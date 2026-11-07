@@ -4,8 +4,15 @@ import Link from "next/link";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useAuth } from "@/components/auth/useAuth";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
-import { customerPassword, ensureCustomerAccount } from "@/lib/customer-accounts";
-import { hasPermission } from "@/lib/permissions";
+import {
+  customerPassword,
+  ensureCustomerAccount,
+  getPrimaryCustomerAccount,
+  hydrateCustomerAccounts,
+  loadCustomerAccounts,
+  type CustomerAccount,
+} from "@/lib/customer-accounts";
+import { canAccessAdminProject, hasPermission } from "@/lib/permissions";
 import {
   emptyTelemetry,
   loadProjectsTelemetry,
@@ -41,6 +48,7 @@ export function ProjectList() {
   const canManageProjects = hasPermission(session, "manageProjects");
   const canManageDevices = hasPermission(session, "manageDevices");
   const [items, setItems] = useState<Project[]>([]);
+  const [customerAccounts, setCustomerAccounts] = useState<CustomerAccount[]>([]);
   const [telemetry, setTelemetry] = useState<Record<string, ProjectTelemetry>>({});
   const [searchQuery, setSearchQuery] = useState("");
   const [customer, setCustomer] = useState("all");
@@ -59,11 +67,23 @@ export function ProjectList() {
       .catch(() => {
         if (active) setItems(loadProjects());
       });
+    void hydrateCustomerAccounts()
+      .then((accounts) => {
+        if (active) setCustomerAccounts(accounts);
+      })
+      .catch(() => {
+        if (active) setCustomerAccounts(loadCustomerAccounts());
+      });
     void loadProjectsTelemetry().then((rows) => {
       if (active) setTelemetry(rows);
     });
+    const onCustomerAccountsChanged = () => {
+      if (active) setCustomerAccounts(loadCustomerAccounts());
+    };
+    window.addEventListener("ems-customer-accounts-changed", onCustomerAccountsChanged);
     return () => {
       active = false;
+      window.removeEventListener("ems-customer-accounts-changed", onCustomerAccountsChanged);
     };
   }, []);
 
@@ -73,23 +93,45 @@ export function ProjectList() {
     return Math.max(...values) * 1.15;
   }, [telemetry]);
 
+  const accessibleItems = useMemo(() => {
+    if (!session || session.portal !== "admin") return items;
+    return items.filter((p) => canAccessAdminProject(session, p.id));
+  }, [items, session]);
+
+  const adminAccountsByProject = useMemo(() => {
+    const map = new Map<string, CustomerAccount>();
+    for (const p of accessibleItems) {
+      map.set(p.id, getPrimaryCustomerAccount(p, customerAccounts));
+    }
+    return map;
+  }, [accessibleItems, customerAccounts]);
+
   const customers = useMemo(
-    () => Array.from(new Set(items.map((p) => p.customer))).sort(),
-    [items],
+    () =>
+      Array.from(
+        new Set(
+          accessibleItems.map((p) => adminAccountsByProject.get(p.id)?.username ?? p.id.toLowerCase()),
+        ),
+      ).sort(),
+    [accessibleItems, adminAccountsByProject],
   );
 
   const filtered = useMemo(() => {
-    return items.filter((p) => {
-      const matchCustomer = customer === "all" || p.customer === customer;
+    const q = searchQuery.trim().toLowerCase();
+    return accessibleItems.filter((p) => {
+      const adminAcc = adminAccountsByProject.get(p.id);
+      const matchCustomer = customer === "all" || adminAcc?.username === customer;
       const matchStatus = status === "all" || p.status === status;
       const matchSearch =
-        !searchQuery.trim() ||
-        p.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        p.id.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        p.customer.toLowerCase().includes(searchQuery.toLowerCase());
+        !q ||
+        p.name.toLowerCase().includes(q) ||
+        p.id.toLowerCase().includes(q) ||
+        p.customer.toLowerCase().includes(q) ||
+        (adminAcc?.username.toLowerCase().includes(q) ?? false) ||
+        (adminAcc?.email.toLowerCase().includes(q) ?? false);
       return matchCustomer && matchStatus && matchSearch;
     });
-  }, [customer, status, searchQuery, items]);
+  }, [customer, status, searchQuery, accessibleItems, adminAccountsByProject]);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const currentPage = Math.min(page, totalPages);
@@ -161,7 +203,7 @@ export function ProjectList() {
               />
             </div>
 
-            {/* Customer Filter */}
+            {/* Customer Admin Account Filter */}
             <FilterSelect
               value={customer}
               onChange={(v) => {
@@ -169,7 +211,7 @@ export function ProjectList() {
                 setPage(1);
               }}
               options={[
-                { value: "all", label: "Tất cả khách hàng" },
+                { value: "all", label: "Tất cả tài khoản quản lý" },
                 ...customers.map((c) => ({ value: c, label: c })),
               ]}
             />
@@ -201,7 +243,7 @@ export function ProjectList() {
             <thead>
               <tr className="border-b border-slate-100 bg-slate-50/80 text-[11px] font-semibold tracking-wider text-slate-400 uppercase">
                 <th className="px-5 py-3.5">Cơ sở / Dự án</th>
-                <th className="px-5 py-3.5">Doanh nghiệp quản lý</th>
+                <th className="px-5 py-3.5">Tài khoản quản lý</th>
                 <th className="px-5 py-3.5">Phụ tải hiện tại (kW)</th>
                 <th className="px-5 py-3.5">Phát thải / ngày</th>
                 <th className="px-5 py-3.5">Hạ tầng đo</th>
@@ -269,9 +311,41 @@ export function ProjectList() {
                         </div>
                       </td>
 
-                      {/* Customer */}
-                      <td className="px-5 py-4 font-medium text-slate-700">
-                        {project.customer}
+                      {/* Customer Admin Account */}
+                      <td className="px-5 py-4">
+                        {(() => {
+                          const adminAcc =
+                            adminAccountsByProject.get(project.id) ??
+                            getPrimaryCustomerAccount(project, customerAccounts);
+                          return (
+                            <div className="flex items-center gap-2.5">
+                              <div className="min-w-0">
+                                <div className="flex items-center gap-1.5">
+                                  <span className="font-mono text-xs font-bold text-slate-800">
+                                    {adminAcc.username}
+                                  </span>
+                                  <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700 border border-emerald-200/70">
+                                    Admin
+                                  </span>
+                                </div>
+                                <span className="block font-mono text-[11px] text-slate-400 truncate max-w-[200px]">
+                                  {adminAcc.email}
+                                </span>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => copyCustomerInvite(project, setCopiedId)}
+                                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-400 hover:border-emerald-200 hover:bg-emerald-50 hover:text-emerald-700 transition-colors"
+                                title="Sao chép thông tin đăng nhập tài khoản Admin khách hàng"
+                              >
+                                <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                                  <rect width="14" height="14" x="8" y="8" rx="2" ry="2" />
+                                  <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" />
+                                </svg>
+                              </button>
+                            </div>
+                          );
+                        })()}
                       </td>
 
                       {/* Load Demand */}

@@ -1,11 +1,7 @@
 import { dbFetch, emitDbChange } from "@/lib/db-client";
 import { vietnamTodayLabel } from "@/lib/vietnam-time";
 
-export type AccountRole =
-  | "Quản trị viên"
-  | "Kỹ sư vận hành"
-  | "Quản lý dự án"
-  | "Nhân viên kỹ thuật";
+export type AccountRole = "Admin" | "Manage";
 
 export type Account = {
   id: string;
@@ -13,15 +9,24 @@ export type Account = {
   email: string;
   role: AccountRole;
   createdAt: string;
+  projectIds?: string[];
   password?: string;
 };
 
-export const ACCOUNT_ROLES: AccountRole[] = [
-  "Quản trị viên",
-  "Kỹ sư vận hành",
-  "Quản lý dự án",
-  "Nhân viên kỹ thuật",
-];
+export const ACCOUNT_ROLES: AccountRole[] = ["Admin", "Manage"];
+
+export const ACCOUNT_ROLE_LABELS: Record<AccountRole, string> = {
+  Admin: "Admin (Toàn quyền hệ thống)",
+  Manage: "Manage (Quản trị theo dự án)",
+};
+
+export function normalizeAccountRole(role: string | undefined | null): AccountRole {
+  const normalized = (role ?? "").trim().toLowerCase();
+  if (normalized === "admin" || normalized === "quản trị viên") {
+    return "Admin";
+  }
+  return "Manage";
+}
 
 let accountsCache: Account[] = [];
 let accountsHydration: Promise<Account[]> | null = null;
@@ -30,13 +35,16 @@ export function loadAccounts(): Account[] {
   return accountsCache;
 }
 
-export function saveAccounts(accounts: Account[]) {
+export async function saveAccounts(accounts: Account[]) {
   accountsCache = accounts;
   emitDbChange("accounts");
-  void dbFetch("accounts", {
+  const saved = await dbFetch<Account[]>("accounts", {
     method: "POST",
     body: JSON.stringify({ items: accounts }),
-  }).catch((error) => console.error("Không thể lưu tài khoản", error));
+  });
+  accountsCache = saved;
+  emitDbChange("accounts");
+  return saved;
 }
 
 export function hydrateAccounts() {
@@ -54,19 +62,21 @@ export function hydrateAccounts() {
   return accountsHydration;
 }
 
-export function upsertAccount(account: Account) {
-  const accounts = loadAccounts();
-  const exists = accounts.some((item) => item.id === account.id);
-  const next = exists
-    ? accounts.map((item) => (item.id === account.id ? account : item))
-    : [account, ...accounts];
-  saveAccounts(next);
-  return next;
+export async function upsertAccount(account: Account) {
+  const saved = await dbFetch<Account[]>("accounts", {
+    method: "POST",
+    body: JSON.stringify(account),
+  });
+  accountsCache = saved;
+  emitDbChange("accounts");
+  return saved;
 }
 
-export function removeAccount(id: string) {
+export async function removeAccount(id: string) {
+  await dbFetch("accounts", { method: "DELETE", query: { id } });
   const next = loadAccounts().filter((item) => item.id !== id);
-  saveAccounts(next);
+  accountsCache = next;
+  emitDbChange("accounts");
   return next;
 }
 

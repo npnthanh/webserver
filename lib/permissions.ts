@@ -1,5 +1,5 @@
 import type { AuthSession } from "@/lib/auth";
-import type { AccountRole } from "@/lib/accounts";
+import { normalizeAccountRole, type AccountRole } from "@/lib/accounts";
 
 export type Permission =
   | "manageUsers"
@@ -10,7 +10,7 @@ export type Permission =
   | "viewProjects";
 
 const ROLE_PERMISSIONS: Record<AccountRole, Permission[]> = {
-  "Quản trị viên": [
+  Admin: [
     "manageUsers",
     "manageProjects",
     "manageDevices",
@@ -18,19 +18,18 @@ const ROLE_PERMISSIONS: Record<AccountRole, Permission[]> = {
     "manageEmissionFactors",
     "viewProjects",
   ],
-  "Quản lý dự án": [
+  Manage: [
     "manageProjects",
     "manageDevices",
+    "manageGateway",
     "manageEmissionFactors",
     "viewProjects",
   ],
-  "Kỹ sư vận hành": ["manageDevices", "manageGateway", "viewProjects"],
-  "Nhân viên kỹ thuật": ["viewProjects", "manageDevices"],
 };
 
 export function permissionsForRole(role: string | undefined | null): Permission[] {
   if (!role) return [];
-  return ROLE_PERMISSIONS[role as AccountRole] ?? [];
+  return ROLE_PERMISSIONS[normalizeAccountRole(role)] ?? [];
 }
 
 export function hasPermission(session: AuthSession | null | undefined, permission: Permission) {
@@ -39,7 +38,26 @@ export function hasPermission(session: AuthSession | null | undefined, permissio
 }
 
 export function isAdminRole(session: AuthSession | null | undefined) {
-  return hasPermission(session, "manageUsers");
+  if (!session || session.portal !== "admin") return false;
+  return normalizeAccountRole(session.role) === "Admin";
+}
+
+/** Kiểm tra tài khoản quản trị (Admin/Manage) có quyền truy cập vào dự án cụ thể hay không. */
+export function canAccessAdminProject(
+  session: AuthSession | null | undefined,
+  projectId: string | undefined | null,
+) {
+  if (!session || session.portal !== "admin" || !projectId) return false;
+  if (isAdminRole(session)) return true;
+  return Array.isArray(session.managedProjectIds) && session.managedProjectIds.includes(projectId);
+}
+
+function extractAdminProjectId(pathname: string): string | null {
+  const editMatch = pathname.match(/^\/sua-du-an\/([^/]+)/);
+  if (editMatch?.[1]) return decodeURIComponent(editMatch[1]);
+  const configMatch = pathname.match(/^\/chinh-sua-du-an\/([^/]+)/);
+  if (configMatch?.[1]) return decodeURIComponent(configMatch[1]);
+  return null;
 }
 
 /** Quyền tối thiểu để mở từng khu vực quản trị. */
@@ -63,6 +81,10 @@ export function permissionForPath(pathname: string): Permission | null {
 
 export function canAccessPath(session: AuthSession | null | undefined, pathname: string) {
   const required = permissionForPath(pathname);
-  if (!required) return true;
-  return hasPermission(session, required);
+  if (required && !hasPermission(session, required)) return false;
+  const targetProjectId = extractAdminProjectId(pathname);
+  if (targetProjectId && !canAccessAdminProject(session, targetProjectId)) {
+    return false;
+  }
+  return true;
 }

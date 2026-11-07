@@ -11,8 +11,22 @@ import {
   saveClientMeters,
   type ClientMeter,
 } from "@/lib/client-meters";
+import { useAuth } from "@/components/auth/useAuth";
+import {
+  CUSTOMER_BRANCH_ROLES,
+  canEditCustomerConfig,
+  defaultCustomerAccount,
+  ensureCustomerAccount,
+  hydrateCustomerAccounts,
+  loadCustomerAccounts,
+  normalizeCustomerRole,
+  removeCustomerAccount,
+  upsertCustomerAccount,
+  type CustomerAccount,
+  type CustomerBranchRole,
+} from "@/lib/customer-accounts";
 import { loadDevices, type CatalogDevice } from "@/lib/devices";
-import { loadProjects, resolveMeterTypes } from "@/lib/projects";
+import { hydrateProjects, loadProjects, resolveMeterTypes } from "@/lib/projects";
 import {
   DEFAULT_VOLTAGE_LEVEL,
   formatTariffPrice,
@@ -46,6 +60,27 @@ const ALERT_TAGS = ["Energy", "U/I", "Tần số", "Công suất", "Sóng hài",
 
 type Slot = { id: string; name: string; color: string; from: string; to: string; price: string };
 type TouPriceInputs = Record<TouBand, string>;
+type SavedProjectConfig = {
+  classify?: string;
+  startTime?: string;
+  warnCount?: string;
+  warnTimeout?: number;
+  onlineTimeout?: number;
+  gmail?: string;
+  password?: string;
+  language?: string;
+  theme?: "Sáng" | "Tối" | "Hệ thống";
+};
+
+type SavedAlertsConfig = {
+  classify?: string;
+  tags?: string[];
+  activeTag?: string;
+  threshold?: string;
+  dailyLimit?: number;
+  peakWarn?: boolean;
+};
+
 type SavedCostConfig = {
   utility?: string;
   applyDate?: string;
@@ -65,18 +100,10 @@ function tariffInputs(levelId: string | undefined): TouPriceInputs {
     peak: formatTariffPrice(prices.peak),
   };
 }
-type AccountRow = {
-  id: string;
-  username: string;
-  fullName: string;
-  role: string;
-  email: string;
-  status: "Đang hoạt động" | "Ngoại tuyến";
-};
-
 export function ClientConfig() {
   const params = useParams<{ id: string }>();
   const projectId = params?.id ?? "default";
+  const { session } = useAuth();
   const [tab, setTab] = useState<TabId>("meters");
   const [openParams, setOpenParams] = useState(true);
   const [saved, setSaved] = useState(false);
@@ -91,8 +118,22 @@ export function ClientConfig() {
   const [flatPrices, setFlatPrices] = useState<Record<string, string>>({});
   const [voltageLevel, setVoltageLevel] = useState<VoltageLevelId>(DEFAULT_VOLTAGE_LEVEL);
   const [touPrices, setTouPrices] = useState<TouPriceInputs>(() => tariffInputs(DEFAULT_VOLTAGE_LEVEL));
-  const [accounts, setAccounts] = useState<AccountRow[]>([]);
+  const [accounts, setAccounts] = useState<CustomerAccount[]>(() =>
+    loadCustomerAccounts().filter((item) => item.projectId === projectId),
+  );
   const [adding, setAdding] = useState(false);
+  const [accountActionError, setAccountActionError] = useState("");
+
+  const canManageCustomerAccounts = useMemo(() => {
+    if (!session) return true;
+    if (session.portal === "admin") return true;
+    return session.role === "Admin" || session.userId === `cus-${projectId}`;
+  }, [session, projectId]);
+
+  const canEditConfig = useMemo(
+    () => canEditCustomerConfig(session, projectId),
+    [session, projectId],
+  );
 
   const [classify, setClassify] = useState("Thông tin chung (Info)");
   const [startTime, setStartTime] = useState("");
@@ -111,6 +152,29 @@ export function ClientConfig() {
   const [peakWarn, setPeakWarn] = useState(true);
 
   function applyCostSettings(settings: ProjectSettingsPayload, types: string[] = utilities) {
+    const savedProject = settings.projectConfig as SavedProjectConfig | undefined;
+    if (savedProject) {
+      if (savedProject.classify !== undefined) setClassify(savedProject.classify);
+      if (savedProject.startTime !== undefined) setStartTime(savedProject.startTime);
+      if (savedProject.warnCount !== undefined) setWarnCount(savedProject.warnCount);
+      if (typeof savedProject.warnTimeout === "number") setWarnTimeout(savedProject.warnTimeout);
+      if (typeof savedProject.onlineTimeout === "number") setOnlineTimeout(savedProject.onlineTimeout);
+      if (savedProject.gmail !== undefined) setGmail(savedProject.gmail);
+      if (savedProject.password !== undefined) setPassword(savedProject.password);
+      if (savedProject.language !== undefined) setLanguage(savedProject.language);
+      if (savedProject.theme) setTheme(savedProject.theme);
+    }
+
+    const savedAlerts = settings.alertsConfig as SavedAlertsConfig | undefined;
+    if (savedAlerts) {
+      if (savedAlerts.classify !== undefined) setClassify(savedAlerts.classify);
+      if (Array.isArray(savedAlerts.tags) && savedAlerts.tags.length > 0) setTags(savedAlerts.tags);
+      if (savedAlerts.activeTag !== undefined) setActiveTag(savedAlerts.activeTag);
+      if (savedAlerts.threshold !== undefined) setThreshold(savedAlerts.threshold);
+      if (typeof savedAlerts.dailyLimit === "number") setDailyLimit(savedAlerts.dailyLimit);
+      if (typeof savedAlerts.peakWarn === "boolean") setPeakWarn(savedAlerts.peakWarn);
+    }
+
     const savedCost = settings.costConfig as SavedCostConfig | undefined;
     if (!savedCost) {
       setApplyDate("");
@@ -134,15 +198,36 @@ export function ClientConfig() {
   }
 
   useEffect(() => {
-    const project = loadProjects().find((item) => item.id === projectId);
-    const types = resolveMeterTypes(project);
-    setUtilities(types.length ? types : FALLBACK_UTILITIES);
-    setUtility((current) => (types.includes(current) ? current : types[0] ?? "Điện"));
+    const applyProject = (project = loadProjects().find((item) => item.id === projectId)) => {
+      const types = resolveMeterTypes(project);
+      setUtilities(types.length ? types : FALLBACK_UTILITIES);
+      setUtility((current) => (types.includes(current) ? current : types[0] ?? "Điện"));
+      return project;
+    };
+    const initialProject = applyProject();
+    void hydrateProjects()
+      .then((projects) => {
+        const found = projects.find((item) => item.id === projectId) ?? initialProject;
+        applyProject(found);
+        return hydrateCustomerAccounts(projectId).then((loaded) => {
+          if (!loaded.some((item) => item.id === `cus-${projectId}`) && found) {
+            const primary = ensureCustomerAccount(found);
+            setAccounts([primary, ...loaded.filter((item) => item.id !== primary.id)]);
+          } else {
+            setAccounts(loaded);
+          }
+        });
+      })
+      .catch(() => {
+        void hydrateCustomerAccounts(projectId)
+          .then(setAccounts)
+          .catch(() => setAccounts(loadCustomerAccounts().filter((item) => item.projectId === projectId)));
+      });
     void hydrateClientMeters(projectId)
       .then(setMeters)
       .catch(() => setMeters(loadClientMeters(projectId)));
     void hydrateProjectSettings(projectId, { force: true })
-      .then((settings) => applyCostSettings(settings, types))
+      .then((settings) => applyCostSettings(settings))
       .catch(() => undefined);
     setDevices(loadDevices());
   }, [projectId]);
@@ -151,7 +236,34 @@ export function ClientConfig() {
     setSaveError("");
     setSaving(true);
     try {
-      if (tab === "cost") {
+      if (tab === "project") {
+        const stored = await saveProjectSettings(projectId, {
+          projectConfig: {
+            classify,
+            startTime,
+            warnCount,
+            warnTimeout,
+            onlineTimeout,
+            gmail,
+            password,
+            language,
+            theme,
+          },
+        });
+        applyCostSettings(stored);
+      } else if (tab === "alerts") {
+        const stored = await saveProjectSettings(projectId, {
+          alertsConfig: {
+            classify,
+            tags,
+            activeTag,
+            threshold,
+            dailyLimit,
+            peakWarn,
+          },
+        });
+        applyCostSettings(stored);
+      } else if (tab === "cost") {
         const stored = await saveProjectSettings(projectId, {
           costConfig: {
             utility,
@@ -234,114 +346,153 @@ export function ClientConfig() {
               <h2 className="text-[22px] font-bold text-slate-800">{meta.title}</h2>
               <p className="mt-1 text-sm text-slate-500">{meta.hint}</p>
             </div>
-            <button
-              type="button"
-              title="Lưu"
-              onClick={() => void markSaved()}
-              disabled={saving}
-              className="flex h-9 w-9 items-center justify-center rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 shadow-xs transition-colors disabled:opacity-60"
-            >
-              {tab === "accounts" ? <FileIcon /> : <SaveIcon />}
-            </button>
+            {tab === "accounts" || canEditConfig ? (
+              <button
+                type="button"
+                title="Lưu"
+                onClick={() => void markSaved()}
+                disabled={saving || (tab !== "accounts" && !canEditConfig)}
+                className="flex h-9 w-9 items-center justify-center rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 shadow-xs transition-colors disabled:opacity-60"
+              >
+                {tab === "accounts" ? <FileIcon /> : <SaveIcon />}
+              </button>
+            ) : null}
           </div>
 
-          {tab === "project" ? (
-            <ProjectForm
-              classify={classify}
-              onClassify={setClassify}
-              startTime={startTime}
-              onStartTime={setStartTime}
-              warnCount={warnCount}
-              onWarnCount={setWarnCount}
-              warnTimeout={warnTimeout}
-              onWarnTimeout={setWarnTimeout}
-              onlineTimeout={onlineTimeout}
-              onOnlineTimeout={setOnlineTimeout}
-              gmail={gmail}
-              onGmail={setGmail}
-              password={password}
-              onPassword={setPassword}
-              language={language}
-              onLanguage={setLanguage}
-              theme={theme}
-              onTheme={setTheme}
-            />
+          {tab !== "accounts" && !canEditConfig ? (
+            <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50/80 px-4 py-2.5 text-[12px] font-medium text-amber-800">
+              Tài khoản nhánh của bạn đang có quyền <strong>Chỉ xem</strong> — chỉ được phép xem các thông số cấu hình, không thể chỉnh sửa hoặc lưu thay đổi.
+            </div>
           ) : null}
 
-          {tab === "meters" ? (
-            <MetersPanel
-              utility={utility}
-              utilities={utilities}
-              onUtility={setUtility}
-              meters={visibleMeters}
-              devices={devices}
-              onMetersChange={(nextVisible) => {
-                setMeters((current) => {
-                  const other = current.filter((item) => item.utility !== utility);
-                  return [...other, ...nextVisible];
-                });
-              }}
-            />
-          ) : null}
+          <fieldset disabled={tab !== "accounts" && !canEditConfig} className="m-0 min-w-0 border-0 p-0">
+            {tab === "project" ? (
+              <ProjectForm
+                classify={classify}
+                onClassify={setClassify}
+                startTime={startTime}
+                onStartTime={setStartTime}
+                warnCount={warnCount}
+                onWarnCount={setWarnCount}
+                warnTimeout={warnTimeout}
+                onWarnTimeout={setWarnTimeout}
+                onlineTimeout={onlineTimeout}
+                onOnlineTimeout={setOnlineTimeout}
+                gmail={gmail}
+                onGmail={setGmail}
+                password={password}
+                onPassword={setPassword}
+                language={language}
+                onLanguage={setLanguage}
+                theme={theme}
+                onTheme={setTheme}
+              />
+            ) : null}
 
-          {tab === "cost" ? (
-            <CostPanel
-              utility={utility}
-              utilities={utilities}
-              onUtility={setUtility}
-              applyDate={applyDate}
-              onApplyDate={setApplyDate}
-              voltageLevel={voltageLevel}
-              touPrices={touPrices}
-              onVoltageLevel={(levelId) => {
-                setVoltageLevel(levelId);
-                setTouPrices(tariffInputs(levelId));
-              }}
-              onTouPrice={(band, value) => setTouPrices((current) => ({ ...current, [band]: value }))}
-              flatPrice={flatPrices[utility]}
-              onFlatPrice={(value) => setFlatPrices((current) => ({ ...current, [utility]: value }))}
-            />
-          ) : null}
+            {tab === "meters" ? (
+              <MetersPanel
+                utility={utility}
+                utilities={utilities}
+                onUtility={setUtility}
+                meters={visibleMeters}
+                devices={devices}
+                onMetersChange={(nextVisible) => {
+                  if (!canEditConfig) return;
+                  setMeters((current) => {
+                    const other = current.filter((item) => item.utility !== utility);
+                    return [...other, ...nextVisible];
+                  });
+                }}
+              />
+            ) : null}
 
-          {tab === "alerts" ? (
-            <AlertsPanel
-              classify={classify}
-              onClassify={setClassify}
-              tags={tags}
-              activeTag={activeTag}
-              onActive={setActiveTag}
-              onRemoveTag={(tag) => {
-                setTags((list) => list.filter((item) => item !== tag));
-                if (activeTag === tag) setActiveTag(tags.find((item) => item !== tag) ?? "");
-              }}
-              onAddTag={() => {
-                const next = `Mới ${tags.length + 1}`;
-                setTags((list) => [...list, next]);
-                setActiveTag(next);
-              }}
-              threshold={threshold}
-              onThreshold={setThreshold}
-              dailyLimit={dailyLimit}
-              onDailyLimit={setDailyLimit}
-              peakWarn={peakWarn}
-              onPeakWarn={setPeakWarn}
-            />
-          ) : null}
+            {tab === "cost" ? (
+              <CostPanel
+                utility={utility}
+                utilities={utilities}
+                onUtility={setUtility}
+                applyDate={applyDate}
+                onApplyDate={setApplyDate}
+                voltageLevel={voltageLevel}
+                touPrices={touPrices}
+                onVoltageLevel={(levelId) => {
+                  setVoltageLevel(levelId);
+                  setTouPrices(tariffInputs(levelId));
+                }}
+                onTouPrice={(band, value) => setTouPrices((current) => ({ ...current, [band]: value }))}
+                flatPrice={flatPrices[utility]}
+                onFlatPrice={(value) => setFlatPrices((current) => ({ ...current, [utility]: value }))}
+              />
+            ) : null}
+
+            {tab === "alerts" ? (
+              <AlertsPanel
+                classify={classify}
+                onClassify={setClassify}
+                tags={tags}
+                activeTag={activeTag}
+                onActive={setActiveTag}
+                onRemoveTag={(tag) => {
+                  setTags((list) => list.filter((item) => item !== tag));
+                  if (activeTag === tag) setActiveTag(tags.find((item) => item !== tag) ?? "");
+                }}
+                onAddTag={() => {
+                  const next = `Mới ${tags.length + 1}`;
+                  setTags((list) => [...list, next]);
+                  setActiveTag(next);
+                }}
+                threshold={threshold}
+                onThreshold={setThreshold}
+                dailyLimit={dailyLimit}
+                onDailyLimit={setDailyLimit}
+                peakWarn={peakWarn}
+                onPeakWarn={setPeakWarn}
+              />
+            ) : null}
+          </fieldset>
 
           {tab === "accounts" ? (
             <AccountsPanel
+              projectId={projectId}
               accounts={accounts}
+              canManage={canManageCustomerAccounts}
+              errorMessage={accountActionError}
               adding={adding}
-              onAdding={setAdding}
-              onAdd={(row) => {
-                setAccounts((list) => [...list, row]);
-                setAdding(false);
+              onAdding={(v) => {
+                setAccountActionError("");
+                setAdding(v);
               }}
-              onRemove={(id) => setAccounts((list) => list.filter((item) => item.id !== id))}
+              onSaveAccount={async (row) => {
+                setAccountActionError("");
+                try {
+                  const saved = await upsertCustomerAccount(row);
+                  setAccounts(saved.filter((item) => item.projectId === projectId));
+                  setAdding(false);
+                } catch (error) {
+                  setAccountActionError(
+                    error instanceof Error ? error.message : "Không thể lưu tài khoản khách hàng.",
+                  );
+                }
+              }}
+              onRemove={async (id) => {
+                if (id === `cus-${projectId}`) {
+                  setAccountActionError("Không thể xóa tài khoản Admin gốc của dự án.");
+                  return;
+                }
+                setAccountActionError("");
+                try {
+                  const remaining = await removeCustomerAccount(id);
+                  setAccounts(remaining.filter((item) => item.projectId === projectId));
+                } catch (error) {
+                  setAccountActionError(
+                    error instanceof Error ? error.message : "Không thể xóa tài khoản khách hàng.",
+                  );
+                }
+              }}
             />
           ) : null}
 
-          {tab !== "accounts" ? (
+          {tab !== "accounts" && canEditConfig ? (
             <div className="mt-8 flex justify-end gap-3">
               <button
                 type="button"
@@ -350,7 +501,6 @@ export function ClientConfig() {
                   void hydrateProjectSettings(projectId, { force: true }).then((settings) => {
                     applyCostSettings(settings);
                   });
-                  setAccounts([]);
                 }}
                 className="h-10 rounded-md border border-slate-200 bg-white px-4 text-sm font-medium text-slate-600 hover:bg-slate-50"
               >
@@ -1071,118 +1221,308 @@ function AlertsPanel({
 }
 
 function AccountsPanel({
+  projectId,
   accounts,
+  canManage,
+  errorMessage,
   adding,
   onAdding,
-  onAdd,
+  onSaveAccount,
   onRemove,
 }: {
-  accounts: AccountRow[];
+  projectId: string;
+  accounts: CustomerAccount[];
+  canManage: boolean;
+  errorMessage?: string;
   adding: boolean;
   onAdding: (v: boolean) => void;
-  onAdd: (row: AccountRow) => void;
-  onRemove: (id: string) => void;
+  onSaveAccount: (row: CustomerAccount) => Promise<void> | void;
+  onRemove: (id: string) => Promise<void> | void;
 }) {
-  const [draft, setDraft] = useState({ username: "", fullName: "", role: "Người xem", email: "" });
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [draft, setDraft] = useState<{
+    username: string;
+    displayName: string;
+    role: CustomerBranchRole;
+    email: string;
+    password: string;
+  }>({
+    username: "",
+    displayName: "",
+    role: "Chỉ xem",
+    email: "",
+    password: "",
+  });
+  const [submitting, setSubmitting] = useState(false);
+
+  const displayAccounts = useMemo(() => {
+    if (accounts.length > 0) return accounts;
+    const project = loadProjects().find((item) => item.id === projectId);
+    return [
+      defaultCustomerAccount({
+        id: projectId,
+        customer: project?.customer ?? projectId,
+      }),
+    ];
+  }, [accounts, projectId]);
+
+  const isEditingPrimary = editingId === `cus-${projectId}`;
+
+  function startCreate() {
+    setEditingId(null);
+    setDraft({
+      username: "",
+      displayName: "",
+      role: "Chỉ xem",
+      email: "",
+      password: "",
+    });
+    onAdding(true);
+  }
+
+  function startEdit(row: CustomerAccount) {
+    const isPrimary = row.id === `cus-${projectId}`;
+    const normalized = normalizeCustomerRole(row.role, isPrimary);
+    setEditingId(row.id);
+    setDraft({
+      username: row.username,
+      displayName: row.displayName,
+      role: normalized === "Xem và chỉnh sửa" ? "Xem và chỉnh sửa" : "Chỉ xem",
+      email: row.email,
+      password: "",
+    });
+    onAdding(true);
+  }
+
+  function cancelForm() {
+    setEditingId(null);
+    onAdding(false);
+  }
+
   return (
     <div>
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-        <h3 className="text-[15px] font-semibold text-slate-800">Danh sách tài khoản phụ</h3>
-        <button
-          type="button"
-          onClick={() => onAdding(true)}
-          className="inline-flex h-10 items-center gap-1.5 rounded-md bg-emerald-600 px-3.5 text-sm font-medium text-white hover:bg-emerald-700 shadow-xs transition-colors"
-        >
-          <UserPlusIcon />
-          + Thêm mới tài khoản
-        </button>
+        <div>
+          <h3 className="text-[15px] font-semibold text-slate-800">
+            Danh sách tài khoản truy cập ứng dụng ({displayAccounts.length})
+          </h3>
+          <p className="mt-0.5 text-[12px] text-slate-500">
+            Hệ thống khởi tạo tài khoản <strong>Admin</strong> ban đầu. Từ tài khoản Admin, khách hàng tạo các tài khoản nhánh với quyền <strong>Chỉ xem</strong> hoặc <strong>Xem và chỉnh sửa</strong> cấu hình thông số.
+          </p>
+        </div>
+        {canManage ? (
+          <button
+            type="button"
+            onClick={startCreate}
+            className="inline-flex h-10 items-center gap-1.5 rounded-md bg-emerald-600 px-3.5 text-sm font-medium text-white hover:bg-emerald-700 shadow-xs transition-colors"
+          >
+            <UserPlusIcon />
+            + Thêm mới tài khoản
+          </button>
+        ) : (
+          <span className="rounded-md bg-slate-100 px-3 py-1.5 text-[12px] font-medium text-slate-500">
+            Chỉ tài khoản Admin mới có quyền quản lý tài khoản nhánh
+          </span>
+        )}
       </div>
-      {adding ? (
-        <div className="mb-4 grid gap-2 rounded-md border border-slate-200 bg-slate-50 p-3 md:grid-cols-4">
-          <input
-            value={draft.username}
-            onChange={(e) => setDraft({ ...draft, username: e.target.value })}
-            placeholder="Tên đăng nhập"
-            className="h-9 rounded-md border border-slate-200 bg-white px-2 text-sm"
-          />
-          <input
-            value={draft.fullName}
-            onChange={(e) => setDraft({ ...draft, fullName: e.target.value })}
-            placeholder="Họ tên"
-            className="h-9 rounded-md border border-slate-200 bg-white px-2 text-sm"
-          />
-          <input
-            value={draft.email}
-            onChange={(e) => setDraft({ ...draft, email: e.target.value })}
-            placeholder="Email"
-            className="h-9 rounded-md border border-slate-200 bg-white px-2 text-sm"
-          />
-          <div className="flex gap-2">
-            <button
-              type="button"
-              onClick={() => {
-                if (!draft.username || !draft.email) return;
-                onAdd({
-                  id: `a${Date.now()}`,
-                  username: draft.username,
-                  fullName: draft.fullName || draft.username,
-                  role: draft.role,
-                  email: draft.email,
-                  status: "Đang hoạt động",
-                });
-                setDraft({ username: "", fullName: "", role: "Người xem", email: "" });
-              }}
-              className="h-9 rounded-md bg-emerald-600 px-3 text-sm text-white hover:bg-emerald-700 shadow-xs transition-colors"
-            >
-              Thêm
-            </button>
-            <button type="button" onClick={() => onAdding(false)} className="h-9 rounded-md border px-3 text-sm">
-              Hủy
-            </button>
-          </div>
+
+      {errorMessage ? (
+        <div className="mb-4 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-[12px] font-medium text-red-600">
+          {errorMessage}
         </div>
       ) : null}
+
+      {adding && canManage ? (
+        <div className="mb-4 rounded-lg border border-slate-200 bg-slate-50 p-4">
+          <div className="mb-2.5 flex items-center justify-between">
+            <p className="text-[13px] font-semibold text-slate-800">
+              {editingId
+                ? isEditingPrimary
+                  ? "Cập nhật tài khoản Admin ban đầu"
+                  : "Cập nhật tài khoản nhánh"
+                : "Tạo tài khoản nhánh mới"}
+            </p>
+            <span className="text-[11px] text-slate-500">
+              {editingId
+                ? "Để trống mật khẩu nếu giữ nguyên mật khẩu hiện tại"
+                : "Mật khẩu mặc định là 123456 nếu để trống"}
+            </span>
+          </div>
+          <div className="grid gap-2.5 md:grid-cols-6">
+            <input
+              value={draft.username}
+              onChange={(e) => setDraft({ ...draft, username: e.target.value })}
+              placeholder="Tên đăng nhập (VD: vanhanh_ca1)"
+              className="h-9 rounded-md border border-slate-200 bg-white px-2.5 text-sm"
+            />
+            <input
+              value={draft.displayName}
+              onChange={(e) => setDraft({ ...draft, displayName: e.target.value })}
+              placeholder="Họ tên / Bộ phận"
+              className="h-9 rounded-md border border-slate-200 bg-white px-2.5 text-sm"
+            />
+            <input
+              value={draft.email}
+              onChange={(e) => setDraft({ ...draft, email: e.target.value })}
+              placeholder="Email đăng nhập"
+              className="h-9 rounded-md border border-slate-200 bg-white px-2.5 text-sm"
+            />
+            {isEditingPrimary ? (
+              <input
+                value="Admin (Tài khoản ban đầu)"
+                disabled
+                className="h-9 rounded-md border border-slate-200 bg-slate-100 px-2.5 text-sm font-medium text-slate-600"
+              />
+            ) : (
+              <select
+                value={draft.role}
+                onChange={(e) => setDraft({ ...draft, role: e.target.value as CustomerBranchRole })}
+                className="h-9 rounded-md border border-slate-200 bg-white px-2.5 text-sm text-slate-700"
+              >
+                {CUSTOMER_BRANCH_ROLES.map((item) => (
+                  <option key={item.value} value={item.value}>
+                    {item.label}
+                  </option>
+                ))}
+              </select>
+            )}
+            <input
+              type="password"
+              value={draft.password}
+              onChange={(e) => setDraft({ ...draft, password: e.target.value })}
+              placeholder={editingId ? "Mật khẩu mới (tùy chọn)" : "Mật khẩu (mặc định 123456)"}
+              className="h-9 rounded-md border border-slate-200 bg-white px-2.5 text-sm"
+            />
+            <div className="flex gap-2">
+              <button
+                type="button"
+                disabled={submitting}
+                onClick={async () => {
+                  const username = draft.username.trim();
+                  const email = draft.email.trim() || `${username.toLowerCase()}@ems.local`;
+                  if (!username) return;
+                  setSubmitting(true);
+                  try {
+                    await onSaveAccount({
+                      id: editingId ?? `cus-${projectId}-${Date.now()}`,
+                      username,
+                      displayName: draft.displayName.trim() || username,
+                      role: isEditingPrimary ? "Admin" : draft.role,
+                      email,
+                      projectId,
+                      password: editingId ? draft.password.trim() : draft.password.trim() || "123456",
+                    });
+                    setEditingId(null);
+                    setDraft({
+                      username: "",
+                      displayName: "",
+                      role: "Chỉ xem",
+                      email: "",
+                      password: "",
+                    });
+                  } finally {
+                    setSubmitting(false);
+                  }
+                }}
+                className="h-9 rounded-md bg-emerald-600 px-3 text-sm font-medium text-white hover:bg-emerald-700 shadow-xs transition-colors disabled:opacity-60"
+              >
+                {submitting ? "Đang lưu..." : editingId ? "Lưu" : "Thêm"}
+              </button>
+              <button
+                type="button"
+                onClick={cancelForm}
+                className="h-9 rounded-md border border-slate-200 bg-white px-3 text-sm text-slate-600 hover:bg-slate-50"
+              >
+                Hủy
+              </button>
+            </div>
+          </div>
+          {!isEditingPrimary ? (
+            <p className="mt-2 text-[11px] text-slate-500">
+              • <strong>Chỉ xem:</strong> Chỉ được xem dữ liệu và thông số cấu hình. &nbsp;|&nbsp; •{" "}
+              <strong>Xem và chỉnh sửa:</strong> Được phép xem và chỉnh sửa các thông số trong phần Cấu hình (Dự án, Cụm điểm đo, Chi phí, Cảnh báo).
+            </p>
+          ) : null}
+        </div>
+      ) : null}
+
       <div className="overflow-x-auto">
         <table className="w-full min-w-[720px] text-left text-[13px]">
           <thead>
             <tr className="border-b border-slate-100 text-[11px] font-semibold tracking-wide text-slate-400">
               <th className="py-2">TÊN NGƯỜI DÙNG / HỌ TÊN</th>
-              <th className="py-2">VAI TRÒ</th>
+              <th className="py-2">VAI TRÒ PHÂN QUYỀN</th>
               <th className="py-2">EMAIL</th>
               <th className="py-2">TRẠNG THÁI</th>
               <th className="py-2 text-right">THAO TÁC</th>
             </tr>
           </thead>
           <tbody>
-            {accounts.map((row) => (
-              <tr key={row.id} className="border-b border-slate-50">
-                <td className="py-3">
-                  <p className="font-medium text-slate-800">{row.username}</p>
-                  <p className="text-[12px] text-slate-500">{row.fullName}</p>
-                </td>
-                <td className="py-3 text-slate-600">{row.role}</td>
-                <td className="py-3 text-slate-600">{row.email}</td>
-                <td className="py-3">
-                  <span
-                    className={`inline-flex rounded-full px-2.5 py-0.5 text-[11px] font-semibold ${
-                      row.status === "Đang hoạt động" ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-500"
-                    }`}
-                  >
-                    {row.status}
-                  </span>
-                </td>
-                <td className="py-3">
-                  <span className="flex justify-end gap-1 text-slate-400">
-                    <IconBtn label="Sửa">
-                      <PencilIcon />
-                    </IconBtn>
-                    <IconBtn label="Xóa" onClick={() => onRemove(row.id)}>
-                      <TrashIcon />
-                    </IconBtn>
-                  </span>
-                </td>
-              </tr>
-            ))}
+            {displayAccounts.map((row) => {
+              const isPrimaryAdmin = row.id === `cus-${projectId}`;
+              const roleLabel = normalizeCustomerRole(row.role, isPrimaryAdmin);
+              return (
+                <tr key={row.id} className="border-b border-slate-50">
+                  <td className="py-3">
+                    <div className="flex items-center gap-2">
+                      <p className="font-semibold text-slate-800">{row.username}</p>
+                      {isPrimaryAdmin ? (
+                        <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700">
+                          Admin ban đầu
+                        </span>
+                      ) : (
+                        <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-600">
+                          Tài khoản nhánh
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-[12px] text-slate-500">{row.displayName}</p>
+                  </td>
+                  <td className="py-3">
+                    <span
+                      className={`inline-flex rounded-full px-2.5 py-0.5 text-[11px] font-semibold ${
+                        roleLabel === "Admin"
+                          ? "bg-slate-900 text-white"
+                          : roleLabel === "Xem và chỉnh sửa"
+                            ? "bg-emerald-50 text-emerald-700"
+                            : "bg-sky-50 text-sky-700"
+                      }`}
+                    >
+                      {roleLabel}
+                    </span>
+                    <p className="mt-0.5 text-[11px] text-slate-400">
+                      {roleLabel === "Admin"
+                        ? "Toàn quyền cấu hình & tạo tài khoản nhánh"
+                        : roleLabel === "Xem và chỉnh sửa"
+                          ? "Được xem và chỉnh sửa cấu hình thông số"
+                          : "Chỉ xem dữ liệu & thông số"}
+                    </p>
+                  </td>
+                  <td className="py-3 text-slate-600">{row.email}</td>
+                  <td className="py-3">
+                    <span className="inline-flex rounded-full bg-emerald-50 px-2.5 py-0.5 text-[11px] font-semibold text-emerald-700">
+                      Đang hoạt động
+                    </span>
+                  </td>
+                  <td className="py-3 text-right">
+                    {canManage ? (
+                      <span className="inline-flex justify-end gap-1 text-slate-400">
+                        <IconBtn label="Sửa tài khoản" onClick={() => startEdit(row)}>
+                          <PencilIcon />
+                        </IconBtn>
+                        {!isPrimaryAdmin ? (
+                          <IconBtn label="Xóa tài khoản nhánh" onClick={() => void onRemove(row.id)}>
+                            <TrashIcon />
+                          </IconBtn>
+                        ) : null}
+                      </span>
+                    ) : (
+                      <span className="text-[11px] text-slate-400">—</span>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>

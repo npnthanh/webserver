@@ -125,7 +125,11 @@ export function ClientShell({
                 {session?.displayName ?? session?.username ?? resolved.customer}
               </p>
               <p className="text-[10px] tracking-wide text-slate-400 uppercase">
-                {session?.portal === "admin" ? "Quản trị viên" : "Khách hàng"}
+                {session?.portal === "admin"
+                  ? "Quản trị viên"
+                  : session?.role === "Admin" || session?.userId === `cus-${project.id}`
+                    ? "Admin khách hàng"
+                    : session?.role || "Khách hàng"}
               </p>
             </div>
             <button

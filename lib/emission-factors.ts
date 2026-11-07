@@ -78,7 +78,12 @@ export function upsertFactorGroup(group: FactorGroup) {
 
 export function removeFactorGroup(id: string) {
   const next = loadFactorGroups().filter((item) => item.id !== id);
-  saveFactorGroups(next);
+  factorGroupsCache = next;
+  emitDbChange("emission-factors");
+  void dbFetch("emission-factors", {
+    method: "DELETE",
+    query: { id },
+  }).catch((error) => console.error("Không thể xóa nhóm hệ số phát thải", error));
   return next;
 }
 

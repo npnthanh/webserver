@@ -1,5 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { cookies } from "next/headers";
+import { normalizeAccountRole } from "@/lib/accounts";
+import { ensureAccountProjectsSchema, ensureCustomerAccountsSchema } from "@/lib/server-auth";
 import { emsDb, queryRows } from "@/lib/server-db";
 
 const SESSION_COOKIE = "ems-session";
@@ -41,11 +43,12 @@ export async function POST(request: Request) {
       account = rows[0];
       resolvedPortal = "admin";
     } else if (body.portal === "customer") {
+      await ensureCustomerAccountsSchema();
       const projectFilter = body.projectId ? "AND project_id = ?" : "";
       const params = [identifier, identifier, password];
       if (body.projectId) params.push(body.projectId);
       const rows = await queryRows<Record<string, any>>(
-        `SELECT id, username, email, 'Khách hàng' AS role, display_name AS displayName, project_id AS projectId
+        `SELECT id, username, email, COALESCE(role, 'Admin') AS role, display_name AS displayName, project_id AS projectId
            FROM customer_accounts
           WHERE (LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?))
             AND password_hash = SHA2(?, 256) ${projectFilter}
@@ -68,11 +71,12 @@ export async function POST(request: Request) {
         account = adminRows[0];
         resolvedPortal = "admin";
       } else {
+        await ensureCustomerAccountsSchema();
         const projectFilter = body.projectId ? "AND project_id = ?" : "";
         const params = [identifier, identifier, password];
         if (body.projectId) params.push(body.projectId);
         const customerRows = await queryRows<Record<string, any>>(
-          `SELECT id, username, email, 'Khách hàng' AS role, display_name AS displayName, project_id AS projectId
+          `SELECT id, username, email, COALESCE(role, 'Admin') AS role, display_name AS displayName, project_id AS projectId
              FROM customer_accounts
             WHERE (LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?))
               AND password_hash = SHA2(?, 256) ${projectFilter}
@@ -110,6 +114,17 @@ export async function POST(request: Request) {
       expires: expiresAt,
     });
 
+    const role = resolvedPortal === "admin" ? normalizeAccountRole(account.role) : String(account.role ?? "");
+    let managedProjectIds: string[] | undefined;
+    if (resolvedPortal === "admin") {
+      await ensureAccountProjectsSchema();
+      const projectRows = await queryRows<{ projectId: string }>(
+        "SELECT project_id AS projectId FROM account_projects WHERE account_id = ? ORDER BY project_id",
+        [account.id],
+      );
+      managedProjectIds = projectRows.map((item) => String(item.projectId));
+    }
+
     return Response.json({
       session: {
         portal: resolvedPortal,
@@ -117,8 +132,9 @@ export async function POST(request: Request) {
         username: account.username,
         displayName: account.displayName,
         email: account.email,
-        role: account.role,
+        role,
         ...(account.projectId ? { projectId: account.projectId } : {}),
+        ...(managedProjectIds !== undefined ? { managedProjectIds } : {}),
       },
     });
   } catch (error) {

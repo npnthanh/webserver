@@ -7,39 +7,56 @@ import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import {
   hydrateAccounts,
   loadAccounts,
+  normalizeAccountRole,
   removeAccount,
   type Account,
   type AccountRole,
 } from "@/lib/accounts";
 import { hasPermission } from "@/lib/permissions";
+import { hydrateProjects, loadProjects, type Project } from "@/lib/projects";
 
 const PAGE_SIZE = 6;
 
 const ROLE_STYLE: Record<AccountRole, string> = {
-  "Quản trị viên": "bg-slate-900 text-white shadow-xs",
-  "Kỹ sư vận hành": "bg-emerald-50 text-emerald-700 border border-emerald-200/60",
-  "Quản lý dự án": "bg-cyan-50 text-cyan-700 border border-cyan-200/60",
-  "Nhân viên kỹ thuật": "bg-amber-50 text-amber-700 border border-amber-200/60",
+  Admin: "bg-slate-900 text-white shadow-xs",
+  Manage: "bg-emerald-50 text-emerald-700 border border-emerald-200/60",
 };
 
 export function AccountList() {
   const { session } = useAuth();
   const canManage = hasPermission(session, "manageUsers");
   const [accounts, setAccounts] = useState<Account[]>([]);
+  const [projects, setProjects] = useState<Project[]>([]);
   const [query, setQuery] = useState("");
   const [page, setPage] = useState(1);
   const [accountToDelete, setAccountToDelete] = useState<Account | null>(null);
+  const [deleteError, setDeleteError] = useState("");
 
   useEffect(() => {
     setAccounts(loadAccounts());
+    setProjects(loadProjects());
     let active = true;
     void hydrateAccounts().then((items) => {
       if (active) setAccounts(items);
     });
+    void hydrateProjects().then((items) => {
+      if (active) setProjects(items);
+    });
+    const onChanged = () => {
+      if (active) setAccounts(loadAccounts());
+    };
+    window.addEventListener("ems-accounts-changed", onChanged);
     return () => {
       active = false;
+      window.removeEventListener("ems-accounts-changed", onChanged);
     };
   }, []);
+
+  const projectMap = useMemo(() => {
+    const map = new Map<string, Project>();
+    for (const item of projects) map.set(item.id, item);
+    return map;
+  }, [projects]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -72,7 +89,7 @@ export function AccountList() {
             </span>
           </div>
           <p className="mt-1 text-xs text-slate-500">
-            Đăng nhập hệ thống, phân quyền theo vai trò User và quản lý tài khoản vận hành EMS.
+            Quản lý danh sách tài khoản nội bộ của đơn vị vận hành để quản trị hệ thống và các dự án khách hàng.
           </p>
         </div>
         {canManage ? (
@@ -85,6 +102,12 @@ export function AccountList() {
           </Link>
         ) : null}
       </div>
+
+      {deleteError ? (
+        <div className="mb-4 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs font-medium text-rose-700">
+          {deleteError}
+        </div>
+      ) : null}
 
       {/* Search Input */}
       <div className="relative mb-6 max-w-md">
@@ -110,13 +133,17 @@ export function AccountList() {
               <tr className="border-b border-slate-100 bg-slate-50/60 text-[11px] font-semibold tracking-wider text-slate-400 uppercase">
                 <th className="px-5 py-3">Tên người dùng</th>
                 <th className="px-5 py-3">Địa chỉ Email</th>
-                <th className="px-5 py-3">Vai trò phân quyền</th>
+                <th className="px-5 py-3">Vai trò phân cấp</th>
+                <th className="px-5 py-3">Dự án được quản trị</th>
                 <th className="px-5 py-3">Ngày tạo</th>
                 <th className="px-5 py-3 text-right">Thao tác</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {pageRows.map((account) => (
+              {pageRows.map((account) => {
+                const role = normalizeAccountRole(account.role);
+                const assignedIds = account.projectIds ?? [];
+                return (
                 <tr
                   key={account.id}
                   className="hover:bg-slate-50/80 transition-colors"
@@ -134,10 +161,34 @@ export function AccountList() {
                   </td>
                   <td className="px-5 py-3.5">
                     <span
-                      className={`inline-flex rounded-full px-2.5 py-0.5 text-[10px] font-semibold ${ROLE_STYLE[account.role]}`}
+                      className={`inline-flex rounded-full px-2.5 py-0.5 text-[10px] font-semibold ${ROLE_STYLE[role]}`}
                     >
-                      {account.role}
+                      {role}
                     </span>
+                  </td>
+                  <td className="px-5 py-3.5">
+                    {role === "Admin" ? (
+                      <span className="inline-flex items-center rounded-md bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-700">
+                        Toàn bộ dự án ({projects.length})
+                      </span>
+                    ) : assignedIds.length === 0 ? (
+                      <span className="text-[11px] italic text-slate-400">Chưa gán dự án</span>
+                    ) : (
+                      <div className="flex flex-wrap gap-1">
+                        {assignedIds.map((pid) => {
+                          const proj = projectMap.get(pid);
+                          return (
+                            <span
+                              key={pid}
+                              className="inline-flex items-center gap-1 rounded-md border border-emerald-200/80 bg-emerald-50/70 px-2 py-0.5 text-[11px] font-medium text-emerald-800"
+                            >
+                              <span className="font-mono font-semibold">{pid}</span>
+                              {proj ? <span className="text-emerald-600">· {proj.customer || proj.name}</span> : null}
+                            </span>
+                          );
+                        })}
+                      </div>
+                    )}
                   </td>
                   <td className="px-5 py-3.5 text-slate-500 font-mono text-[11px]">
                     {account.createdAt}
@@ -166,10 +217,11 @@ export function AccountList() {
                     )}
                   </td>
                 </tr>
-              ))}
+                );
+              })}
               {pageRows.length === 0 && (
                 <tr>
-                  <td colSpan={5} className="px-5 py-12 text-center text-xs text-slate-400">
+                  <td colSpan={6} className="px-5 py-12 text-center text-xs text-slate-400">
                     Không tìm thấy tài khoản nào phù hợp với từ khóa tìm kiếm.
                   </td>
                 </tr>
@@ -215,9 +267,9 @@ export function AccountList() {
           i
         </span>
         <p className="leading-relaxed">
-          <strong className="font-semibold">Phân quyền User:</strong> Quản trị viên quản lý người dùng và dự án.
-          Quản lý dự án chỉnh sửa dự án/hệ số phát thải. Kỹ sư vận hành dùng Gateway và thiết bị.
-          Nhân viên kỹ thuật chủ yếu xem và theo dõi vận hành.
+          <strong className="font-semibold">Phân cấp tài khoản quản trị:</strong> Chỉ hiển thị các tài khoản nội bộ để quản lý các dự án khách hàng, gồm 2 cấp:{" "}
+          <strong>Admin</strong> (có quyền truy cập toàn bộ dự án &amp; quản trị người dùng) và{" "}
+          <strong>Manage</strong> (truy cập các dự án được cho phép quản trị). Cả 2 cấp đều có quyền cấu hình các thông tin phần quản trị.
         </p>
       </div>
 
@@ -227,10 +279,15 @@ export function AccountList() {
         description={`Bạn có chắc chắn muốn xóa tài khoản "${accountToDelete?.username}" (${accountToDelete?.email}) không? Người dùng sẽ không thể đăng nhập vào hệ thống sau khi bị xóa.`}
         confirmText="Xác nhận xóa"
         onConfirm={() => {
-          if (accountToDelete) {
-            setAccounts(removeAccount(accountToDelete.id));
-            setAccountToDelete(null);
-          }
+          if (!accountToDelete) return;
+          const target = accountToDelete;
+          setAccountToDelete(null);
+          setDeleteError("");
+          void removeAccount(target.id)
+            .then((next) => setAccounts(next))
+            .catch((err) =>
+              setDeleteError(err instanceof Error ? err.message : "Không thể xóa tài khoản."),
+            );
         }}
         onCancel={() => setAccountToDelete(null)}
       />

@@ -38,6 +38,19 @@ CREATE TABLE IF NOT EXISTS projects (
   KEY idx_projects_customer (customer)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS account_projects (
+  account_id VARCHAR(64) NOT NULL,
+  project_id VARCHAR(64) NOT NULL,
+  PRIMARY KEY (account_id, project_id),
+  KEY idx_account_projects_project (project_id),
+  CONSTRAINT fk_account_projects_account
+    FOREIGN KEY (account_id) REFERENCES accounts (id)
+    ON DELETE CASCADE ON UPDATE CASCADE,
+  CONSTRAINT fk_account_projects_project
+    FOREIGN KEY (project_id) REFERENCES projects (id)
+    ON DELETE CASCADE ON UPDATE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 ALTER TABLE projects
   ADD COLUMN IF NOT EXISTS logo_url MEDIUMTEXT NULL AFTER address;
 
@@ -66,16 +79,24 @@ CREATE TABLE IF NOT EXISTS customer_accounts (
   username VARCHAR(100) NOT NULL,
   email VARCHAR(255) NOT NULL,
   display_name VARCHAR(255) NOT NULL,
+  role VARCHAR(60) NOT NULL DEFAULT 'Admin',
   project_id VARCHAR(64) NOT NULL,
   password_hash CHAR(64) NOT NULL,
   PRIMARY KEY (id),
   UNIQUE KEY uq_customer_accounts_username (username),
   UNIQUE KEY uq_customer_accounts_email (email),
-  UNIQUE KEY uq_customer_accounts_project (project_id),
+  KEY idx_customer_accounts_project (project_id),
   CONSTRAINT fk_customer_accounts_project
     FOREIGN KEY (project_id) REFERENCES projects (id)
     ON DELETE CASCADE ON UPDATE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+ALTER TABLE customer_accounts
+  ADD COLUMN IF NOT EXISTS role VARCHAR(60) NOT NULL DEFAULT 'Admin' AFTER display_name;
+ALTER TABLE customer_accounts
+  ADD INDEX IF NOT EXISTS idx_customer_accounts_project (project_id);
+ALTER TABLE customer_accounts
+  DROP INDEX IF EXISTS uq_customer_accounts_project;
 
 CREATE TABLE IF NOT EXISTS devices (
   id VARCHAR(64) NOT NULL,
@@ -286,6 +307,13 @@ CREATE TABLE IF NOT EXISTS auth_sessions (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Reference rows only. Demo projects, devices, accounts, and telemetry are not seeded.
+DELETE FROM accounts WHERE id IN ('acc-2', 'acc-3', 'acc-4', 'acc-5', 'acc-6', 'acc-7', 'acc-8', 'acc-9', 'acc-10', 'acc-11', 'acc-12');
+
+INSERT IGNORE INTO accounts (id, username, email, role, password_hash, created_at) VALUES
+  ('acc-1', 'admin_system', 'admin@ems-precision.com', 'Admin', SHA2('123456', 256), '2024-01-01');
+
+UPDATE accounts SET role = 'Admin' WHERE role = 'Quản trị viên';
+UPDATE accounts SET role = 'Manage' WHERE role NOT IN ('Admin', 'Manage');
 
 INSERT IGNORE INTO meter_types (name, description, icon, builtin) VALUES
   ('Điện', 'Điện năng, công suất, chất lượng điện', 'bolt', 1),

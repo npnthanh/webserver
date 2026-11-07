@@ -1,7 +1,9 @@
 import type { PoolConnection } from "mysql2/promise";
 import { NextRequest } from "next/server";
+import { normalizeAccountRole } from "@/lib/accounts";
 import { getProjectsListTelemetry } from "@/lib/gateway-store";
-import { requirePermission } from "@/lib/server-auth";
+import { isAdminRole } from "@/lib/permissions";
+import { ensureAccountProjectsSchema, ensureCustomerAccountsSchema, getServerSession, requirePermission } from "@/lib/server-auth";
 import { emsDb, jsonField, queryRows } from "@/lib/server-db";
 
 type Params = { params: Promise<{ resource: string }> };
@@ -38,8 +40,21 @@ function serverError(error: unknown) {
       : "";
   const code = typeof error === "object" && error && "code" in error ? String((error as { code?: string }).code) : "";
   const message = error instanceof Error ? error.message : "";
+  const detail = `${sqlMessage} ${message}`;
   console.error("EMS API error", { code, message, sqlMessage, error });
-  if (code === "ER_DUP_ENTRY" || message.includes("uq_devices_serial_number")) {
+  if (
+    detail.includes("uq_accounts_username") ||
+    detail.includes("uq_customer_accounts_username")
+  ) {
+    return Response.json({ error: "Tên người dùng này đã tồn tại trên hệ thống." }, { status: 400 });
+  }
+  if (
+    detail.includes("uq_accounts_email") ||
+    detail.includes("uq_customer_accounts_email")
+  ) {
+    return Response.json({ error: "Địa chỉ email này đã tồn tại trên hệ thống." }, { status: 400 });
+  }
+  if (code === "ER_DUP_ENTRY" || detail.includes("uq_devices_serial_number")) {
     return Response.json({ error: "Serial này đã được dùng cho loại thiết bị khác." }, { status: 400 });
   }
   if (code === "ER_DATA_TOO_LONG" || message.includes("Data too long")) {
@@ -142,9 +157,47 @@ async function resourceName(context: Params) {
   return resource;
 }
 
-async function getProjects(projectId?: string) {
-  const where = projectId ? "WHERE p.id = ?" : "";
-  const params = projectId ? [projectId] : [];
+async function getAccounts() {
+  await ensureAccountProjectsSchema();
+  const [accounts, mappings] = await Promise.all([
+    queryRows<Row>(
+      `SELECT id, username, email, role, DATE_FORMAT(created_at, '%d/%m/%Y') AS createdAt
+         FROM accounts ORDER BY created_at DESC, id`,
+    ),
+    queryRows<Row>(
+      "SELECT account_id AS accountId, project_id AS projectId FROM account_projects ORDER BY account_id, project_id",
+    ),
+  ]);
+  const projectsByAccount = new Map<string, string[]>();
+  for (const row of mappings) {
+    const accountId = String(row.accountId);
+    const projectId = String(row.projectId);
+    projectsByAccount.set(accountId, [...(projectsByAccount.get(accountId) ?? []), projectId]);
+  }
+  return accounts.map((row) => {
+    const id = String(row.id);
+    const role = normalizeAccountRole(asString(row.role));
+    return {
+      ...row,
+      role,
+      projectIds: role === "Admin" ? [] : (projectsByAccount.get(id) ?? []),
+    };
+  });
+}
+
+async function getProjects(projectId?: string, allowedProjectIds?: string[]) {
+  if (allowedProjectIds && allowedProjectIds.length === 0) return [];
+  const clauses: string[] = [];
+  const params: string[] = [];
+  if (projectId) {
+    clauses.push("p.id = ?");
+    params.push(projectId);
+  }
+  if (allowedProjectIds) {
+    clauses.push(`p.id IN (${allowedProjectIds.map(() => "?").join(",")})`);
+    params.push(...allowedProjectIds);
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
   const projects = await queryRows<Row>(
     `SELECT p.id, p.initials, p.accent, p.name, p.customer, p.status,
             DATE_FORMAT(p.start_date, '%Y-%m-%d') AS startDate,
@@ -195,20 +248,25 @@ async function getProjects(projectId?: string) {
 async function getResource(resource: string, request: NextRequest) {
   const projectId = request.nextUrl.searchParams.get("projectId") || undefined;
   if (resource === "accounts") {
-    return queryRows<Row>(
-      `SELECT id, username, email, role, DATE_FORMAT(created_at, '%d/%m/%Y') AS createdAt
-         FROM accounts ORDER BY created_at DESC, id`,
-    );
+    return getAccounts();
   }
   if (resource === "customer-accounts") {
+    await ensureCustomerAccountsSchema();
     return queryRows<Row>(
-      `SELECT id, username, email, display_name AS displayName, project_id AS projectId
+      `SELECT id, username, email, display_name AS displayName, COALESCE(role, 'Admin') AS role, project_id AS projectId
          FROM customer_accounts ${projectId ? "WHERE project_id = ?" : ""}
-        ORDER BY id`,
+        ORDER BY CASE WHEN COALESCE(role, 'Admin') = 'Admin' THEN 0 ELSE 1 END, id`,
       projectId ? [projectId] : [],
     );
   }
-  if (resource === "projects") return getProjects(projectId);
+  if (resource === "projects") {
+    const session = await getServerSession();
+    const allowedProjectIds =
+      session?.portal === "admin" && !isAdminRole(session)
+        ? (session.managedProjectIds ?? [])
+        : undefined;
+    return getProjects(projectId, allowedProjectIds);
+  }
   if (resource === "project-telemetry") return getProjectsListTelemetry();
   if (resource === "devices") {
     await ensureDeviceColumns();
@@ -375,29 +433,51 @@ async function transaction<T>(work: (connection: PoolConnection) => Promise<T>) 
 
 async function saveResource(resource: string, body: Row) {
   if (resource === "accounts") {
+    await ensureAccountProjectsSchema();
     const items = Array.isArray(body.items) ? body.items : [body];
-    for (const item of items as Row[]) {
-      const password = asString(item.password, "123456");
-      await emsDb.execute(
-        `INSERT INTO accounts (id, username, email, role, password_hash, created_at)
-         VALUES (?, ?, ?, ?, SHA2(?, 256), STR_TO_DATE(?, '%d/%m/%Y'))
-         ON DUPLICATE KEY UPDATE username=VALUES(username), email=VALUES(email),
-           role=VALUES(role), created_at=VALUES(created_at),
-           password_hash=IF(? = '', password_hash, SHA2(?, 256))`,
-        [item.id, item.username, item.email, item.role, password, item.createdAt, password, password],
-      );
-    }
-    return getResource(resource, new NextRequest("http://localhost/api/ems/accounts"));
+    await transaction(async (connection) => {
+      for (const item of items as Row[]) {
+        const rawPassword = asString(item.password).trim();
+        const insertPassword = rawPassword || "123456";
+        const role = normalizeAccountRole(asString(item.role));
+        await connection.execute(
+          `INSERT INTO accounts (id, username, email, role, password_hash, created_at)
+           VALUES (?, ?, ?, ?, SHA2(?, 256), STR_TO_DATE(?, '%d/%m/%Y'))
+           ON DUPLICATE KEY UPDATE username=VALUES(username), email=VALUES(email),
+             role=VALUES(role), created_at=VALUES(created_at),
+             password_hash=IF(? = '', password_hash, SHA2(?, 256))`,
+          [item.id, item.username, item.email, role, insertPassword, item.createdAt, rawPassword, rawPassword],
+        );
+        if (role === "Admin" || Array.isArray(item.projectIds)) {
+          await connection.execute("DELETE FROM account_projects WHERE account_id = ?", [item.id]);
+        }
+        if (role === "Manage" && Array.isArray(item.projectIds)) {
+          const uniqueProjectIds = Array.from(
+            new Set(item.projectIds.map((pid: unknown) => asString(pid).trim()).filter(Boolean)),
+          );
+          for (const pid of uniqueProjectIds) {
+            await connection.execute(
+              "INSERT IGNORE INTO account_projects (account_id, project_id) VALUES (?, ?)",
+              [item.id, pid],
+            );
+          }
+        }
+      }
+    });
+    return getAccounts();
   }
   if (resource === "customer-accounts") {
-    const password = asString(body.password, "123456");
+    await ensureCustomerAccountsSchema();
+    const rawPassword = asString(body.password).trim();
+    const insertPassword = rawPassword || "123456";
+    const role = asString(body.role).trim() || "Admin";
     await emsDb.execute(
-      `INSERT INTO customer_accounts (id, username, email, display_name, project_id, password_hash)
-       VALUES (?, ?, ?, ?, ?, SHA2(?, 256))
+      `INSERT INTO customer_accounts (id, username, email, display_name, role, project_id, password_hash)
+       VALUES (?, ?, ?, ?, ?, ?, SHA2(?, 256))
        ON DUPLICATE KEY UPDATE username=VALUES(username), email=VALUES(email),
-         display_name=VALUES(display_name), project_id=VALUES(project_id),
+         display_name=VALUES(display_name), role=VALUES(role), project_id=VALUES(project_id),
          password_hash=IF(? = '', password_hash, SHA2(?, 256))`,
-      [body.id, body.username, body.email, body.displayName, body.projectId, password, password, password],
+      [body.id, body.username, body.email, body.displayName, role, body.projectId, insertPassword, rawPassword, rawPassword],
     );
     return getResource(resource, new NextRequest("http://localhost/api/ems/customer-accounts"));
   }
@@ -447,6 +527,14 @@ async function saveResource(resource: string, body: Row) {
         );
       }
     });
+    const session = await getServerSession();
+    if (session?.portal === "admin" && !isAdminRole(session)) {
+      await ensureAccountProjectsSchema();
+      await emsDb.execute(
+        "INSERT IGNORE INTO account_projects (account_id, project_id) VALUES (?, ?)",
+        [session.userId, body.id],
+      );
+    }
     return getProjects(asString(body.id));
   }
   if (resource === "devices") {
@@ -636,7 +724,9 @@ async function deleteResource(resource: string, request: NextRequest) {
     return { ok: true };
   }
   if (resource === "projects") {
+    await ensureAccountProjectsSchema();
     await transaction(async (connection) => {
+      await connection.execute("DELETE FROM account_projects WHERE project_id = ?", [id]);
       await connection.execute("UPDATE meter_points SET parent_id = NULL WHERE project_id = ?", [id]);
       await connection.execute("DELETE FROM projects WHERE id = ?", [id]);
     });
@@ -648,6 +738,17 @@ async function deleteResource(resource: string, request: NextRequest) {
   if (resource === "devices") {
     await ensureDeviceColumns();
     await emsDb.execute("UPDATE meter_points SET device_id = NULL WHERE device_id = ?", [id]);
+  }
+  if (resource === "accounts") {
+    await ensureAccountProjectsSchema();
+    await emsDb.execute("DELETE FROM account_projects WHERE account_id = ?", [id]);
+    await emsDb.execute("DELETE FROM auth_sessions WHERE portal = 'admin' AND user_id = ?", [id]);
+  }
+  if (resource === "customer-accounts") {
+    await emsDb.execute("DELETE FROM auth_sessions WHERE portal = 'customer' AND user_id = ?", [id]);
+  }
+  if (resource === "emission-factors") {
+    await emsDb.execute("DELETE FROM emission_factor_gases WHERE group_id = ?", [id]);
   }
   await emsDb.execute(`DELETE FROM ${table} WHERE ${key} = ?`, [id]);
   return { ok: true };

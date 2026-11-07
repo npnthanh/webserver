@@ -1,4 +1,5 @@
 import { AUTH_EVENT, AUTH_STORAGE_KEY, DEFAULT_PASSWORD } from "@/lib/auth-constants";
+import { normalizeAccountRole } from "@/lib/accounts";
 
 export { DEFAULT_PASSWORD, AUTH_EVENT, AUTH_STORAGE_KEY };
 
@@ -12,6 +13,7 @@ export type AuthSession = {
   email: string;
   role: string;
   projectId?: string;
+  managedProjectIds?: string[];
 };
 
 export type AuthResult =
@@ -113,7 +115,10 @@ export function clientProjectId(pathname: string) {
 
 export function canViewClientProject(session: AuthSession | null, projectId?: string) {
   if (!session || !projectId) return false;
-  if (session.portal === "admin") return true;
+  if (session.portal === "admin") {
+    if (normalizeAccountRole(session.role) === "Admin") return true;
+    return Array.isArray(session.managedProjectIds) && session.managedProjectIds.includes(projectId);
+  }
   return session.portal === "customer" && session.projectId === projectId;
 }
 

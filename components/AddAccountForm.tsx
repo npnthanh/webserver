@@ -2,12 +2,13 @@
 
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useAuth } from "@/components/auth/useAuth";
 import {
   ACCOUNT_ROLES,
+  ACCOUNT_ROLE_LABELS,
   hydrateAccounts,
-  loadAccounts,
+  normalizeAccountRole,
   todayLabel,
   upsertAccount,
   type Account,
@@ -15,6 +16,7 @@ import {
 } from "@/lib/accounts";
 import { DEFAULT_PASSWORD } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
+import { hydrateProjects, loadProjects, type Project } from "@/lib/projects";
 
 export function AddAccountForm() {
   const router = useRouter();
@@ -25,16 +27,33 @@ export function AddAccountForm() {
 
   const [username, setUsername] = useState("");
   const [email, setEmail] = useState("");
-  const [role, setRole] = useState<AccountRole>("Kỹ sư vận hành");
+  const [role, setRole] = useState<AccountRole>("Manage");
+  const [selectedProjectIds, setSelectedProjectIds] = useState<string[]>([]);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [projectSearch, setProjectSearch] = useState("");
   const [password, setPassword] = useState("");
   const [createdAt, setCreatedAt] = useState(todayLabel());
   const [isEdit, setIsEdit] = useState(false);
   const [existing, setExisting] = useState<Account | null>(null);
+  const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    setProjects(loadProjects());
+    let active = true;
+    void hydrateProjects().then((items) => {
+      if (active) setProjects(items);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!editingId) {
       setIsEdit(false);
       setExisting(null);
+      setSelectedProjectIds([]);
       return;
     }
     let active = true;
@@ -44,13 +63,15 @@ export function AddAccountForm() {
       if (!found) {
         setIsEdit(false);
         setExisting(null);
+        setSelectedProjectIds([]);
         return;
       }
       setIsEdit(true);
       setExisting(found);
       setUsername(found.username);
       setEmail(found.email);
-      setRole(found.role);
+      setRole(normalizeAccountRole(found.role));
+      setSelectedProjectIds(found.projectIds ?? []);
       setCreatedAt(found.createdAt);
       setPassword("");
     });
@@ -59,21 +80,62 @@ export function AddAccountForm() {
     };
   }, [editingId]);
 
-  function handleSubmit() {
-    if (!canManage) return;
+  const filteredProjects = useMemo(() => {
+    const q = projectSearch.trim().toLowerCase();
+    if (!q) return projects;
+    return projects.filter(
+      (item) =>
+        item.id.toLowerCase().includes(q) ||
+        item.name.toLowerCase().includes(q) ||
+        item.customer.toLowerCase().includes(q),
+    );
+  }, [projects, projectSearch]);
+
+  function toggleProject(projectId: string) {
+    setSelectedProjectIds((current) =>
+      current.includes(projectId)
+        ? current.filter((id) => id !== projectId)
+        : [...current, projectId],
+    );
+  }
+
+  function selectAllFiltered() {
+    setSelectedProjectIds((current) => {
+      const next = new Set(current);
+      for (const item of filteredProjects) next.add(item.id);
+      return [...next];
+    });
+  }
+
+  function clearAllProjects() {
+    setSelectedProjectIds([]);
+  }
+
+  async function handleSubmit() {
+    if (!canManage || saving) return;
     const name = username.trim();
     const mail = email.trim();
     if (!name || !mail) return;
 
-    upsertAccount({
-      id: editingId && isEdit ? editingId : `acc-${Date.now()}`,
-      username: name,
-      email: mail,
-      role,
-      createdAt: isEdit ? createdAt : todayLabel(),
-      password: password.trim() || existing?.password || DEFAULT_PASSWORD,
-    });
-    router.push("/tai-khoan");
+    setError("");
+    setSaving(true);
+    try {
+      const nextPassword = password.trim();
+      await upsertAccount({
+        id: editingId && isEdit ? editingId : `acc-${Date.now()}`,
+        username: name,
+        email: mail,
+        role,
+        projectIds: role === "Admin" ? [] : selectedProjectIds,
+        createdAt: isEdit && existing ? createdAt : todayLabel(),
+        password: isEdit ? nextPassword || undefined : nextPassword || DEFAULT_PASSWORD,
+      });
+      router.push("/tai-khoan");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Không thể lưu tài khoản.");
+    } finally {
+      setSaving(false);
+    }
   }
 
   if (!canManage) {
@@ -109,19 +171,25 @@ export function AddAccountForm() {
       >
         <div className="mb-6">
           <h2 className="text-[15px] font-semibold text-slate-800">
-            {isEdit ? "Thông tin tài khoản" : "Thêm tài khoản mới"}
+            {isEdit ? "Thông tin tài khoản nội bộ" : "Thêm tài khoản nội bộ mới"}
           </h2>
           <p className="mt-1 text-sm text-slate-500">
-            Nhập thông tin đăng nhập và vai trò truy cập cho người dùng.
+            Cấp tài khoản nội bộ để quản trị hệ thống và quản lý các dự án khách hàng.
           </p>
         </div>
+
+        {error ? (
+          <div className="mb-4 rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs font-medium text-rose-700">
+            {error}
+          </div>
+        ) : null}
 
         <div className="grid gap-4 sm:grid-cols-2">
           <Field label="TÊN NGƯỜI DÙNG">
             <input
               value={username}
               onChange={(e) => setUsername(e.target.value)}
-              placeholder="Ví dụ: kisu_vanhanh"
+              placeholder="Ví dụ: admin_vanhanh"
               className="input"
               required
             />
@@ -131,12 +199,12 @@ export function AddAccountForm() {
               type="email"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
-              placeholder="Ví dụ: operator01@sunergy.com"
+              placeholder="Ví dụ: admin@ems-precision.com"
               className="input"
               required
             />
           </Field>
-          <Field label="VAI TRÒ">
+          <Field label="VAI TRÒ PHÂN CẤP">
             <div className="relative">
               <select
                 value={role}
@@ -145,7 +213,7 @@ export function AddAccountForm() {
               >
                 {ACCOUNT_ROLES.map((item) => (
                   <option key={item} value={item}>
-                    {item}
+                    {ACCOUNT_ROLE_LABELS[item]}
                   </option>
                 ))}
               </select>
@@ -164,6 +232,122 @@ export function AddAccountForm() {
           </Field>
         </div>
 
+        {/* Danh sách các dự án / khách hàng được quản trị */}
+        <div className="mt-6 border-t border-slate-100 pt-6">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h3 className="text-[14px] font-semibold text-slate-800">
+                Các dự án / khách hàng được quản trị
+              </h3>
+              <p className="mt-0.5 text-xs text-slate-500">
+                {role === "Admin"
+                  ? "Tài khoản Admin có toàn quyền truy cập và cấu hình tất cả các dự án trên hệ thống."
+                  : "Chọn các dự án (khách hàng) mà tài khoản Manage này được phép truy cập và cấu hình."}
+              </p>
+            </div>
+            {role === "Admin" ? (
+              <span className="inline-flex items-center gap-1.5 rounded-full bg-slate-900 px-3 py-1 text-xs font-semibold text-white">
+                Toàn bộ dự án ({projects.length})
+              </span>
+            ) : (
+              <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-xs font-semibold text-emerald-700">
+                Đã chọn {selectedProjectIds.length} / {projects.length} dự án
+              </span>
+            )}
+          </div>
+
+          {role === "Admin" ? (
+            <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50/70 p-4">
+              {projects.length === 0 ? (
+                <p className="text-xs text-slate-500">Hiện chưa có dự án nào trên hệ thống.</p>
+              ) : (
+                <div className="flex flex-wrap gap-2">
+                  {projects.map((project) => (
+                    <span
+                      key={project.id}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 shadow-2xs"
+                    >
+                      <span className="font-mono font-semibold text-emerald-700">{project.id}</span>
+                      <span className="text-slate-300">•</span>
+                      <span>{project.customer || project.name}</span>
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="mt-4 space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <input
+                  type="search"
+                  value={projectSearch}
+                  onChange={(e) => setProjectSearch(e.target.value)}
+                  placeholder="Tìm kiếm mã dự án, tên dự án hoặc khách hàng..."
+                  className="h-9 w-full max-w-sm rounded-lg border border-slate-200 bg-white px-3 text-xs text-slate-800 outline-none placeholder:text-slate-400 focus:border-emerald-500"
+                />
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={selectAllFiltered}
+                    className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-600 hover:bg-slate-50 transition-colors"
+                  >
+                    Chọn tất cả
+                  </button>
+                  <button
+                    type="button"
+                    onClick={clearAllProjects}
+                    className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-500 hover:bg-slate-50 transition-colors"
+                  >
+                    Bỏ chọn hết
+                  </button>
+                </div>
+              </div>
+
+              {filteredProjects.length === 0 ? (
+                <div className="rounded-xl border border-dashed border-slate-200 p-6 text-center text-xs text-slate-400">
+                  Không tìm thấy dự án nào phù hợp.
+                </div>
+              ) : (
+                <div className="grid max-h-[320px] gap-2.5 overflow-y-auto pr-1 sm:grid-cols-2">
+                  {filteredProjects.map((project) => {
+                    const checked = selectedProjectIds.includes(project.id);
+                    return (
+                      <label
+                        key={project.id}
+                        className={`flex cursor-pointer items-start gap-3 rounded-xl border p-3 transition-all ${
+                          checked
+                            ? "border-emerald-500 bg-emerald-50/50 shadow-2xs"
+                            : "border-slate-200 bg-white hover:border-slate-300 hover:bg-slate-50/60"
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => toggleProject(project.id)}
+                          className="mt-0.5 h-4 w-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                        />
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="truncate text-xs font-bold text-slate-900">
+                              {project.customer || project.name}
+                            </span>
+                            <span className="shrink-0 rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-slate-600">
+                              {project.id}
+                            </span>
+                          </div>
+                          <p className="mt-0.5 truncate text-[11px] text-slate-500">
+                            Dự án: {project.name}
+                          </p>
+                        </div>
+                      </label>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
         <div className="mt-8 flex flex-wrap justify-end gap-3">
           <Link
             href="/tai-khoan"
@@ -173,9 +357,10 @@ export function AddAccountForm() {
           </Link>
           <button
             type="submit"
-            className="h-10 rounded-xl bg-emerald-600 px-5 text-sm font-semibold text-white shadow-xs hover:bg-emerald-700 transition-colors"
+            disabled={saving}
+            className="h-10 rounded-xl bg-emerald-600 px-5 text-sm font-semibold text-white shadow-xs hover:bg-emerald-700 disabled:opacity-60 transition-colors"
           >
-            {isEdit ? "Cập nhật tài khoản" : "Lưu tài khoản"}
+            {saving ? "Đang lưu..." : isEdit ? "Cập nhật tài khoản" : "Lưu tài khoản"}
           </button>
         </div>
       </form>
@@ -185,8 +370,9 @@ export function AddAccountForm() {
           i
         </span>
         <p>
-          <span className="font-semibold text-emerald-900">Mẹo:</span> Chỉ cấp quyền Quản trị viên cho người vận
-          hành hệ thống. Kỹ sư vận hành chỉ nên được phép theo dõi điểm đo và cảnh báo.
+          <span className="font-semibold text-emerald-900">Phân cấp quyền:</span> Hệ thống chỉ gồm 2 cấp là{" "}
+          <strong>Admin</strong> (truy cập toàn bộ dự án &amp; quản trị người dùng) và{" "}
+          <strong>Manage</strong> (truy cập các dự án được cấp phép ở trên). Cả 2 cấp đều có quyền cấu hình đầy đủ các thông tin phần quản trị.
         </p>
       </div>
     </div>

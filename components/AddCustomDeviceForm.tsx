@@ -5,6 +5,8 @@ import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { METER_MODEL_BY_CODE } from "@/lib/gateway-protocol";
+import { METER_PARAMETERS } from "@/lib/meter-parameters";
 import {
   hydrateDevices,
   kindFromDeviceType,
@@ -21,7 +23,18 @@ type RegisterRow = DeviceRegister;
 
 const protocols = ["Modbus TCP", "Modbus RTU", "M-Bus", "BACnet", "MQTT"];
 const dataTypes = ["UINT16", "UINT32", "INT32", "FLOAT32", "FLOAT64"];
-const deviceCategories = ["PM2230", "PM5100", "iEM3000", "SITRANS F", "MAG 5100", "SensyTemp", "EJX"];
+const deviceCategories = Array.from(new Set(Object.values(METER_MODEL_BY_CODE)));
+
+function defaultPm2230Registers(): RegisterRow[] {
+  const coreKeys = ["EPaed", "Papt", "Qrpt", "Sapt", "VLNavg", "VLLavg", "Iavg", "PFt", "F", "THDVln", "THDCa"];
+  return METER_PARAMETERS.filter((param) => coreKeys.includes(param.key)).map((param, idx) => ({
+    id: `r-${idx + 1}`,
+    address: param.key,
+    name: `${param.name}${param.unit ? ` (${param.unit})` : ""}`,
+    dataType: "FLOAT32",
+    multiplier: "1.0",
+  }));
+}
 
 function nextId(prefix: string) {
   return `${prefix}-${Math.random().toString(36).slice(2, 8)}`;
@@ -199,14 +212,25 @@ export function AddCustomDeviceForm() {
         </div>
 
         <div className="grid gap-4 sm:grid-cols-2">
-          <Field label="1. Category">
+          <Field label="1. Category (Loại đồng hồ hỗ trợ)">
             <select
               value={category}
-              onChange={(e) => setCategory(e.target.value)}
+              onChange={(e) => {
+                const nextCat = e.target.value;
+                setCategory(nextCat);
+                if (nextCat === "PM2230") {
+                  if (!brand.trim()) setBrand("Schneider Electric");
+                  if (!model.trim()) setModel("PM2230");
+                  if (!deviceType.trim()) setDeviceType("Đồng hồ điện 3 pha");
+                  if (rows.length === 1 && !rows[0].address.trim() && !rows[0].name.trim()) {
+                    setRows(defaultPm2230Registers());
+                  }
+                }
+              }}
               className="input"
               required
             >
-              <option value="">Chọn category</option>
+              <option value="">Chọn loại đồng hồ</option>
               {deviceCategories.map((item) => (
                 <option key={item} value={item}>
                   {item}
@@ -238,7 +262,7 @@ export function AddCustomDeviceForm() {
             <input
               value={model}
               onChange={(e) => setModel(e.target.value)}
-              placeholder="VD: PowerLogic PM5000"
+              placeholder="VD: PowerLogic PM2230"
               className="input"
             />
           </Field>
