@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { CustomSelect } from "@/components/ui/CustomSelect";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useAuth } from "@/components/auth/useAuth";
@@ -206,7 +207,7 @@ export function AddAccountForm() {
           </Field>
           <Field label="VAI TRÒ PHÂN CẤP">
             <div className="relative">
-              <select
+              <CustomSelect
                 value={role}
                 onChange={(e) => setRole(e.target.value as AccountRole)}
                 className="input appearance-none pr-9"
@@ -216,7 +217,7 @@ export function AddAccountForm() {
                     {ACCOUNT_ROLE_LABELS[item]}
                   </option>
                 ))}
-              </select>
+              </CustomSelect>
               <ChevronIcon className="pointer-events-none absolute top-1/2 right-3 h-4 w-4 -translate-y-1/2 text-slate-400" />
             </div>
           </Field>

@@ -2,8 +2,16 @@
 
 import { useMemo, useState } from "react";
 import { ChartTimeline } from "@/components/client/ChartTimeline";
+import {
+  buildSampleTableRows,
+  ChartDataTable,
+  ChartViewToolbar,
+  type ChartViewMode,
+} from "@/components/client/ChartViewToolbar";
 import { useChartSize } from "@/components/client/useChartSize";
+import { CustomSelect } from "@/components/ui/CustomSelect";
 import { chartTimeLabel, chartTimeTicks, domainTicks, paddedDomain, valuesForKeysAverage, type ChartSample } from "@/lib/gateway-series";
+import { getTimeFilterLabel, type TimeFilterValue } from "./TimeFilterBar";
 
 const N = 160;
 const AGGS = ["MAX", "AVG", "MIN"] as const;
@@ -40,7 +48,16 @@ function unbalanceKeys(qty: string) {
   return ["Vuab", "Vubc", "Vuca"];
 }
 
-export function UnbalanceChart({ samples }: { samples?: ChartSample[] }) {
+export function UnbalanceChart({
+  samples,
+  timeFilter,
+  onRefresh,
+}: {
+  samples?: ChartSample[];
+  timeFilter?: TimeFilterValue;
+  onRefresh?: () => void;
+}) {
+  const [view, setView] = useState<ChartViewMode>("chart");
   const [topQty, setTopQty] = useState("Uunb");
   const [botQty, setBotQty] = useState("Iunb");
   const [aggs, setAggs] = useState<Agg[]>(["AVG"]);
@@ -97,41 +114,67 @@ export function UnbalanceChart({ samples }: { samples?: ChartSample[] }) {
   );
   const timelineValues = uSeries[0]?.values ?? Array.from({ length: N }, () => 0);
 
+  const tableColumns = useMemo(
+    () => [
+      { header: "Thời điểm" },
+      ...uSeries.map((s) => ({ header: `${s.name} (%)`, color: s.color })),
+      ...iSeries.map((s) => ({ header: `${s.name} (%)`, color: s.color })),
+    ],
+    [uSeries, iSeries],
+  );
+
+  const tableRows = useMemo(
+    () =>
+      buildSampleTableRows(
+        samples,
+        [
+          ...uSeries.map((s) => ({ ...s, unit: "%", digits: 2 })),
+          ...iSeries.map((s) => ({ ...s, unit: "%", digits: 2 })),
+        ],
+        viewWin,
+        N,
+      ),
+    [samples, uSeries, iSeries, viewWin],
+  );
+
   return (
     <section className="mt-4 w-full min-w-0 rounded-lg border border-slate-200 bg-white p-3 shadow-[0_1px_2px_rgba(16,24,40,0.04)] lg:p-4">
       <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-2">
-          <select
+          <CustomSelect
             value={topQty}
             onChange={(e) => setTopQty(e.target.value)}
-            className="h-8 rounded border border-slate-300 bg-white px-2 text-[13px] text-slate-700"
+            className="h-8 rounded-lg border border-slate-200 bg-white px-2.5 text-[13px] font-medium text-slate-700 shadow-2xs"
           >
             <option>Uunb</option>
             <option>Uneg</option>
             <option>Uzero</option>
-          </select>
-          <select
+          </CustomSelect>
+          <CustomSelect
             value={botQty}
             onChange={(e) => setBotQty(e.target.value)}
-            className="h-8 rounded border border-slate-300 bg-white px-2 text-[13px] text-slate-700"
+            className="h-8 rounded-lg border border-slate-200 bg-white px-2.5 text-[13px] font-medium text-slate-700 shadow-2xs"
           >
             <option>Iunb</option>
             <option>Ineg</option>
             <option>Izero</option>
-          </select>
+          </CustomSelect>
         </div>
-        <div className="flex items-center gap-3 rounded border border-slate-200 px-2.5 py-1 text-[12px] text-slate-600">
-          {AGGS.map((agg) => (
-            <label key={agg} className="inline-flex cursor-pointer items-center gap-1">
-              <input
-                type="checkbox"
-                checked={aggs.includes(agg)}
-                onChange={() => setAggs((list) => toggleIn(list, agg))}
-                className="accent-emerald-600"
-              />
-              {agg}
-            </label>
-          ))}
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="flex items-center gap-3 rounded border border-slate-200 px-2.5 py-1 text-[12px] text-slate-600">
+            {AGGS.map((agg) => (
+              <label key={agg} className="inline-flex cursor-pointer items-center gap-1">
+                <input
+                  type="checkbox"
+                  checked={aggs.includes(agg)}
+                  onChange={() => setAggs((list) => toggleIn(list, agg))}
+                  className="accent-emerald-600"
+                />
+                {agg}
+              </label>
+            ))}
+          </div>
+          <ChartViewToolbar view={view} onViewChange={setView} onRefresh={onRefresh} />
         </div>
       </div>
 
@@ -139,47 +182,59 @@ export function UnbalanceChart({ samples }: { samples?: ChartSample[] }) {
         <ChartTimeline compact labels={timelineLabels} values={timelineValues} range={viewWin} onRange={setViewWin} />
       </div>
 
-      <div className="min-w-0 w-full overflow-hidden rounded-[2px] border border-slate-400 bg-white">
-        <UnbPane
-          title={`${topQty} [%]`}
-          series={uSeries}
-          samples={samples}
-          viewWin={viewWin}
-          hover={crosshair ? hover : null}
-          onHover={setHover}
-          domain={uDomain}
-          ticks={uTicks}
-          formatTick={(v) => (v === 0 ? "0" : v.toFixed(1))}
-        />
-        <div className="h-px bg-slate-400" />
-        <UnbPane
-          title={`${botQty} [%]`}
-          series={iSeries}
-          samples={samples}
-          viewWin={viewWin}
-          hover={crosshair ? hover : null}
-          onHover={setHover}
-          domain={iDomain}
-          ticks={iTicks}
-          formatTick={(v) => String(v)}
-          axis
-        />
-      </div>
+      {view === "chart" ? (
+        <>
+          <div className="min-w-0 w-full overflow-hidden rounded-[2px] border border-slate-400 bg-white">
+            <UnbPane
+              title={`${topQty} [%]`}
+              series={uSeries}
+              samples={samples}
+              viewWin={viewWin}
+              hover={crosshair ? hover : null}
+              onHover={setHover}
+              domain={uDomain}
+              ticks={uTicks}
+              formatTick={(v) => (v === 0 ? "0" : v.toFixed(1))}
+            />
+            <div className="h-px bg-slate-400" />
+            <UnbPane
+              title={`${botQty} [%]`}
+              series={iSeries}
+              samples={samples}
+              viewWin={viewWin}
+              hover={crosshair ? hover : null}
+              onHover={setHover}
+              domain={iDomain}
+              ticks={iTicks}
+              formatTick={(v) => String(v)}
+              axis
+            />
+          </div>
 
-      <div className="mt-2 flex w-[68px] flex-wrap gap-1">
-        <ToolBtn label="Phóng to" onClick={zoomIn}>
-          <ZoomIcon plus />
-        </ToolBtn>
-        <ToolBtn label="Thu nhỏ" onClick={zoomOut}>
-          <ZoomIcon plus={false} />
-        </ToolBtn>
-        <ToolBtn label="Vừa khung" onClick={() => setViewWin({ start: 0, end: N - 1 })}>
-          <FitIcon />
-        </ToolBtn>
-        <ToolBtn label="Con trỏ" active={crosshair} onClick={() => setCrosshair((v) => !v)}>
-          <CursorIcon />
-        </ToolBtn>
-      </div>
+          <div className="mt-2 flex w-[68px] flex-wrap gap-1">
+            <ToolBtn label="Phóng to" onClick={zoomIn}>
+              <ZoomIcon plus />
+            </ToolBtn>
+            <ToolBtn label="Thu nhỏ" onClick={zoomOut}>
+              <ZoomIcon plus={false} />
+            </ToolBtn>
+            <ToolBtn label="Vừa khung" onClick={() => setViewWin({ start: 0, end: N - 1 })}>
+              <FitIcon />
+            </ToolBtn>
+            <ToolBtn label="Con trỏ" active={crosshair} onClick={() => setCrosshair((v) => !v)}>
+              <CursorIcon />
+            </ToolBtn>
+          </div>
+        </>
+      ) : (
+        <ChartDataTable
+          title={`Biểu đồ Mất cân bằng pha (${topQty} / ${botQty})`}
+          subtitle={timeFilter ? `Kỳ hiển thị: ${getTimeFilterLabel(timeFilter)}` : undefined}
+          filename="bieu-do-mat-can-bang-pha"
+          columns={tableColumns}
+          rows={tableRows}
+        />
+      )}
     </section>
   );
 }

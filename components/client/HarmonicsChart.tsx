@@ -2,8 +2,15 @@
 
 import { useMemo, useState } from "react";
 import { ChartTimeline } from "@/components/client/ChartTimeline";
+import {
+  buildSampleTableRows,
+  ChartDataTable,
+  ChartViewToolbar,
+  type ChartViewMode,
+} from "@/components/client/ChartViewToolbar";
 import { useChartSize } from "@/components/client/useChartSize";
 import { chartTimeLabel, chartTimeTicks, domainTicks, latestValue, paddedDomain, valuesForKey, type ChartSample } from "@/lib/gateway-series";
+import { getTimeFilterLabel, type TimeFilterValue } from "./TimeFilterBar";
 
 const N = 160;
 const CHANNELS = [1, 2, 3] as const;
@@ -78,7 +85,16 @@ function peakHarmDomain(kind: "u" | "i"): { domain: [number, number]; ticks: num
     : { domain: [0, 40], ticks: [0, 10, 20, 30, 40], unit: "[A]" };
 }
 
-export function HarmonicsChart({ samples }: { samples?: ChartSample[] }) {
+export function HarmonicsChart({
+  samples,
+  timeFilter,
+  onRefresh,
+}: {
+  samples?: ChartSample[];
+  timeFilter?: TimeFilterValue;
+  onRefresh?: () => void;
+}) {
+  const [view, setView] = useState<ChartViewMode>("chart");
   const [tab, setTab] = useState<"trend" | "peak">("trend");
   const [thduComponents, setThduComponents] = useState<ThduComponent[]>(["up"]);
   const [thduChannels, setThduChannels] = useState<Channel[]>([1, 2, 3]);
@@ -180,31 +196,94 @@ export function HarmonicsChart({ samples }: { samples?: ChartSample[] }) {
   );
   const timelineValues = thduSeries[0]?.values ?? Array.from({ length: N }, () => 0);
 
+  const trendColumns = useMemo(
+    () => [
+      { header: "Thời điểm" },
+      ...thduSeries.map((s) => ({ header: `${s.name} (%)`, color: s.color })),
+      ...thdiSeries.map((s) => ({ header: `${s.name} (%)`, color: s.color })),
+    ],
+    [thduSeries, thdiSeries],
+  );
+
+  const trendRows = useMemo(
+    () =>
+      buildSampleTableRows(
+        samples,
+        [
+          ...thduSeries.map((s) => ({ ...s, unit: "%", digits: 2 })),
+          ...thdiSeries.map((s) => ({ ...s, unit: "%", digits: 2 })),
+        ],
+        viewWin,
+        N,
+      ),
+    [samples, thduSeries, thdiSeries, viewWin],
+  );
+
+  const peakColumns = useMemo(
+    () => [
+      { header: "Bậc sóng hài" },
+      ...thduChannels.map((ch) => ({
+        header: `${PHASES[ch - 1].u} (V)`,
+        color: PHASES[ch - 1].color,
+      })),
+      ...thdiChannels.map((ch) => ({
+        header: `${PHASES[ch - 1].i} (A)`,
+        color: PHASES[ch - 1].color,
+      })),
+    ],
+    [thduChannels, thdiChannels],
+  );
+
+  const peakRows = useMemo(
+    () =>
+      ORDERS.map((order) => ({
+        label: `Bậc H${order}`,
+        values: [
+          ...thduChannels.map((ch) => {
+            const raw = Number(
+              (samples?.length ? latestValue(samples, harmOrderKey("u", ch, order)) ?? 0 : 0).toFixed(2),
+            );
+            return { raw, display: `${raw.toFixed(2)} V` };
+          }),
+          ...thdiChannels.map((ch) => {
+            const raw = Number(
+              (samples?.length ? latestValue(samples, harmOrderKey("i", ch, order)) ?? 0 : 0).toFixed(2),
+            );
+            return { raw, display: `${raw.toFixed(2)} A` };
+          }),
+        ],
+      })),
+    [samples, thduChannels, thdiChannels],
+  );
+
   return (
     <section className="mt-4 w-full min-w-0 rounded-lg border border-slate-200 bg-white p-3 shadow-[0_1px_2px_rgba(16,24,40,0.04)] lg:p-4">
-      <div className="mb-2.5 inline-flex overflow-hidden rounded-lg border border-slate-200 bg-slate-100/80 p-0.5 text-[12px] font-medium shadow-2xs">
-        <button
-          type="button"
-          onClick={() => setTab("trend")}
-          className={`h-8 rounded-md px-3.5 transition-all ${
-            tab === "trend"
-              ? "bg-white font-semibold text-emerald-700 shadow-xs"
-              : "text-slate-600 hover:text-slate-900"
-          }`}
-        >
-          Biểu đồ xu hướng
-        </button>
-        <button
-          type="button"
-          onClick={() => setTab("peak")}
-          className={`h-8 rounded-md px-3.5 transition-all ${
-            tab === "peak"
-              ? "bg-white font-semibold text-emerald-700 shadow-xs"
-              : "text-slate-600 hover:text-slate-900"
-          }`}
-        >
-          Mức đỉnh bậc
-        </button>
+      <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2">
+        <div className="inline-flex overflow-hidden rounded-lg border border-slate-200 bg-slate-100/80 p-0.5 text-[12px] font-medium shadow-2xs">
+          <button
+            type="button"
+            onClick={() => setTab("trend")}
+            className={`h-8 rounded-md px-3.5 transition-all ${
+              tab === "trend"
+                ? "bg-white font-semibold text-emerald-700 shadow-xs"
+                : "text-slate-600 hover:text-slate-900"
+            }`}
+          >
+            Biểu đồ xu hướng
+          </button>
+          <button
+            type="button"
+            onClick={() => setTab("peak")}
+            className={`h-8 rounded-md px-3.5 transition-all ${
+              tab === "peak"
+                ? "bg-white font-semibold text-emerald-700 shadow-xs"
+                : "text-slate-600 hover:text-slate-900"
+            }`}
+          >
+            Mức đỉnh bậc
+          </button>
+        </div>
+        <ChartViewToolbar view={view} onViewChange={setView} onRefresh={onRefresh} />
       </div>
 
       <div className="mb-3 rounded border border-slate-300 bg-slate-50/80 px-3 py-2">
@@ -286,65 +365,86 @@ export function HarmonicsChart({ samples }: { samples?: ChartSample[] }) {
         </div>
       </div>
 
-      {tab === "trend" ? (
+      {view === "chart" ? (
         <>
-        <div className="mb-2">
-          <ChartTimeline compact labels={timelineLabels} values={timelineValues} range={viewWin} onRange={setViewWin} />
-        </div>
-        <div className="min-w-0 w-full overflow-hidden rounded-[2px] border border-slate-400 bg-white">
-          <HarmPane
-            title={`THDu ${thduScale.unit}`}
-            series={thduSeries}
-            samples={samples}
-            viewWin={viewWin}
-            hover={crosshair ? hover : null}
-            onHover={setHover}
-            domain={thduScale.domain}
-            ticks={thduScale.ticks}
-            formatTick={(v) => String(v)}
-          />
-          <div className="h-px bg-slate-400" />
-          <HarmPane
-            title={`THDi ${thdiScale.unit}`}
-            series={thdiSeries}
-            samples={samples}
-            viewWin={viewWin}
-            hover={crosshair ? hover : null}
-            onHover={setHover}
-            domain={thdiScale.domain}
-            ticks={thdiScale.ticks}
-            formatTick={(v) => String(v)}
-            axis
-          />
-        </div>
+          {tab === "trend" ? (
+            <>
+              <div className="mb-2">
+                <ChartTimeline compact labels={timelineLabels} values={timelineValues} range={viewWin} onRange={setViewWin} />
+              </div>
+              <div className="min-w-0 w-full overflow-hidden rounded-[2px] border border-slate-400 bg-white">
+                <HarmPane
+                  title={`THDu ${thduScale.unit}`}
+                  series={thduSeries}
+                  samples={samples}
+                  viewWin={viewWin}
+                  hover={crosshair ? hover : null}
+                  onHover={setHover}
+                  domain={thduScale.domain}
+                  ticks={thduScale.ticks}
+                  formatTick={(v) => String(v)}
+                />
+                <div className="h-px bg-slate-400" />
+                <HarmPane
+                  title={`THDi ${thdiScale.unit}`}
+                  series={thdiSeries}
+                  samples={samples}
+                  viewWin={viewWin}
+                  hover={crosshair ? hover : null}
+                  onHover={setHover}
+                  domain={thdiScale.domain}
+                  ticks={thdiScale.ticks}
+                  formatTick={(v) => String(v)}
+                  axis
+                />
+              </div>
+            </>
+          ) : (
+            <PeakOrderView
+              uCh={thduChannels}
+              iCh={thdiChannels}
+              orders={orders}
+              samples={samples}
+              uTitle={`U harmonic ${peakUScale.unit}`}
+              iTitle={`I harmonic ${peakIScale.unit}`}
+              uDomain={peakDomainFromSamples(samples, "u", peakUScale.domain)}
+              iDomain={peakDomainFromSamples(samples, "i", peakIScale.domain)}
+            />
+          )}
+
+          <div className="mt-2 flex w-[68px] flex-wrap gap-1">
+            <ToolBtn label="Phóng to" onClick={zoomIn}>
+              <ZoomIcon plus />
+            </ToolBtn>
+            <ToolBtn label="Thu nhỏ" onClick={zoomOut}>
+              <ZoomIcon plus={false} />
+            </ToolBtn>
+            <ToolBtn label="Vừa khung" onClick={() => setViewWin({ start: 0, end: N - 1 })}>
+              <FitIcon />
+            </ToolBtn>
+            <ToolBtn label="Con trỏ" active={crosshair} onClick={() => setCrosshair((v) => !v)}>
+              <CursorIcon />
+            </ToolBtn>
+          </div>
         </>
+      ) : tab === "trend" ? (
+        <ChartDataTable
+          title="Biểu đồ Sóng hài xu hướng (THDu / THDi)"
+          subtitle={timeFilter ? `Kỳ hiển thị: ${getTimeFilterLabel(timeFilter)}` : undefined}
+          filename="bieu-do-song-hai-xu-huong"
+          columns={trendColumns}
+          rows={trendRows}
+        />
       ) : (
-        <PeakOrderView
-          uCh={thduChannels}
-          iCh={thdiChannels}
-          orders={orders}
-          samples={samples}
-          uTitle={`U harmonic ${peakUScale.unit}`}
-          iTitle={`I harmonic ${peakIScale.unit}`}
-          uDomain={peakDomainFromSamples(samples, "u", peakUScale.domain)}
-          iDomain={peakDomainFromSamples(samples, "i", peakIScale.domain)}
+        <ChartDataTable
+          title="Biểu đồ Sóng hài theo mức đỉnh bậc (H3 - H13)"
+          subtitle={timeFilter ? `Kỳ hiển thị: ${getTimeFilterLabel(timeFilter)}` : undefined}
+          filename="bieu-do-song-hai-dinh-bac"
+          columns={peakColumns}
+          rows={peakRows}
+          rowCountLabel={`Bảng số liệu sóng hài (${peakRows.length} bậc)`}
         />
       )}
-
-      <div className="mt-2 flex w-[68px] flex-wrap gap-1">
-        <ToolBtn label="Phóng to" onClick={zoomIn}>
-          <ZoomIcon plus />
-        </ToolBtn>
-        <ToolBtn label="Thu nhỏ" onClick={zoomOut}>
-          <ZoomIcon plus={false} />
-        </ToolBtn>
-        <ToolBtn label="Vừa khung" onClick={() => setViewWin({ start: 0, end: N - 1 })}>
-          <FitIcon />
-        </ToolBtn>
-        <ToolBtn label="Con trỏ" active={crosshair} onClick={() => setCrosshair((v) => !v)}>
-          <CursorIcon />
-        </ToolBtn>
-      </div>
     </section>
   );
 }

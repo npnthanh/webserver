@@ -181,22 +181,20 @@ CREATE TABLE IF NOT EXISTS ghg_emission_sources (
   scope_id TINYINT UNSIGNED NOT NULL,
   name VARCHAR(255) NOT NULL,
   input_method VARCHAR(30) NOT NULL,
-  factor_group_id VARCHAR(100) NOT NULL,
-  gas_key VARCHAR(10) NOT NULL,
-  factor_value DECIMAL(18,6) NOT NULL,
+  factor_group_id VARCHAR(100) NULL,
+  gas_key VARCHAR(10) NULL,
+  factor_value DECIMAL(18,6) NOT NULL DEFAULT 0,
   formula VARCHAR(500) NOT NULL,
   applied_at DATE NOT NULL,
   meter_point_id VARCHAR(64) NULL,
+  manual_value DECIMAL(18,6) NULL,
+  manual_unit VARCHAR(40) NULL,
   tons_co2e DECIMAL(18,6) NULL,
   PRIMARY KEY (id),
   KEY idx_ghg_sources_project_scope (project_id, scope_id),
   CONSTRAINT fk_ghg_sources_project
     FOREIGN KEY (project_id) REFERENCES projects (id)
-    ON DELETE CASCADE ON UPDATE CASCADE,
-  CONSTRAINT fk_ghg_sources_factor
-    FOREIGN KEY (factor_group_id, gas_key)
-    REFERENCES emission_factor_gases (group_id, gas_key)
-    ON DELETE RESTRICT ON UPDATE CASCADE
+    ON DELETE CASCADE ON UPDATE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 ALTER TABLE ghg_emission_sources
@@ -204,6 +202,12 @@ ALTER TABLE ghg_emission_sources
 
 ALTER TABLE ghg_emission_sources
   ADD COLUMN IF NOT EXISTS multipliers_json JSON NULL AFTER formula;
+
+ALTER TABLE ghg_emission_sources
+  ADD COLUMN IF NOT EXISTS manual_value DECIMAL(18,6) NULL AFTER meter_point_id;
+
+ALTER TABLE ghg_emission_sources
+  ADD COLUMN IF NOT EXISTS manual_unit VARCHAR(40) NULL AFTER manual_value;
 
 CREATE TABLE IF NOT EXISTS alert_recipients (
   id VARCHAR(64) NOT NULL,
@@ -271,12 +275,15 @@ CREATE TABLE IF NOT EXISTS diagram_states (
   utility VARCHAR(100) NOT NULL,
   positions JSON NOT NULL,
   viewport JSON NULL,
+  displays JSON NULL,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (project_id, utility),
   CONSTRAINT fk_diagram_states_project
     FOREIGN KEY (project_id) REFERENCES projects (id)
     ON DELETE CASCADE ON UPDATE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+ALTER TABLE diagram_states ADD COLUMN IF NOT EXISTS displays JSON NULL AFTER viewport;
 
 CREATE TABLE IF NOT EXISTS project_settings (
   project_id VARCHAR(64) NOT NULL,
@@ -312,7 +319,7 @@ DELETE FROM accounts WHERE id IN ('acc-2', 'acc-3', 'acc-4', 'acc-5', 'acc-6', '
 INSERT IGNORE INTO accounts (id, username, email, role, password_hash, created_at) VALUES
   ('acc-1', 'admin_system', 'admin@ems-precision.com', 'Admin', SHA2('123456', 256), '2024-01-01');
 
-UPDATE accounts SET role = 'Admin' WHERE role = 'Quản trị viên';
+UPDATE accounts SET role = 'Admin' WHERE id = 'acc-1' OR username = 'admin_system' OR role = 'Quản trị viên';
 UPDATE accounts SET role = 'Manage' WHERE role NOT IN ('Admin', 'Manage');
 
 INSERT IGNORE INTO meter_types (name, description, icon, builtin) VALUES

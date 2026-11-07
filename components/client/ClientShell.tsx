@@ -29,7 +29,12 @@ export function ClientShell({
   const router = useRouter();
   const { session } = useAuth();
   const [resolved, setResolved] = useState(project);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const base = `/du-an/${project.id}`;
+
+  useEffect(() => {
+    setMobileMenuOpen(false);
+  }, [pathname]);
 
   useEffect(() => {
     let active = true;
@@ -43,15 +48,15 @@ export function ClientShell({
 
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col bg-[#f8fafc] font-sans">
-      <header className="flex min-h-[56px] shrink-0 items-center justify-between gap-3 border-b border-slate-200/80 bg-white px-3 sm:px-6">
-        <div className="flex items-center gap-4 sm:gap-6 min-w-0">
+      <header className="flex min-h-[52px] sm:min-h-[56px] shrink-0 items-center justify-between gap-2 sm:gap-3 border-b border-slate-200/80 bg-white px-3 sm:px-6">
+        <div className="flex items-center gap-2.5 sm:gap-6 min-w-0">
           <Link
             href={base}
             title={resolved.customer}
             aria-label={resolved.customer}
-            className="flex items-center shrink-0"
+            className="flex items-center gap-2 min-w-0 shrink-0"
           >
-            <div className="flex h-8 w-8 items-center justify-center overflow-hidden rounded-lg bg-emerald-600 text-[10px] font-bold text-white shadow-xs">
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-emerald-600 text-[10px] font-bold text-white shadow-xs">
               {resolved.logoUrl ? (
                 <img
                   src={resolved.logoUrl}
@@ -62,6 +67,9 @@ export function ClientShell({
                 resolved.initials
               )}
             </div>
+            <span className="truncate text-xs font-bold text-slate-800 max-w-[130px] sm:hidden">
+              {resolved.customer}
+            </span>
           </Link>
 
           {/* Desktop/Tablet Nav */}
@@ -147,39 +155,112 @@ export function ClientShell({
         </div>
       </header>
 
-      {/* Mobile Navigation Strip */}
-      <nav
-        className="flex sm:hidden overflow-x-auto border-b border-slate-200/80 bg-white px-2.5 py-1.5 gap-1 shrink-0 scrollbar-none"
-        aria-label="Điều hướng dự án mobile"
-      >
-        {navItems.map((item) => {
-          const href = `${base}${item.href}`;
-          const active =
-            item.href === ""
-              ? pathname === base
-              : pathname === href || pathname.startsWith(`${href}/`);
-          const Icon = item.icon;
+      {/* Mobile Navigation Strip + Quick Grid Menu */}
+      <div className="relative flex sm:hidden items-center border-b border-slate-200/80 bg-white shrink-0">
+        <nav
+          className="flex flex-1 overflow-x-auto px-2 py-1.5 gap-1 scrollbar-none"
+          aria-label="Điều hướng dự án mobile"
+        >
+          {navItems.map((item) => {
+            const href = `${base}${item.href}`;
+            const active =
+              item.href === ""
+                ? pathname === base
+                : pathname === href || pathname.startsWith(`${href}/`);
+            const Icon = item.icon;
 
-          return (
-            <Link
-              key={item.href || "home"}
-              href={href}
-              className={`flex shrink-0 items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium whitespace-nowrap transition-colors ${
-                active
-                  ? "bg-emerald-600 text-white font-semibold shadow-xs"
-                  : "text-slate-600 hover:bg-slate-100 hover:text-slate-900"
-              }`}
-            >
-              <Icon className={`h-3.5 w-3.5 shrink-0 ${active ? "text-white" : "text-slate-400"}`} />
-              <span>{item.label}</span>
-            </Link>
-          );
-        })}
-      </nav>
+            return (
+              <Link
+                key={item.href || "home"}
+                href={href}
+                className={`flex shrink-0 items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium whitespace-nowrap transition-colors ${
+                  active
+                    ? "bg-emerald-600 text-white font-semibold shadow-xs"
+                    : "text-slate-600 hover:bg-slate-100 hover:text-slate-900"
+                }`}
+              >
+                <Icon className={`h-3.5 w-3.5 shrink-0 ${active ? "text-white" : "text-slate-400"}`} />
+                <span>{item.label}</span>
+              </Link>
+            );
+          })}
+        </nav>
+
+        <div className="flex shrink-0 items-center border-l border-slate-200/80 bg-white px-2 py-1.5">
+          <button
+            type="button"
+            onClick={() => setMobileMenuOpen((v) => !v)}
+            aria-expanded={mobileMenuOpen}
+            aria-label="Mở danh mục nhanh"
+            className={`inline-flex h-7 items-center gap-1 rounded-lg border px-2 text-[11px] font-semibold transition-colors ${
+              mobileMenuOpen
+                ? "border-emerald-600 bg-emerald-50 text-emerald-700"
+                : "border-slate-200 bg-slate-50 text-slate-700"
+            }`}
+          >
+            <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <rect x="3" y="3" width="7" height="7" rx="1.5" />
+              <rect x="14" y="3" width="7" height="7" rx="1.5" />
+              <rect x="3" y="14" width="7" height="7" rx="1.5" />
+              <rect x="14" y="14" width="7" height="7" rx="1.5" />
+            </svg>
+            <span>Menu</span>
+          </button>
+        </div>
+
+        {mobileMenuOpen ? (
+          <>
+            <div
+              className="fixed inset-0 z-40 bg-slate-900/35"
+              onClick={() => setMobileMenuOpen(false)}
+              aria-hidden
+            />
+            <div className="absolute inset-x-0 top-full z-50 border-b border-slate-200 bg-white p-3 shadow-xl">
+              <div className="mb-2 flex items-center justify-between px-1">
+                <span className="text-[11px] font-bold tracking-wider text-slate-400 uppercase">
+                  Chọn nhanh chức năng ({resolved.customer})
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setMobileMenuOpen(false)}
+                  className="rounded-md px-2 py-0.5 text-xs font-semibold text-slate-500 hover:bg-slate-100"
+                >
+                  Đóng ✕
+                </button>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                {navItems.map((item) => {
+                  const href = `${base}${item.href}`;
+                  const active =
+                    item.href === ""
+                      ? pathname === base
+                      : pathname === href || pathname.startsWith(`${href}/`);
+                  const Icon = item.icon;
+                  return (
+                    <Link
+                      key={item.href || "home"}
+                      href={href}
+                      onClick={() => setMobileMenuOpen(false)}
+                      className={`flex items-center gap-2.5 rounded-xl border px-3 py-2.5 text-xs font-semibold transition-colors ${
+                        active
+                          ? "border-emerald-600 bg-emerald-600 text-white shadow-xs"
+                          : "border-slate-200/80 bg-slate-50/70 text-slate-700 hover:bg-slate-100"
+                      }`}
+                    >
+                      <Icon className={`h-4 w-4 shrink-0 ${active ? "text-white" : "text-emerald-600"}`} />
+                      <span className="truncate">{item.label}</span>
+                    </Link>
+                  );
+                })}
+              </div>
+            </div>
+          </>
+        ) : null}
+      </div>
 
       <main className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden">{children}</main>
 
-      <footer className="flex h-9 shrink-0 items-center justify-between gap-4 border-t border-slate-200/80 bg-white px-4 text-[11px] text-slate-400 sm:px-6">
+      <footer className="hidden sm:flex h-9 shrink-0 items-center justify-between gap-4 border-t border-slate-200/80 bg-white px-4 text-[11px] text-slate-400 sm:px-6">
         <p className="truncate">
           © 2026 {resolved.customer} • EMS Telemetry Gateway
         </p>

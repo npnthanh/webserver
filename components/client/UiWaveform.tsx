@@ -2,7 +2,14 @@
 
 import { useMemo, useState } from "react";
 import { ChartTimeline } from "@/components/client/ChartTimeline";
+import {
+  buildSampleTableRows,
+  ChartDataTable,
+  ChartViewToolbar,
+  type ChartViewMode,
+} from "@/components/client/ChartViewToolbar";
 import { useChartSize } from "@/components/client/useChartSize";
+import { CustomSelect } from "@/components/ui/CustomSelect";
 import { chartTimeLabel, chartTimeTicks, paddedDomain, valuesForKey, type ChartSample } from "@/lib/gateway-series";
 import { getTimeFilterLabel, type TimeFilterValue } from "./TimeFilterBar";
 
@@ -37,7 +44,16 @@ function currentKey(qty: string, ch: number) {
   return ["Ia", "Ib", "Ic"][ch - 1] ?? "Ia";
 }
 
-export function UiWaveform({ timeFilter, samples }: { timeFilter: TimeFilterValue; samples?: ChartSample[] }) {
+export function UiWaveform({
+  timeFilter,
+  samples,
+  onRefresh,
+}: {
+  timeFilter: TimeFilterValue;
+  samples?: ChartSample[];
+  onRefresh?: () => void;
+}) {
+  const [view, setView] = useState<ChartViewMode>("chart");
   const [uQty, setUQty] = useState("U");
   const [iQty, setIQty] = useState("I");
   const [uCh, setUCh] = useState([1, 2, 3]);
@@ -107,6 +123,29 @@ export function UiWaveform({ timeFilter, samples }: { timeFilter: TimeFilterValu
   );
   const timelineValues = uSeries[0]?.values ?? iSeries[0]?.values ?? Array.from({ length: N }, () => 0);
 
+  const tableColumns = useMemo(
+    () => [
+      { header: "Thời điểm" },
+      ...uSeries.map((s) => ({ header: `${s.name} (V)`, color: s.color })),
+      ...iSeries.map((s) => ({ header: `${s.name} (A)`, color: s.color })),
+    ],
+    [uSeries, iSeries],
+  );
+
+  const tableRows = useMemo(
+    () =>
+      buildSampleTableRows(
+        samples,
+        [
+          ...uSeries.map((s) => ({ ...s, unit: "V", digits: 2 })),
+          ...iSeries.map((s) => ({ ...s, unit: "A", digits: 2 })),
+        ],
+        window,
+        N,
+      ),
+    [samples, uSeries, iSeries, window],
+  );
+
   return (
     <div className="w-full min-w-0 font-sans">
       {/* Top bar: thông số U/I; bộ lọc thời gian dùng thanh chung của trang */}
@@ -127,55 +166,67 @@ export function UiWaveform({ timeFilter, samples }: { timeFilter: TimeFilterValu
             onChannel={(ch) => setICh((list) => toggleIn(list, ch))}
           />
         </div>
-
+        <ChartViewToolbar view={view} onViewChange={setView} onRefresh={onRefresh} />
       </div>
 
       <div className="mb-2">
         <ChartTimeline compact labels={timelineLabels} values={timelineValues} range={window} onRange={setWindow} />
       </div>
 
-      <div className="min-w-0 w-full overflow-hidden rounded-[2px] border border-slate-400 bg-white">
-        <WavePane
-          title={`${uQty} [V]`}
-          series={uSeries}
-          samples={samples}
-          window={window}
-          hover={crosshair ? hover : null}
-          onHover={setHover}
-          domain={uDomain}
-        />
-        <div className="h-2 border-y border-slate-300 bg-slate-200" />
-        <WavePane
-          title={`${iQty} [A]`}
-          series={iSeries}
-          samples={samples}
-          window={window}
-          hover={crosshair ? hover : null}
-          onHover={setHover}
-          domain={iDomain}
-          axis
-        />
-      </div>
+      {view === "chart" ? (
+        <>
+          <div className="min-w-0 w-full overflow-hidden rounded-[2px] border border-slate-400 bg-white">
+            <WavePane
+              title={`${uQty} [V]`}
+              series={uSeries}
+              samples={samples}
+              window={window}
+              hover={crosshair ? hover : null}
+              onHover={setHover}
+              domain={uDomain}
+            />
+            <div className="h-2 border-y border-slate-300 bg-slate-200" />
+            <WavePane
+              title={`${iQty} [A]`}
+              series={iSeries}
+              samples={samples}
+              window={window}
+              hover={crosshair ? hover : null}
+              onHover={setHover}
+              domain={iDomain}
+              axis
+            />
+          </div>
 
-      <div className="mt-2.5 flex items-center justify-between gap-3">
-        <div className="flex gap-1">
-          <ToolBtn label="Phóng to" onClick={zoomIn}>
-            <ZoomIcon plus />
-          </ToolBtn>
-          <ToolBtn label="Thu nhỏ" onClick={zoomOut}>
-            <ZoomIcon plus={false} />
-          </ToolBtn>
-          <ToolBtn label="Vừa khung" onClick={() => setWindow({ start: 0, end: N - 1 })}>
-            <FitIcon />
-          </ToolBtn>
-          <ToolBtn label="Con trỏ" active={crosshair} onClick={() => setCrosshair((v) => !v)}>
-            <CursorIcon />
-          </ToolBtn>
-        </div>
-        <span className="text-[11px] text-slate-400">
-          Kỳ hiển thị: {getTimeFilterLabel(timeFilter)}
-        </span>
-      </div>
+          <div className="mt-2.5 flex items-center justify-between gap-3">
+            <div className="flex gap-1">
+              <ToolBtn label="Phóng to" onClick={zoomIn}>
+                <ZoomIcon plus />
+              </ToolBtn>
+              <ToolBtn label="Thu nhỏ" onClick={zoomOut}>
+                <ZoomIcon plus={false} />
+              </ToolBtn>
+              <ToolBtn label="Vừa khung" onClick={() => setWindow({ start: 0, end: N - 1 })}>
+                <FitIcon />
+              </ToolBtn>
+              <ToolBtn label="Con trỏ" active={crosshair} onClick={() => setCrosshair((v) => !v)}>
+                <CursorIcon />
+              </ToolBtn>
+            </div>
+            <span className="text-[11px] text-slate-400">
+              Kỳ hiển thị: {getTimeFilterLabel(timeFilter)}
+            </span>
+          </div>
+        </>
+      ) : (
+        <ChartDataTable
+          title="Biểu đồ Điện áp và Dòng điện (U / I)"
+          subtitle={`Kỳ hiển thị: ${getTimeFilterLabel(timeFilter)}`}
+          filename="bieu-do-dien-ap-dong-dien"
+          columns={tableColumns}
+          rows={tableRows}
+        />
+      )}
     </div>
   );
 }
@@ -195,15 +246,15 @@ function ParamGroup({
 }) {
   return (
     <div className="flex items-center gap-3 text-[12px] text-slate-600">
-      <select
+      <CustomSelect
         value={qty}
         onChange={(e) => onQty(e.target.value)}
-        className="h-8 rounded border border-slate-300 bg-white px-2 text-[13px] text-slate-700"
+        className="h-8 rounded-lg border border-slate-200 bg-white px-2.5 text-[13px] font-medium text-slate-700 shadow-2xs"
       >
         {options.map((opt) => (
           <option key={opt}>{opt}</option>
         ))}
-      </select>
+      </CustomSelect>
       <span className="text-slate-400">CH</span>
       {[1, 2, 3].map((ch) => (
         <Check key={ch} checked={channels.includes(ch)} onChange={() => onChannel(ch)}>

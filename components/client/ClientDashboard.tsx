@@ -1,10 +1,11 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { CustomSelect } from "@/components/ui/CustomSelect";
 import type { Project } from "@/lib/projects";
 import { hydrateAlertEvents, type AlertEvent } from "@/lib/alert-events";
 import { hydrateClientMeters } from "@/lib/client-meters";
-import { hydrateGhgSources } from "@/lib/ghg-sources";
+import { computeManualTons, hydrateGhgSources } from "@/lib/ghg-sources";
 import { hydrateDevices } from "@/lib/devices";
 import {
   civilWeekday,
@@ -144,6 +145,9 @@ export function ClientDashboard({ project }: { project: Project }) {
   const [deviceStatus, setDeviceStatus] = useState(EMPTY_STATUS);
   const [alerts, setAlerts] = useState<DashboardAlert[]>([]);
   const [co2, setCo2] = useState(0);
+  const [ghgSourceCount, setGhgSourceCount] = useState(0);
+  const [topGhgText, setTopGhgText] = useState("");
+  const [prevMonthKwh, setPrevMonthKwh] = useState<number | null>(null);
   const alignedMonth = useRef(false);
 
   useEffect(() => {
@@ -194,7 +198,23 @@ export function ClientDashboard({ project }: { project: Project }) {
             value: `${event.value}${event.unit ? ` ${event.unit}` : ""}`,
           })),
         );
-        setCo2(sources.reduce((sum, source) => sum + (source.tons ?? 0), 0));
+        const computedSources = sources.map((source) => {
+          const tons =
+            source.method === "manual"
+              ? (computeManualTons(source) ?? source.tons ?? 0)
+              : (source.tons ?? 0);
+          return { name: source.name, tons };
+        });
+        const totalTons = computedSources.reduce((sum, item) => sum + item.tons, 0);
+        setGhgSourceCount(computedSources.length);
+        setCo2(totalTons);
+        const top = [...computedSources].sort((a, b) => b.tons - a.tons)[0];
+        if (top && totalTons > 0) {
+          const share = Math.round((top.tons / totalTons) * 100);
+          setTopGhgText(`${top.name}: ${top.tons.toFixed(2)} tấn (${share}%)`);
+        } else {
+          setTopGhgText("");
+        }
       }).catch(() => undefined);
     };
     reload();
@@ -210,14 +230,20 @@ export function ClientDashboard({ project }: { project: Project }) {
   useEffect(() => {
     let active = true;
     const { from, to } = monthRange(year, month);
+    const prevMonth = month === 1 ? 12 : month - 1;
+    const prevYear = month === 1 ? year - 1 : year;
     void Promise.all([
       loadProjectGatewayDaily(project.id, year, month),
       loadProjectGatewayEnergySlots(project.id, from, to),
-    ]).then(([summary, slots]) => {
+      loadProjectGatewayDaily(project.id, prevYear, prevMonth),
+    ]).then(([summary, slots, prevSummary]) => {
       if (!active) return;
       setDailyRows(summary.days);
       setLatest(summary.latest);
       setMonthSlots(slots.slots);
+      const prevSeries = monthEnergySeries(prevSummary.days, prevYear, prevMonth);
+      const prevTotal = prevSeries.reduce((sum, item) => sum + item.kwh, 0);
+      setPrevMonthKwh(prevSummary.days.length ? prevTotal : null);
     });
     return () => {
       active = false;
@@ -237,10 +263,9 @@ export function ClientDashboard({ project }: { project: Project }) {
 
   const energySeries = useMemo(() => monthEnergySeries(dailyRows, year, month), [dailyRows, year, month]);
   const consumptionTotal = energySeries.reduce((sum, item) => sum + item.kwh, 0);
-  const showIndex = dailyRows.length > 0 && consumptionTotal === 0;
   const chartSeries = energySeries.map((item) => ({
     day: item.label,
-    kwh: showIndex ? item.indexKwh : item.kwh,
+    kwh: item.kwh,
     hasSample: item.hasSample,
   }));
   const sampledValues = chartSeries.filter((item) => item.hasSample).map((item) => item.kwh);
@@ -249,11 +274,32 @@ export function ClientDashboard({ project }: { project: Project }) {
   const monthCost = useMemo(() => monthlyCostFromSlots(monthSlots, touPrices), [monthSlots, touPrices]);
   const monthCostThousands = monthCost / 1000;
 
+  const energyMom = useMemo(() => {
+    if (prevMonthKwh == null || !Number.isFinite(prevMonthKwh) || prevMonthKwh <= 0) return null;
+    const delta = consumptionTotal - prevMonthKwh;
+    const pct = (delta / prevMonthKwh) * 100;
+    return { delta, pct, prev: prevMonthKwh };
+  }, [consumptionTotal, prevMonthKwh]);
+
+  const energyCaption =
+    energyMom != null
+      ? `${energyMom.delta >= 0 ? "Tăng" : "Giảm"} ${formatKwh(Math.abs(energyMom.delta))} kWh (${Math.abs(energyMom.pct).toFixed(1)}%) so với tháng trước (${formatKwh(energyMom.prev)} kWh)`
+      : sampledValues.length > 0
+        ? `Tháng ${pad2(month)}/${year}: ${sampledValues.length} ngày có số liệu · Tổng ${formatKwh(consumptionTotal)} kWh`
+        : `Tháng ${pad2(month)}/${year}: 0.0 kWh`;
+
+  const co2Caption =
+    co2 > 0
+      ? topGhgText || `${ghgSourceCount} nguồn phát thải · Tổng ${co2.toFixed(2)} tấn CO₂e`
+      : ghgSourceCount > 0
+        ? `${ghgSourceCount} nguồn phát thải · Tổng 0.00 tấn CO₂e`
+        : "0 nguồn phát thải · 0.00 tấn CO₂e";
+
   return (
-    <div className="mx-auto h-full max-w-[1480px] overflow-y-auto px-5 py-5 lg:px-6">
-      <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+    <div className="mx-auto h-full max-w-[1480px] overflow-y-auto px-3 py-3.5 sm:px-5 sm:py-5 lg:px-6">
+      <div className="mb-3.5 sm:mb-4 flex flex-wrap items-center justify-between gap-2.5 sm:gap-3">
         <div>
-          <h1 className="text-[28px] font-bold tracking-tight text-slate-800">
+          <h1 className="text-xl sm:text-[28px] font-bold tracking-tight text-slate-800">
             {project.customer}
           </h1>
         </div>
@@ -267,9 +313,9 @@ export function ClientDashboard({ project }: { project: Project }) {
         />
       </div>
 
-      <div className="grid gap-4 xl:grid-cols-3">
+      <div className="grid gap-3.5 sm:gap-4 xl:grid-cols-3">
         <DashboardCard title="ĐIỆN NĂNG TIÊU THỤ" className="xl:col-span-2">
-          <div className="mb-3 flex flex-wrap gap-x-6 gap-y-1 text-sm">
+          <div className="mb-3 flex flex-wrap gap-x-4 sm:gap-x-6 gap-y-1 text-xs sm:text-sm">
             <p>
               Lớn nhất:{" "}
               <span className="font-semibold text-emerald-700">{formatKwh(energyMax)} kWh</span>
@@ -282,14 +328,16 @@ export function ClientDashboard({ project }: { project: Project }) {
               Tổng tiêu thụ:{" "}
               <span className="font-semibold text-slate-800">{formatKwh(consumptionTotal)} kWh</span>
             </p>
-            {showIndex ? (
-              <p className="w-full text-[12px] text-amber-700">
-                Công tơ không tăng trong tháng — cột đang hiện chỉ số EPaed cuối ngày để thấy các ngày có bản tin.
-              </p>
-            ) : null}
           </div>
-          {latest ? <LatestReading sample={latest} /> : null}
           <EnergyChart data={chartSeries} />
+          <p className="mt-2 text-center text-[11.5px] sm:text-[12px] text-slate-500">
+            {energyCaption}
+            {energyMom ? (
+              <span className={`ml-1 ${energyMom.delta <= 0 ? "text-emerald-600" : "text-amber-600"}`}>
+                {energyMom.delta <= 0 ? "↓" : "↑"}
+              </span>
+            ) : null}
+          </p>
         </DashboardCard>
 
         <DashboardCard title="PHÁT THẢI CO2">
@@ -297,17 +345,13 @@ export function ClientDashboard({ project }: { project: Project }) {
             color="#1e6b45"
             value={co2.toFixed(2)}
             unit="tấn CO2 tđ"
-            caption={
-              <span className="inline-flex items-center gap-1">
-                Giảm thiểu 12% so với tháng trước
-                <span className="text-emerald-600">↓</span>
-              </span>
-            }
+            progress={co2 > 0 ? 0.82 : 0}
+            caption={co2Caption}
           />
         </DashboardCard>
       </div>
 
-      <div className="mt-4 grid gap-4 lg:grid-cols-2 xl:grid-cols-4">
+      <div className="mt-3.5 sm:mt-4 grid gap-3.5 sm:gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <DashboardCard title="CHI PHÍ">
           <DonutChart
             color="#1e5f8a"
@@ -315,13 +359,8 @@ export function ClientDashboard({ project }: { project: Project }) {
               maximumFractionDigits: monthCostThousands > 0 && monthCostThousands < 10 ? 2 : 0,
             })}
             unit="nghìn VNĐ"
-            caption={
-              monthCost > 0
-                ? `Tổng tháng ${pad2(month)}/${year}: ${formatVnd(monthCost)} VND (trước VAT)`
-                : monthSlots.length > 0
-                  ? `Tháng ${pad2(month)}/${year}: có bản tin nhưng EPaed không tăng → 0 VND`
-                  : `Chưa có số liệu chi phí tháng ${pad2(month)}/${year}`
-            }
+            progress={monthCost > 0 ? 0.82 : 0}
+            caption={`Tổng tháng ${pad2(month)}/${year}: ${formatVnd(monthCost)} VNĐ`}
           />
         </DashboardCard>
 
@@ -388,7 +427,7 @@ function MonthPicker({
       {open ? (
         <div className="absolute top-11 right-0 z-20 w-[220px] rounded-md border border-slate-200 bg-white p-3 shadow-md">
           <div className="mb-2 flex items-center gap-2">
-            <select
+            <CustomSelect
               value={year}
               onChange={(e) => onChange(month, Number(e.target.value))}
               className="h-9 flex-1 rounded-md border border-slate-200 bg-white px-2 text-sm text-slate-700 outline-none focus:border-emerald-500"
@@ -399,7 +438,7 @@ function MonthPicker({
                   {item}
                 </option>
               ))}
-            </select>
+            </CustomSelect>
           </div>
           <ul role="listbox" aria-label="Chọn tháng" className="grid grid-cols-3 gap-1.5">
             {MONTH_OPTIONS.map((value) => {
@@ -590,20 +629,22 @@ function DonutChart({
   color,
   value,
   unit,
+  progress = 0.82,
   caption,
 }: {
   color: string;
   value: string;
   unit: string;
+  progress?: number;
   caption: React.ReactNode;
 }) {
   const radius = 56;
   const circumference = 2 * Math.PI * radius;
-  const filled = circumference * 0.82;
+  const filled = circumference * Math.max(0, Math.min(1, progress));
 
   return (
     <div className="flex flex-col items-center pt-1">
-      <div className="relative h-[210px] w-[210px]">
+      <div className="relative h-[168px] w-[168px] sm:h-[210px] sm:w-[210px]">
         <svg viewBox="0 0 160 160" className="h-full w-full -rotate-90">
           <circle
             cx="80"
@@ -625,7 +666,7 @@ function DonutChart({
           />
         </svg>
         <div className="absolute inset-0 flex flex-col items-center justify-center text-center">
-          <p className="text-[26px] font-bold leading-none text-slate-800">{value}</p>
+          <p className="text-[22px] sm:text-[26px] font-bold leading-none text-slate-800">{value}</p>
           <p className="mt-1.5 text-xs text-slate-400">{unit}</p>
         </div>
       </div>
@@ -680,7 +721,7 @@ function AlertLogTable({ rows: sourceRows }: { rows: DashboardAlert[] }) {
             </th>
             <th className="pb-2 pr-2 font-normal">
               <span className="relative block">
-                <select
+                <CustomSelect
                   value={point}
                   onChange={(e) => setPoint(e.target.value)}
                   className="h-8 w-full appearance-none rounded border border-slate-200 pr-7 pl-2 text-xs outline-none focus:border-emerald-500"
@@ -689,7 +730,7 @@ function AlertLogTable({ rows: sourceRows }: { rows: DashboardAlert[] }) {
                   {Array.from(new Set(sourceRows.map((row) => row.point))).map((name) => (
                     <option key={name} value={name}>{name}</option>
                   ))}
-                </select>
+                </CustomSelect>
                 <FilterMark />
               </span>
             </th>

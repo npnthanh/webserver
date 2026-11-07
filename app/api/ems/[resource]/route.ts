@@ -69,6 +69,24 @@ function serverError(error: unknown) {
 let deviceColumnsReady: Promise<void> | null = null;
 let ghgColumnsReady: Promise<void> | null = null;
 let projectSettingsReady: Promise<void> | null = null;
+let diagramDisplaysReady: Promise<void> | null = null;
+
+function ensureDiagramDisplaysColumn() {
+  if (!diagramDisplaysReady) {
+    diagramDisplaysReady = emsDb
+      .query(
+        `ALTER TABLE diagram_states
+           ADD COLUMN IF NOT EXISTS displays JSON NULL AFTER viewport`,
+      )
+      .then(() => undefined)
+      .catch((error) => {
+        diagramDisplaysReady = null;
+        console.error("diagram_states.displays migrate failed", error);
+        return undefined;
+      });
+  }
+  return diagramDisplaysReady;
+}
 
 function ensureDeviceColumns() {
   deviceColumnsReady ??= emsDb
@@ -107,11 +125,26 @@ async function migrateProjectSettings() {
 }
 
 function ensureGhgColumns() {
-  ghgColumnsReady ??= emsDb
-    .execute(
+  ghgColumnsReady ??= Promise.all([
+    emsDb.execute(
       "ALTER TABLE ghg_emission_sources ADD COLUMN IF NOT EXISTS multipliers_json JSON NULL",
-    )
-    .then(() => undefined);
+    ),
+    emsDb.execute(
+      "ALTER TABLE ghg_emission_sources ADD COLUMN IF NOT EXISTS manual_value DECIMAL(18,6) NULL",
+    ),
+    emsDb.execute(
+      "ALTER TABLE ghg_emission_sources ADD COLUMN IF NOT EXISTS manual_unit VARCHAR(40) NULL",
+    ),
+    emsDb
+      .execute("ALTER TABLE ghg_emission_sources DROP FOREIGN KEY fk_ghg_sources_factor")
+      .catch(() => undefined),
+    emsDb
+      .execute("ALTER TABLE ghg_emission_sources MODIFY COLUMN factor_group_id VARCHAR(100) NULL")
+      .catch(() => undefined),
+    emsDb
+      .execute("ALTER TABLE ghg_emission_sources MODIFY COLUMN gas_key VARCHAR(10) NULL")
+      .catch(() => undefined),
+  ]).then(() => undefined);
   return ghgColumnsReady;
 }
 
@@ -323,6 +356,7 @@ async function getResource(resource: string, request: NextRequest) {
               input_method AS method, factor_group_id AS factorGroupId,
               gas_key AS gasKey, factor_value AS factorValue, formula,
               multipliers_json AS multipliers,
+              manual_value AS manualValue, manual_unit AS manualUnit,
               DATE_FORMAT(applied_at, '%Y-%m-%d') AS appliedAt,
               tons_co2e AS tons
          FROM ghg_emission_sources ${projectId ? "WHERE project_id = ?" : ""}
@@ -332,9 +366,14 @@ async function getResource(resource: string, request: NextRequest) {
     return rows.map((row) => ({
       ...row,
       scope: asNumber(row.scope),
-      factorId: `${row.factorGroupId}:${row.gasKey}`,
+      factorId:
+        row.factorGroupId && row.gasKey
+          ? `${row.factorGroupId}:${row.gasKey}`
+          : "none:none",
       factorValue: asNumber(row.factorValue),
       multipliers: asMultipliers(row.multipliers),
+      manualValue: row.manualValue == null ? undefined : asNumber(row.manualValue),
+      manualUnit: asString(row.manualUnit) || undefined,
       tons: row.tons == null ? undefined : asNumber(row.tons),
     }));
   }
@@ -353,11 +392,69 @@ async function getResource(resource: string, request: NextRequest) {
         ORDER BY occurred_at DESC`,
       projectId ? [projectId] : [],
     );
-    return rows.map((row) => ({
+    const mappedEvents: Record<string, unknown>[] = rows.map((row) => ({
       ...row,
       value: asNumber(row.value),
       thresholdValue: row.thresholdValue == null ? undefined : asNumber(row.thresholdValue),
     }));
+
+    // Bổ sung các bản ghi cảnh báo thực tế từ bảng gateway_alarms của các đồng hồ thuộc dự án
+    try {
+      const gwRows = await queryRows<Row>(
+        `SELECT ga.id, ga.source, ga.gateway_id AS gatewayId, ga.meter_model AS meterModel,
+                ga.meter_id AS meterId, ga.occurred_at AS occurredAt, ga.created_at AS createdAt,
+                ga.alarm_code AS alarmCode, ga.alarm_name AS alarmName, ga.alarm_value AS alarmValue,
+                ga.parameter_name AS parameterName, ga.parameter_value AS parameterValue,
+                ga.min_value AS minValue, ga.max_value AS maxValue,
+                mp.id AS meterPointId, mp.project_id AS projectId, mp.code AS pointCode,
+                mp.name AS pointName, mp.utility
+           FROM gateway_alarms ga
+           LEFT JOIN devices d ON d.serial_number = ga.meter_id
+           LEFT JOIN meter_points mp
+             ON (mp.serial_number = ga.meter_id OR (d.id IS NOT NULL AND mp.device_id = d.id))
+            ${projectId ? "AND mp.project_id = ?" : ""}
+          ${projectId ? "WHERE mp.project_id = ? OR NOT EXISTS (SELECT 1 FROM meter_points WHERE project_id = ? AND (serial_number IS NOT NULL OR device_id IS NOT NULL))" : ""}
+          ORDER BY ga.id DESC
+          LIMIT 200`,
+        projectId ? [projectId, projectId, projectId] : [],
+      );
+
+      for (const gw of gwRows) {
+        const isGatewayHw = asString(gw.source) === "gateway";
+        const param = isGatewayHw
+          ? asString(gw.alarmName) || `IDAlarm #${asNumber(gw.alarmCode)}`
+          : asString(gw.parameterName) || "Gateway";
+        const val = isGatewayHw ? asNumber(gw.alarmValue) : asNumber(gw.parameterValue);
+        const minVal = gw.minValue == null ? null : asNumber(gw.minValue);
+        const maxVal = gw.maxValue == null ? null : asNumber(gw.maxValue);
+        const thresh = maxVal ?? minVal ?? undefined;
+        const rawTime = asString(gw.occurredAt) || asString(gw.createdAt);
+        const normalizedTime = rawTime.replace("T", " ").replace("Z", "").slice(0, 19);
+        mappedEvents.push({
+          id: `GW-ALM-${gw.id}`,
+          projectId: asString(gw.projectId) || projectId || "default",
+          meterPointId: asString(gw.meterPointId) || undefined,
+          occurredAt: normalizedTime,
+          parameter: param,
+          value: val,
+          unit: "",
+          severity: isGatewayHw ? "critical" : "warning",
+          status: "active",
+          category: undefined,
+          message: isGatewayHw
+            ? `Cảnh báo tức thời từ Gateway (${param}): giá trị ${val}`
+            : `Thông số ${param} = ${val} vượt ngưỡng cài đặt (${minVal != null ? `Min ${minVal}` : ""}${minVal != null && maxVal != null ? " / " : ""}${maxVal != null ? `Max ${maxVal}` : ""})`,
+          thresholdValue: thresh,
+          pointCode: asString(gw.pointCode) || asString(gw.meterId) || `GW-${gw.gatewayId}`,
+          pointName: asString(gw.pointName) || `${asString(gw.meterModel) || "Đồng hồ"} (${asString(gw.meterId)})`,
+          utility: asString(gw.utility) || "Điện",
+        });
+      }
+    } catch {
+      // Bảng gateway_alarms chưa khởi tạo hoặc truy vấn phụ lỗi thì vẫn trả về mappedEvents
+    }
+
+    return mappedEvents;
   }
   if (resource === "meter-readings") {
     const meterPointId = request.nextUrl.searchParams.get("meterPointId") || undefined;
@@ -384,9 +481,10 @@ async function getResource(resource: string, request: NextRequest) {
   }
   if (resource === "diagram-states") {
     if (!projectId) throw new Error("projectId is required");
+    await ensureDiagramDisplaysColumn();
     const utility = request.nextUrl.searchParams.get("utility");
     const rows = await queryRows<Row>(
-      `SELECT project_id AS projectId, utility, positions, viewport, updated_at AS updatedAt
+      `SELECT project_id AS projectId, utility, positions, viewport, displays, updated_at AS updatedAt
          FROM diagram_states WHERE project_id = ? ${utility ? "AND utility = ?" : ""}
         ORDER BY utility`,
       utility ? [projectId, utility] : [projectId],
@@ -395,6 +493,7 @@ async function getResource(resource: string, request: NextRequest) {
       ...row,
       positions: jsonField(row.positions, {}),
       viewport: jsonField(row.viewport, undefined),
+      displays: jsonField(row.displays, {}),
     }));
   }
   if (resource === "project-settings") {
@@ -635,17 +734,23 @@ async function saveResource(resource: string, body: Row) {
       await connection.execute("DELETE FROM ghg_emission_sources WHERE project_id = ?", [projectId]);
       for (const source of sources) {
         const factorId = asString(source.factorId);
-        const [factorGroupId, gasKey] = factorId.split(":");
+        const [rawGroupId, rawGasKey] = factorId.split(":");
+        const factorGroupId =
+          !rawGroupId || rawGroupId === "none" ? null : rawGroupId;
+        const gasKey = !rawGasKey || rawGasKey === "none" ? null : rawGasKey;
         const multipliers = asMultipliers(source.multipliers);
         await connection.execute(
           `INSERT INTO ghg_emission_sources
             (id, project_id, scope_id, name, input_method, factor_group_id, gas_key,
-             factor_value, formula, multipliers_json, applied_at, meter_point_id, tons_co2e)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             factor_value, formula, multipliers_json, applied_at, meter_point_id,
+             manual_value, manual_unit, tons_co2e)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [source.id, projectId, asNumber(source.scope), source.name, source.method,
-            factorGroupId || "do-industry", gasKey || "co2", asNumber(source.factorValue),
+            factorGroupId, gasKey, asNumber(source.factorValue),
             source.formula || "", multipliers.length ? JSON.stringify(multipliers) : null,
             source.appliedAt, asString(source.meterPointId) || null,
+            source.manualValue == null ? null : asNumber(source.manualValue),
+            asString(source.manualUnit) || null,
             source.tons == null ? null : asNumber(source.tons)],
         );
       }
@@ -672,11 +777,21 @@ async function saveResource(resource: string, body: Row) {
     const projectId = asString(body.projectId);
     const utility = asString(body.utility);
     if (!projectId || !utility) throw new Error("projectId and utility are required");
+    await ensureDiagramDisplaysColumn();
     await emsDb.execute(
-      `INSERT INTO diagram_states (project_id, utility, positions, viewport)
-       VALUES (?, ?, ?, ?)
-       ON DUPLICATE KEY UPDATE positions=VALUES(positions), viewport=VALUES(viewport)`,
-      [projectId, utility, JSON.stringify(body.positions ?? {}), body.viewport ? JSON.stringify(body.viewport) : null],
+      `INSERT INTO diagram_states (project_id, utility, positions, viewport, displays)
+       VALUES (?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         positions=VALUES(positions),
+         viewport=VALUES(viewport),
+         displays=VALUES(displays)`,
+      [
+        projectId,
+        utility,
+        JSON.stringify(body.positions ?? {}),
+        body.viewport ? JSON.stringify(body.viewport) : null,
+        body.displays ? JSON.stringify(body.displays) : null,
+      ],
     );
     return getResource(resource, new NextRequest(`http://localhost/api/ems/diagram-states?projectId=${encodeURIComponent(projectId)}&utility=${encodeURIComponent(utility)}`));
   }

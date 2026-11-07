@@ -1,6 +1,7 @@
 "use client";
 
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
+import { CustomSelect } from "@/components/ui/CustomSelect";
 
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
@@ -213,7 +214,7 @@ export function AddCustomDeviceForm() {
 
         <div className="grid gap-4 sm:grid-cols-2">
           <Field label="1. Category (Loại đồng hồ hỗ trợ)">
-            <select
+            <CustomSelect
               value={category}
               onChange={(e) => {
                 const nextCat = e.target.value;
@@ -239,7 +240,7 @@ export function AddCustomDeviceForm() {
               {category && !deviceCategories.includes(category) ? (
                 <option value={category}>{category}</option>
               ) : null}
-            </select>
+            </CustomSelect>
           </Field>
           <Field label="2. Serial">
             <input
@@ -275,7 +276,7 @@ export function AddCustomDeviceForm() {
             />
           </Field>
           <Field label="Giao thức kết nối">
-            <select
+            <CustomSelect
               value={protocol}
               onChange={(e) => setProtocol(e.target.value)}
               className="input"
@@ -283,7 +284,7 @@ export function AddCustomDeviceForm() {
               {protocols.map((item) => (
                 <option key={item}>{item}</option>
               ))}
-            </select>
+            </CustomSelect>
           </Field>
           {extraFields.map((field) => (
             <div key={field.id} className="sm:col-span-2 grid grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)_auto] items-end gap-2">
@@ -377,7 +378,7 @@ export function AddCustomDeviceForm() {
                     />
                   </td>
                   <td className="px-2 py-2">
-                    <select
+                    <CustomSelect
                       value={row.dataType}
                       onChange={(e) => updateRow(row.id, "dataType", e.target.value)}
                       className="input h-9"
@@ -385,7 +386,7 @@ export function AddCustomDeviceForm() {
                       {dataTypes.map((type) => (
                         <option key={type}>{type}</option>
                       ))}
-                    </select>
+                    </CustomSelect>
                   </td>
                   <td className="px-2 py-2">
                     <input

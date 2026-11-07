@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { CustomSelect } from "@/components/ui/CustomSelect";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import {
@@ -412,7 +413,7 @@ function FilterSelect({
 }) {
   return (
     <div className="relative">
-      <select
+      <CustomSelect
         value={value}
         onChange={(e) => onChange(e.target.value)}
         className="h-9 appearance-none rounded-lg border border-slate-200 bg-white py-0 pr-8 pl-3 text-xs font-medium text-slate-700 outline-none hover:border-slate-300 focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 transition-colors"
@@ -422,7 +423,7 @@ function FilterSelect({
             {opt.label}
           </option>
         ))}
-      </select>
+      </CustomSelect>
       <span className="pointer-events-none absolute top-1/2 right-2.5 -translate-y-1/2 text-slate-400 text-xs">
         ▾
       </span>

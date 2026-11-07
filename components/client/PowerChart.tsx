@@ -2,7 +2,14 @@
 
 import { useMemo, useState } from "react";
 import { ChartTimeline } from "@/components/client/ChartTimeline";
+import {
+  buildSampleTableRows,
+  ChartDataTable,
+  ChartViewToolbar,
+  type ChartViewMode,
+} from "@/components/client/ChartViewToolbar";
 import { useChartSize } from "@/components/client/useChartSize";
+import { CustomSelect } from "@/components/ui/CustomSelect";
 import { chartTimeLabel, chartTimeTicks, domainTicks, paddedDomain, valuesForKey, type ChartSample } from "@/lib/gateway-series";
 import { getTimeFilterLabel, type TimeFilterValue } from "./TimeFilterBar";
 
@@ -55,10 +62,13 @@ function factorKey(qty: string, ch: Channel) {
 export function PowerChart({
   timeFilter,
   samples,
+  onRefresh,
 }: {
   timeFilter: TimeFilterValue;
   samples?: ChartSample[];
+  onRefresh?: () => void;
 }) {
+  const [view, setView] = useState<ChartViewMode>("chart");
   const [botQty, setBotQty] = useState("DPF");
   const [topCh, setTopCh] = useState<Channel[]>(["sum"]);
   const [botCh, setBotCh] = useState<Channel[]>(["sum"]);
@@ -129,6 +139,29 @@ export function PowerChart({
         : "Q [kVAR]"
       : "P/S/Q [kW, kVA, kVAR]";
 
+  const tableColumns = useMemo(
+    () => [
+      { header: "Thời điểm" },
+      ...pSeries.map((s) => ({ header: s.name, color: s.color })),
+      ...dpfSeries.map((s) => ({ header: s.name, color: s.color })),
+    ],
+    [pSeries, dpfSeries],
+  );
+
+  const tableRows = useMemo(
+    () =>
+      buildSampleTableRows(
+        samples,
+        [
+          ...pSeries.map((s) => ({ ...s, digits: 2 })),
+          ...dpfSeries.map((s) => ({ ...s, digits: 3 })),
+        ],
+        viewWin,
+        N,
+      ),
+    [samples, pSeries, dpfSeries, viewWin],
+  );
+
   return (
     <section className="w-full min-w-0 rounded-lg border border-slate-200 bg-white p-3 shadow-[0_1px_2px_rgba(16,24,40,0.04)] sm:p-4">
       <div className="mb-3 flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 pb-3">
@@ -156,7 +189,7 @@ export function PowerChart({
           {/* Nhóm Hệ số công suất */}
           <div className="flex flex-wrap items-center gap-2">
             <span className="font-semibold text-slate-700">Hệ số:</span>
-            <select
+            <CustomSelect
               value={botQty}
               onChange={(e) => setBotQty(e.target.value)}
               className="h-8 rounded-lg border border-slate-200 bg-white px-2.5 text-[12px] font-medium text-slate-700 outline-none focus:border-emerald-500 shadow-2xs"
@@ -164,7 +197,7 @@ export function PowerChart({
               {["DPF", "PF", "cosφ"].map((opt) => (
                 <option key={opt}>{opt}</option>
               ))}
-            </select>
+            </CustomSelect>
             <span className="text-slate-400">CH</span>
             {CHANNELS.map((ch) => (
               <Check key={ch} checked={botCh.includes(ch)} onChange={() => setBotCh((list) => toggleIn(list, ch))}>
@@ -173,59 +206,71 @@ export function PowerChart({
             ))}
           </div>
         </div>
-
+        <ChartViewToolbar view={view} onViewChange={setView} onRefresh={onRefresh} />
       </div>
 
       <div className="mb-2">
         <ChartTimeline compact labels={timelineLabels} values={timelineValues} range={viewWin} onRange={setViewWin} />
       </div>
 
-      <div className="min-w-0 w-full overflow-hidden rounded-[2px] border border-slate-400 bg-white">
-        <PowerPane
-          title={yLabel}
-          series={pSeries}
-          samples={samples}
-          viewWin={viewWin}
-          hover={crosshair ? hover : null}
-          onHover={setHover}
-          domain={pDomain}
-          ticks={samples?.length ? domainTicks(pDomain) : [300, 350, 400]}
-          formatTick={(v) => (Math.abs(pDomain[1] - pDomain[0]) < 20 ? v.toFixed(2) : String(Math.round(v)))}
-        />
-        <div className="h-px bg-slate-400" />
-        <PowerPane
-          title={botQty}
-          series={dpfSeries}
-          samples={samples}
-          viewWin={viewWin}
-          hover={crosshair ? hover : null}
-          onHover={setHover}
-          domain={dpfDomain}
-          ticks={samples?.length ? domainTicks(dpfDomain) : [-0.99, -0.995, -1]}
-          formatTick={(v) => (v === -1 ? "±1.000" : v.toFixed(3))}
-          axis
-        />
-      </div>
+      {view === "chart" ? (
+        <>
+          <div className="min-w-0 w-full overflow-hidden rounded-[2px] border border-slate-400 bg-white">
+            <PowerPane
+              title={yLabel}
+              series={pSeries}
+              samples={samples}
+              viewWin={viewWin}
+              hover={crosshair ? hover : null}
+              onHover={setHover}
+              domain={pDomain}
+              ticks={samples?.length ? domainTicks(pDomain) : [300, 350, 400]}
+              formatTick={(v) => (Math.abs(pDomain[1] - pDomain[0]) < 20 ? v.toFixed(2) : String(Math.round(v)))}
+            />
+            <div className="h-px bg-slate-400" />
+            <PowerPane
+              title={botQty}
+              series={dpfSeries}
+              samples={samples}
+              viewWin={viewWin}
+              hover={crosshair ? hover : null}
+              onHover={setHover}
+              domain={dpfDomain}
+              ticks={samples?.length ? domainTicks(dpfDomain) : [-0.99, -0.995, -1]}
+              formatTick={(v) => (v === -1 ? "±1.000" : v.toFixed(3))}
+              axis
+            />
+          </div>
 
-      <div className="mt-2.5 flex items-center justify-between gap-3">
-        <div className="flex gap-1">
-          <ToolBtn label="Phóng to" onClick={zoomIn}>
-            <ZoomIcon plus />
-          </ToolBtn>
-          <ToolBtn label="Thu nhỏ" onClick={zoomOut}>
-            <ZoomIcon plus={false} />
-          </ToolBtn>
-          <ToolBtn label="Vừa khung" onClick={() => setViewWin({ start: 0, end: N - 1 })}>
-            <FitIcon />
-          </ToolBtn>
-          <ToolBtn label="Con trỏ" active={crosshair} onClick={() => setCrosshair((v) => !v)}>
-            <CursorIcon />
-          </ToolBtn>
-        </div>
-        <span className="text-[11px] text-slate-400">
-          Kỳ hiển thị: {getTimeFilterLabel(timeFilter)}
-        </span>
-      </div>
+          <div className="mt-2.5 flex items-center justify-between gap-3">
+            <div className="flex gap-1">
+              <ToolBtn label="Phóng to" onClick={zoomIn}>
+                <ZoomIcon plus />
+              </ToolBtn>
+              <ToolBtn label="Thu nhỏ" onClick={zoomOut}>
+                <ZoomIcon plus={false} />
+              </ToolBtn>
+              <ToolBtn label="Vừa khung" onClick={() => setViewWin({ start: 0, end: N - 1 })}>
+                <FitIcon />
+              </ToolBtn>
+              <ToolBtn label="Con trỏ" active={crosshair} onClick={() => setCrosshair((v) => !v)}>
+                <CursorIcon />
+              </ToolBtn>
+            </div>
+            <span className="text-[11px] text-slate-400">
+              Kỳ hiển thị: {getTimeFilterLabel(timeFilter)}
+            </span>
+          </div>
+        </>
+      ) : (
+        <ChartDataTable
+          title="Biểu đồ Công suất và Hệ số công suất"
+          subtitle={`Kỳ hiển thị: ${getTimeFilterLabel(timeFilter)}`}
+          filename="bieu-do-cong-suat"
+          columns={tableColumns}
+          rows={tableRows}
+        />
+      )}
     </section>
   );
 }

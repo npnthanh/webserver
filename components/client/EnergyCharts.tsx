@@ -3,6 +3,7 @@
 import { useParams } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ChartTimeline } from "@/components/client/ChartTimeline";
+import { ChartDataTable } from "@/components/client/ChartViewToolbar";
 import { useChartSize } from "@/components/client/useChartSize";
 import {
   DEFAULT_TIME_FILTER,
@@ -28,6 +29,8 @@ import {
 } from "@/lib/gateway-series";
 import { formatStoredVietnam, vietnamFromStored } from "@/lib/vietnam-time";
 import { hydrateMeterReadings, type MeterReading } from "@/lib/meter-readings";
+import { civilWeekday, industrialBand } from "@/lib/industrial-electricity";
+import { registerToKwh } from "@/lib/meter-parameters";
 
 type EnergyKind = string;
 type MetricId = "energy" | "ui" | "freq" | "power" | "harm" | "unbalance" | "pst";
@@ -92,13 +95,11 @@ function energyBarsFromReadings(
     } else if (
       filter.mode === "custom_date" &&
       filter.customDateMode !== "range" &&
-      date === filter.customDate
+      date === filter.customDate.slice(0, 10)
     ) {
       index = Number(row.recordedAt.slice(11, 13));
     } else if (filter.mode === "custom_date" && filter.customDateMode === "range") {
-      const start = new Date(`${filter.startDate}T00:00:00`).getTime();
-      const current = new Date(`${date}T00:00:00`).getTime();
-      index = Math.round((current - start) / (24 * 60 * 60 * 1000));
+      index = periodIndexForInstant(filter, row.recordedAt, periods.length);
     }
     if (index >= 0 && index < periods.length) values.set(index, (values.get(index) ?? 0) + row.value);
   }
@@ -120,12 +121,14 @@ function periodIndex(filter: TimeFilterValue, at: string, length: number) {
     if (Number(date.slice(0, 4)) === filter.year) index = Number(date.slice(5, 7)) - 1;
   } else if (filter.mode === "day" && date === filter.date) {
     index = Number(normalized.slice(11, 13));
-  } else if (filter.mode === "custom_date" && filter.customDateMode !== "range" && date === filter.customDate) {
+  } else if (
+    filter.mode === "custom_date" &&
+    filter.customDateMode !== "range" &&
+    date === filter.customDate.slice(0, 10)
+  ) {
     index = Number(normalized.slice(11, 13));
   } else if (filter.mode === "custom_date" && filter.customDateMode === "range") {
-    const start = new Date(`${filter.startDate}T00:00:00`).getTime();
-    const current = new Date(`${date}T00:00:00`).getTime();
-    index = Math.round((current - start) / (24 * 60 * 60 * 1000));
+    index = periodIndexForInstant(filter, normalized, length);
   }
   return index >= 0 && index < length ? index : -1;
 }
@@ -139,7 +142,7 @@ function energyBarsFromGateway(filter: TimeFilterValue, samples: ProjectGatewayS
     const index = periodIndexForInstant(filter, sample.at, periods.length);
     if (index < 0) continue;
     const list = grouped.get(index) ?? [];
-    list.push(wh / 1000);
+    list.push(registerToKwh(wh));
     grouped.set(index, list);
   }
   return periods.map((period, index) => {
@@ -167,7 +170,9 @@ function energyBarsFromDaily(filter: TimeFilterValue, rows: GatewayDailyPoint[])
   return periods.map((period, index) => {
     const bucket = buckets[index];
     const kwh =
-      bucket.first == null || bucket.last == null ? 0 : Math.max(0, (bucket.last - bucket.first) / 1000);
+      bucket.first == null || bucket.last == null
+        ? 0
+        : Math.max(0, registerToKwh(bucket.last) - registerToKwh(bucket.first));
     return {
       minute: index,
       label: period.label,
@@ -228,9 +233,11 @@ export function EnergyCharts() {
   const [readings, setReadings] = useState<MeterReading[]>([]);
   const [gatewaySamples, setGatewaySamples] = useState<ProjectGatewaySample[]>([]);
   const [dailyRows, setDailyRows] = useState<GatewayDailyPoint[]>([]);
+  const [reloadTick, setReloadTick] = useState(0);
   const gatewayMonthAligned = useRef(false);
   const filterTouched = useRef(false);
   const selectionTouched = useRef(false);
+  const handleRefresh = () => setReloadTick((value) => value + 1);
 
   useEffect(() => {
     gatewayMonthAligned.current = false;
@@ -274,7 +281,7 @@ export function EnergyCharts() {
       active = false;
       window.removeEventListener("ems-client-meters-changed", reload);
     };
-  }, [projectId]);
+  }, [projectId, reloadTick]);
 
   useEffect(() => {
     const span = timeFilterSpan(timeFilter);
@@ -303,7 +310,7 @@ export function EnergyCharts() {
     return () => {
       active = false;
     };
-  }, [projectId, timeFilter]);
+  }, [projectId, timeFilter, reloadTick]);
 
   const pointsForEnergy = useMemo(
     () => allPoints.filter((p) => p.energy === energy),
@@ -445,12 +452,39 @@ export function EnergyCharts() {
   const grandTotal = pointTotals.reduce((s, item) => s + item.total, 0);
 
   const tou = useMemo(() => {
-    const peak = Math.round(grandTotal * 0.18 * 10) / 10;
-    const normal = Math.round(grandTotal * 0.61 * 10) / 10;
-    const off = Math.round(grandTotal * 0.16 * 10) / 10;
-    const none = Math.max(0, Math.round((grandTotal - peak - normal - off) * 10) / 10);
-    return { peak, normal, off, none };
-  }, [grandTotal]);
+    const result = { peak: 0, normal: 0, off: 0, none: 0 };
+    for (const point of selectedPoints) {
+      const samples = gatewayByPoint.get(point.id);
+      if (!samples?.length) continue;
+      const ordered = [...samples].sort((a, b) => a.at.localeCompare(b.at));
+      let prevKwh: number | null = null;
+      for (const sample of ordered) {
+        const raw = sample.values.EPaed;
+        if (typeof raw !== "number" || !Number.isFinite(raw)) continue;
+        const currKwh = registerToKwh(raw);
+        const delta = prevKwh == null ? 0 : Math.max(0, currKwh - prevKwh);
+        prevKwh = currKwh;
+        if (delta <= 0) continue;
+        const parts = vietnamFromStored(sample.at);
+        if (!parts) {
+          result.none += delta;
+          continue;
+        }
+        const band = industrialBand(
+          civilWeekday(parts.year, parts.month, parts.day),
+          parts.hour,
+          parts.minute,
+        );
+        result[band] += delta;
+      }
+    }
+    return {
+      peak: Math.round(result.peak * 100) / 100,
+      normal: Math.round(result.normal * 100) / 100,
+      off: Math.round(result.off * 100) / 100,
+      none: Math.round(result.none * 100) / 100,
+    };
+  }, [gatewayByPoint, selectedPoints]);
 
   const totals = useMemo(() => {
     if (isConsumptionChart) {
@@ -630,14 +664,14 @@ export function EnergyCharts() {
         </div>
       </aside>
 
-      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto md:overflow-hidden">
         <div className="shrink-0 border-b border-slate-200 bg-white px-3 py-2.5 sm:px-4">
           <div className="flex flex-col gap-2.5">
-            <div className="flex flex-wrap items-center gap-1.5">
+            <div className="flex items-center gap-1.5 overflow-x-auto scrollbar-none sm:flex-wrap">
               <button
                 type="button"
                 onClick={() => setPointsOpen(true)}
-                className="inline-flex h-8 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 text-[13px] font-medium text-slate-700 md:hidden"
+                className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md border border-slate-200 bg-white px-2.5 text-[13px] font-medium text-slate-700 md:hidden"
               >
                 Điểm đo ({selectedPoints.length})
               </button>
@@ -649,7 +683,7 @@ export function EnergyCharts() {
                     setEnergy(item);
                     setMetric("energy");
                   }}
-                  className={`inline-flex h-8 items-center gap-1.5 rounded-md border px-2.5 text-[13px] font-medium transition-colors ${
+                  className={`inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md border px-2.5 text-[13px] font-medium transition-colors ${
                     energy === item
                       ? "border-slate-900 bg-slate-900 text-white shadow-xs"
                       : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
@@ -670,13 +704,13 @@ export function EnergyCharts() {
             />
           </div>
           {isElectric ? (
-            <div className="mt-2 flex flex-wrap gap-1 border-t border-slate-100 pt-2">
+            <div className="mt-2 flex items-center gap-1 overflow-x-auto border-t border-slate-100 pt-2 pb-0.5 scrollbar-none sm:flex-wrap">
               {METRICS.map((item) => (
                 <button
                   key={item.id}
                   type="button"
                   onClick={() => setMetric(item.id)}
-                  className={`h-7 rounded-full px-2.5 text-[11.5px] font-medium transition-colors ${
+                  className={`h-7 shrink-0 rounded-full px-2.5 text-[11.5px] font-medium whitespace-nowrap transition-colors ${
                     metric === item.id
                       ? "bg-emerald-600 text-white shadow-xs"
                       : "bg-slate-50 text-slate-600 ring-1 ring-slate-200 hover:bg-white"
@@ -689,22 +723,23 @@ export function EnergyCharts() {
           ) : null}
         </div>
 
-        <div className="min-h-0 min-w-0 flex-1 overflow-y-auto p-2 sm:p-3">
+        <div className="min-w-0 flex-1 md:min-h-0 md:overflow-y-auto p-2 sm:p-3">
         {isUiChart ? (
           <section className="w-full min-w-0 rounded-lg border border-slate-200 bg-white p-2 shadow-[0_1px_2px_rgba(16,24,40,0.04)] sm:p-3">
-            <UiWaveform timeFilter={timeFilter} samples={liveSamples} />
+            <UiWaveform timeFilter={timeFilter} samples={liveSamples} onRefresh={handleRefresh} />
           </section>
         ) : isFreqChart ? (
           <FrequencyChart
             timeFilter={timeFilter}
             samples={liveSamples}
+            onRefresh={handleRefresh}
           />
         ) : isPowerChart ? (
-          <PowerChart timeFilter={timeFilter} samples={liveSamples} />
+          <PowerChart timeFilter={timeFilter} samples={liveSamples} onRefresh={handleRefresh} />
         ) : isHarmChart ? (
-          <HarmonicsChart samples={liveSamples} />
+          <HarmonicsChart timeFilter={timeFilter} samples={liveSamples} onRefresh={handleRefresh} />
         ) : isUnbChart ? (
-          <UnbalanceChart samples={liveSamples} />
+          <UnbalanceChart timeFilter={timeFilter} samples={liveSamples} onRefresh={handleRefresh} />
         ) : isConsumptionChart ? (
           <>
             <div className="flex w-full min-w-0 flex-col gap-4">
@@ -755,7 +790,7 @@ export function EnergyCharts() {
                     >
                       <TableIcon className="h-4 w-4" />
                     </IconBtn>
-                    <IconBtn label="Làm mới" onClick={() => undefined}>
+                    <IconBtn label="Làm mới" onClick={handleRefresh}>
                       <RefreshIcon className="h-4 w-4" />
                     </IconBtn>
                   </div>
@@ -783,31 +818,41 @@ export function EnergyCharts() {
                     />
                   </div>
                 ) : (
-                  <div className="mt-4 overflow-x-auto">
-                    <table className="w-full min-w-[480px] text-left text-sm">
-                      <thead>
-                        <tr className="border-b border-slate-100 text-[11px] text-slate-400">
-                          <th className="py-2 font-medium">Thời điểm</th>
-                          {selectedPoints.map((p) => (
-                            <th key={p.id} className="py-2 font-medium" style={{ color: p.color }}>
-                              ({p.code}) {p.name}
-                            </th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {visibleBars.map((point, rowIdx) => (
-                          <tr key={point.minute} className="border-b border-slate-50 text-slate-600">
-                            <td className="py-1.5 font-medium">{point.label}</td>
-                            {multiBars.map((series) => (
-                              <td key={series.point.id} className="py-1.5">
-                                {formatKwh(series.bars[range.start + rowIdx]?.kwh ?? 0)} {consumptionUnit}
-                              </td>
-                            ))}
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
+                  <div className="mt-3 flex w-full min-w-0 flex-col gap-3">
+                    <ChartTimeline
+                      labels={primaryBars.map((item) => item.label)}
+                      values={primaryBars.map((item) => item.kwh)}
+                      range={range}
+                      onRange={setRange}
+                    />
+                    <ChartDataTable
+                      title={
+                        energy === "Điện"
+                          ? "Chi tiết tiêu thụ điện năng"
+                          : `Chi tiết tiêu thụ ${energy.toLowerCase()}`
+                      }
+                      subtitle={`Kỳ lọc: ${getTimeFilterLabel(timeFilter)} · Đơn vị: ${consumptionUnit}`}
+                      filename={`tieu-thu-${energy.toLowerCase()}`}
+                      columns={[
+                        { header: "Thời điểm" },
+                        ...selectedPoints.map((p) => ({
+                          header: `(${p.code}) ${p.name} (${consumptionUnit})`,
+                          color: p.color,
+                        })),
+                      ]}
+                      rows={visibleBars.map((point, rowIdx) => ({
+                        label: point.label,
+                        values: multiBars.map((series) => {
+                          const kwh = Number(
+                            (series.bars[range.start + rowIdx]?.kwh ?? 0).toFixed(3),
+                          );
+                          return {
+                            raw: kwh,
+                            display: `${formatKwh(kwh)} ${consumptionUnit}`,
+                          };
+                        }),
+                      }))}
+                    />
                   </div>
                 )}
               </article>
@@ -893,7 +938,7 @@ export function EnergyCharts() {
                 <IconBtn label="Bảng dữ liệu" active={view === "table"} onClick={() => setView("table")}>
                   <TableIcon className="h-4 w-4" />
                 </IconBtn>
-                <IconBtn label="Làm mới" onClick={() => undefined}>
+                <IconBtn label="Làm mới" onClick={handleRefresh}>
                   <RefreshIcon className="h-4 w-4" />
                 </IconBtn>
               </div>
@@ -940,32 +985,25 @@ export function EnergyCharts() {
                 </div>
               </div>
             ) : (
-              <div className="mt-4 overflow-x-auto">
-                <table className="w-full min-w-[480px] text-left text-sm">
-                  <thead>
-                    <tr className="border-b border-slate-100 text-[11px] text-slate-400">
-                      <th className="py-2 font-medium">Thời điểm</th>
-                      {selectedPoints.map((p) => (
-                        <th key={p.id} className="py-2 font-medium" style={{ color: p.color }}>
-                          ({p.code}) {p.name}
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {Array.from({ length: 25 }, (_, i) => (
-                      <tr key={i} className="border-b border-slate-50 text-slate-600">
-                        <td className="py-1.5">{String(i).padStart(2, "0")}:00</td>
-                        {values.map((row, s) => (
-                          <td key={selectedPoints[s]?.id ?? s} className="py-1.5">
-                            {row[i].toFixed(1)}
-                          </td>
-                        ))}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+              <ChartDataTable
+                title={meta.title}
+                subtitle={`Kỳ lọc: ${getTimeFilterLabel(timeFilter)}`}
+                filename={`bieu-do-${metric}`}
+                columns={[
+                  { header: "Thời điểm" },
+                  ...selectedPoints.map((p) => ({
+                    header: `(${p.code}) ${p.name}`,
+                    color: p.color,
+                  })),
+                ]}
+                rows={Array.from({ length: 25 }, (_, i) => ({
+                  label: `${String(i).padStart(2, "0")}:00`,
+                  values: values.map((row) => {
+                    const num = Number((row[i] ?? 0).toFixed(2));
+                    return { raw: num, display: num.toFixed(1) };
+                  }),
+                }))}
+              />
             )}
 
             {isElectric && totals.kind === "stats" ? (

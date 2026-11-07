@@ -3,7 +3,9 @@
 import { useParams } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ChartTimeline } from "@/components/client/ChartTimeline";
+import { ChartDataTable, type ChartViewMode } from "@/components/client/ChartViewToolbar";
 import { useChartSize } from "@/components/client/useChartSize";
+import { exportToExcel } from "@/lib/excel-export";
 import {
   DEFAULT_TIME_FILTER,
   TimeFilterBar,
@@ -168,6 +170,7 @@ export function CostCharts() {
   const [timeFilter, setTimeFilter] = useState<TimeFilterValue>(DEFAULT_TIME_FILTER);
   const [allPoints, setAllPoints] = useState<CostPoint[]>([]);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [view, setView] = useState<ChartViewMode>("chart");
   const [showSum, setShowSum] = useState(false);
   const [hover, setHover] = useState<number | null>(null);
   const [query, setQuery] = useState("");
@@ -256,15 +259,15 @@ export function CostCharts() {
         setTimeFilter((current) =>
           current.mode === "custom_date" &&
           current.customDateMode === "range" &&
-          current.startDate === first &&
-          current.endDate === last
+          current.startDate.slice(0, 10) === first &&
+          current.endDate.slice(0, 10) === last
             ? current
             : {
                 ...current,
                 mode: "custom_date",
                 customDateMode: "range",
-                startDate: first,
-                endDate: last,
+                startDate: `${first}T00:00`,
+                endDate: `${last}T23:59`,
                 date: last,
                 month: last.slice(0, 7),
                 year: Number(last.slice(0, 4)),
@@ -351,6 +354,12 @@ export function CostCharts() {
   useEffect(() => {
     setRange({ start: 0, end: Math.max(barCount - 1, 0) });
   }, [timeFilter, barCount]);
+
+  const visibleIndices = useMemo(() => {
+    const start = Math.max(0, Math.min(range.start, barCount - 1));
+    const end = Math.max(start, Math.min(range.end, barCount - 1));
+    return Array.from({ length: end - start + 1 }, (_, i) => start + i);
+  }, [barCount, range.end, range.start]);
   const grandTotal = series.reduce(
     (sum, item) => sum + item.bars.reduce((s, b) => s + b.dark, 0),
     0,
@@ -414,17 +423,22 @@ export function CostCharts() {
 
   const exportCsv = () => {
     const periodName = getTimeFilterLabel(timeFilter);
-    const header = ["Thời điểm", ...selectedPoints.map((p) => `${p.code} ${p.name}`)].join(",");
-    const rows = primaryBars.map((bar, i) =>
-      [bar.label, ...series.map((s) => s.bars[i]?.dark ?? 0)].join(","),
-    );
-    const blob = new Blob([[`# Kỳ: ${periodName}`, header, ...rows].join("\n")], { type: "text/csv;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `chi-phi-${energy}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
+    exportToExcel({
+      filename: `chi-phi-${energy}-${periodName}`,
+      sheetName: `Chi phí ${energy}`,
+      title: `Chi tiết chi phí ${energy.toLowerCase()} — Kỳ: ${periodName}`,
+      columns: [
+        { header: "Thời điểm", width: 22 },
+        ...selectedPoints.map((p) => ({
+          header: `(${p.code}) ${p.name} (VNĐ)`,
+          width: 26,
+        })),
+      ],
+      rows: visibleIndices.map((idx) => [
+        primaryBars[idx]?.label ?? "",
+        ...series.map((s) => Math.round(s.bars[idx]?.dark ?? 0)),
+      ]),
+    });
   };
 
   return (
@@ -636,13 +650,16 @@ export function CostCharts() {
                 </div>
               </div>
               <div className="flex items-center">
-                <IconBtn label="Biểu đồ cột" active>
+                <IconBtn label="Biểu đồ cột" active={view === "chart"} onClick={() => setView("chart")}>
                   <BarIcon className="h-4 w-4" />
                 </IconBtn>
                 <IconBtn label="Tổng" active={showSum} onClick={() => setShowSum((v) => !v)}>
                   <SigmaIcon className="h-4 w-4" />
                 </IconBtn>
-                <IconBtn label="Xuất dữ liệu" onClick={exportCsv}>
+                <IconBtn label="Bảng dữ liệu" active={view === "table"} onClick={() => setView("table")}>
+                  <TableIcon className="h-4 w-4" />
+                </IconBtn>
+                <IconBtn label="Xuất Excel (.xlsx)" onClick={exportCsv}>
                   <SaveIcon className="h-4 w-4" />
                 </IconBtn>
                 <IconBtn label="Làm mới" onClick={() => setReloadKey((value) => value + 1)}>
@@ -655,31 +672,49 @@ export function CostCharts() {
                 Chưa có điểm đo loại {energy} để hiển thị chi phí
               </p>
             ) : (
-              <>
-                {slots.length > 0 && series.every((item) => item.slotCount === 0) ? (
-                  <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[12px] leading-relaxed text-amber-900">
-                    API đã trả {slots.length} khung giờ, nhưng điểm đo đang chọn không khớp `meterPointId` của series.
-                    Chọn đúng điểm đo có dữ liệu (ví dụ {slots[0]?.meterPointId}) để xem chi phí.
-                  </div>
-                ) : null}
-                {grandTotal <= 0 && series.some((item) => item.slotCount > 0) ? (
-                  <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[12px] leading-relaxed text-amber-900">
-                    Series đã trả {series.reduce((sum, item) => sum + item.slotCount, 0)} khung giờ /
-                    {" "}{Math.max(...series.map((item) => item.sampleDays), 0)} ngày có bản tin.
-                    Chỉ số EPaed đứng yên (ví dụ {formatKwh(Math.max(...series.map((item) => item.lastIndexKwh), 0))} kWh)
-                    nên sản lượng từng ngày = 0 kWh và cột chi phí = 0 VND. Khi công tơ tăng, cột sẽ hiện đúng theo từng ngày.
-                  </div>
-                ) : null}
-                <div className="mt-3 flex w-full min-w-0 flex-col gap-3">
-                  <ChartTimeline
-                    labels={primaryBars.map((item) => item.label)}
-                    values={primaryBars.map((item) => item.dark)}
-                    range={range}
-                    onRange={setRange}
+              <div className="mt-3 flex w-full min-w-0 flex-col gap-3">
+                <ChartTimeline
+                  labels={primaryBars.map((item) => item.label)}
+                  values={primaryBars.map((item) => item.dark)}
+                  range={range}
+                  onRange={setRange}
+                />
+                {view === "table" ? (
+                  <ChartDataTable
+                    title={`Bảng số liệu chi phí ${energy.toLowerCase()} (VNĐ)`}
+                    subtitle={`Kỳ dữ liệu: ${getTimeFilterLabel(timeFilter)}`}
+                    filename={`chi-phi-${energy}-${getTimeFilterLabel(timeFilter)}`}
+                    columns={[
+                      { header: "Thời điểm", align: "left", width: 22 },
+                      ...series.map((s) => ({
+                        header: `(${s.point.code}) ${s.point.name} (VNĐ)`,
+                        color: s.point.color,
+                        align: "right" as const,
+                        width: 26,
+                      })),
+                      ...(series.length > 1
+                        ? [{ header: "Tổng chi phí (VNĐ)", align: "right" as const, width: 24 }]
+                        : []),
+                    ]}
+                    rows={visibleIndices.map((idx) => {
+                      const values = series.map((s) => {
+                        const val = Math.round(s.bars[idx]?.dark ?? 0);
+                        return { raw: val, display: `${formatVnd(val)} VNĐ` };
+                      });
+                      if (series.length > 1) {
+                        const totalVal = values.reduce((sum, item) => sum + Number(item.raw ?? 0), 0);
+                        values.push({ raw: totalVal, display: `${formatVnd(totalVal)} VNĐ` });
+                      }
+                      return {
+                        label: primaryBars[idx]?.label ?? "",
+                        values,
+                      };
+                    })}
                   />
+                ) : (
                   <MultiCostBarChart series={series} range={range} hover={hover} onHover={setHover} />
-                </div>
-              </>
+                )}
+              </div>
             )}
           </article>
 
@@ -769,13 +804,9 @@ export function CostCharts() {
         <div className="mt-4 flex flex-wrap items-center justify-between gap-2 text-[12px] text-slate-500">
           <p className="inline-flex items-center gap-2">
             <span className={`h-2.5 w-2.5 rounded-full ${grandTotal > 0 ? "bg-emerald-500" : "bg-slate-300"}`} />
-            {grandTotal > 0
-              ? energy === "Điện"
-                ? "Tiền điện = sản lượng từng khung giờ (chỉ số cuối − chỉ số đầu) × đơn giá khung giờ tương ứng. Chưa gồm VAT."
-                : `Chi phí = sản lượng × ${formatVnd(flatPrices[energy] ?? 0)} VNĐ.`
-              : slots.length > 0 && energy === "Điện"
-                ? `Đã lấy ${Math.max(...series.map((item) => item.sampleDays), 0)} ngày có bản tin trong kỳ, nhưng EPaed không tăng (first = last) nên sản lượng và tiền điện mỗi ngày đều là 0. Chưa gồm VAT.`
-                : "Chưa có số liệu chi phí trong kỳ này"}
+            {`Tổng chi phí kỳ lọc: ${formatVnd(grandTotal)} VNĐ · Tổng sản lượng: ${formatKwh(
+              kwh.normal + kwh.off + kwh.peak + kwh.none,
+            )} kWh`}
           </p>
         </div>
       </div>
@@ -1125,6 +1156,15 @@ function SigmaIcon({ className }: { className?: string }) {
   return (
     <svg className={className} viewBox="0 0 24 24" fill="none" aria-hidden>
       <path d="M17 6H7l5 6-5 6h10" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function TableIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" aria-hidden>
+      <rect x="4" y="5" width="16" height="14" rx="1.8" stroke="currentColor" strokeWidth="1.6" />
+      <path d="M4 10h16M10 10v9" stroke="currentColor" strokeWidth="1.6" />
     </svg>
   );
 }

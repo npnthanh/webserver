@@ -2,7 +2,14 @@
 
 import { useMemo, useState } from "react";
 import { ChartTimeline } from "@/components/client/ChartTimeline";
+import {
+  buildSampleTableRows,
+  ChartDataTable,
+  ChartViewToolbar,
+  type ChartViewMode,
+} from "@/components/client/ChartViewToolbar";
 import { useChartSize } from "@/components/client/useChartSize";
+import { CustomSelect } from "@/components/ui/CustomSelect";
 import { chartTimeLabel, chartTimeTicks, paddedDomain, valuesForKey, type ChartSample } from "@/lib/gateway-series";
 import { getTimeFilterLabel, type TimeFilterValue } from "./TimeFilterBar";
 
@@ -37,11 +44,13 @@ const COLORS: Record<Agg, string> = {
 export function FrequencyChart({
   timeFilter,
   samples,
+  onRefresh,
 }: {
   onRefresh?: () => void;
   timeFilter: TimeFilterValue;
   samples?: ChartSample[];
 }) {
+  const [view, setView] = useState<ChartViewMode>("chart");
   const [qty, setQty] = useState("Freq");
   const [slotA, setSlotA] = useState("-");
   const [slotB, setSlotB] = useState("-");
@@ -83,12 +92,31 @@ export function FrequencyChart({
   );
   const timelineValues = series[0]?.values ?? Array.from({ length: N }, () => 0);
 
+  const tableColumns = useMemo(
+    () => [
+      { header: "Thời điểm" },
+      ...series.map((s) => ({ header: `${s.name} (Hz)`, color: s.color })),
+    ],
+    [series],
+  );
+
+  const tableRows = useMemo(
+    () =>
+      buildSampleTableRows(
+        samples,
+        series.map((s) => ({ ...s, unit: "Hz", digits: 3 })),
+        viewWin,
+        N,
+      ),
+    [samples, series, viewWin],
+  );
+
   return (
     <section className="w-full min-w-0 rounded-lg border border-slate-200 bg-white p-3 shadow-[0_1px_2px_rgba(16,24,40,0.04)] sm:p-4">
       {/* Top bar: chọn kênh; bộ lọc thời gian dùng thanh chung của trang */}
       <div className="mb-3 flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 pb-3">
         <div className="flex flex-wrap items-center gap-2">
-          <select
+          <CustomSelect
             value={qty}
             onChange={(e) => setQty(e.target.value)}
             className="h-9 rounded-lg border border-slate-200 bg-white px-3 text-[13px] font-semibold text-slate-700 outline-none focus:border-emerald-500 shadow-2xs"
@@ -96,10 +124,10 @@ export function FrequencyChart({
             <option value="Freq">Tần số (Freq)</option>
             <option value="U">Điện áp (U)</option>
             <option value="I">Dòng điện (I)</option>
-          </select>
+          </CustomSelect>
           {qty !== "Freq" && (
             <>
-              <select
+              <CustomSelect
                 value={slotA === "-" ? "CH1" : slotA}
                 onChange={(e) => setSlotA(e.target.value)}
                 className="h-9 rounded-lg border border-slate-200 bg-white px-2.5 text-[13px] text-slate-700 outline-none focus:border-emerald-500 shadow-2xs"
@@ -107,8 +135,8 @@ export function FrequencyChart({
                 <option value="CH1">Pha A (CH1)</option>
                 <option value="CH2">Pha B (CH2)</option>
                 <option value="CH3">Pha C (CH3)</option>
-              </select>
-              <select
+              </CustomSelect>
+              <CustomSelect
                 value={slotB === "-" ? "rms" : slotB}
                 onChange={(e) => setSlotB(e.target.value)}
                 className="h-9 rounded-lg border border-slate-200 bg-white px-2.5 text-[13px] text-slate-700 outline-none focus:border-emerald-500 shadow-2xs"
@@ -116,49 +144,61 @@ export function FrequencyChart({
                 <option value="rms">Hiệu dụng (RMS)</option>
                 <option value="pk+">Đỉnh dương (Pk+)</option>
                 <option value="pk-">Đỉnh âm (Pk-)</option>
-              </select>
+              </CustomSelect>
             </>
           )}
         </div>
-
+        <ChartViewToolbar view={view} onViewChange={setView} onRefresh={onRefresh} />
       </div>
 
       <div className="mb-2">
         <ChartTimeline compact labels={timelineLabels} values={timelineValues} range={viewWin} onRange={setViewWin} />
       </div>
 
-      <div className="min-w-0 w-full overflow-hidden rounded-[2px] border border-slate-400 bg-white">
-        <FreqPane
-          qty={qty}
-          series={series}
-          samples={samples}
-          viewWin={viewWin}
-          hover={crosshair ? hover : null}
-          onHover={setHover}
-          domain={freqDomain}
-        />
-      </div>
+      {view === "chart" ? (
+        <>
+          <div className="min-w-0 w-full overflow-hidden rounded-[2px] border border-slate-400 bg-white">
+            <FreqPane
+              qty={qty}
+              series={series}
+              samples={samples}
+              viewWin={viewWin}
+              hover={crosshair ? hover : null}
+              onHover={setHover}
+              domain={freqDomain}
+            />
+          </div>
 
-      {/* Dưới cùng chỉ giữ lại công cụ zoom / view */}
-      <div className="mt-2.5 flex items-center justify-between gap-3">
-        <div className="flex gap-1">
-          <ToolBtn label="Phóng to" onClick={zoomIn}>
-            <ZoomIcon plus />
-          </ToolBtn>
-          <ToolBtn label="Thu nhỏ" onClick={zoomOut}>
-            <ZoomIcon plus={false} />
-          </ToolBtn>
-          <ToolBtn label="Vừa khung" onClick={() => setViewWin({ start: 0, end: N - 1 })}>
-            <FitIcon />
-          </ToolBtn>
-          <ToolBtn label="Con trỏ" active={crosshair} onClick={() => setCrosshair((v) => !v)}>
-            <CursorIcon />
-          </ToolBtn>
-        </div>
-        <span className="text-[11px] text-slate-400">
-          Kỳ hiển thị: {getTimeFilterLabel(timeFilter)}
-        </span>
-      </div>
+          {/* Dưới cùng chỉ giữ lại công cụ zoom / view */}
+          <div className="mt-2.5 flex items-center justify-between gap-3">
+            <div className="flex gap-1">
+              <ToolBtn label="Phóng to" onClick={zoomIn}>
+                <ZoomIcon plus />
+              </ToolBtn>
+              <ToolBtn label="Thu nhỏ" onClick={zoomOut}>
+                <ZoomIcon plus={false} />
+              </ToolBtn>
+              <ToolBtn label="Vừa khung" onClick={() => setViewWin({ start: 0, end: N - 1 })}>
+                <FitIcon />
+              </ToolBtn>
+              <ToolBtn label="Con trỏ" active={crosshair} onClick={() => setCrosshair((v) => !v)}>
+                <CursorIcon />
+              </ToolBtn>
+            </div>
+            <span className="text-[11px] text-slate-400">
+              Kỳ hiển thị: {getTimeFilterLabel(timeFilter)}
+            </span>
+          </div>
+        </>
+      ) : (
+        <ChartDataTable
+          title="Biểu đồ Tần số (Hz)"
+          subtitle={`Kỳ hiển thị: ${getTimeFilterLabel(timeFilter)}`}
+          filename="bieu-do-tan-so"
+          columns={tableColumns}
+          rows={tableRows}
+        />
+      )}
     </section>
   );
 }

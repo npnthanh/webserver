@@ -20,23 +20,35 @@ import {
   loadClientMeters,
   type ClientMeter,
 } from "@/lib/client-meters";
-import { hydrateProjects, loadProjects, resolveMeterTypes, type MeterType } from "@/lib/projects";
+import { hydrateProjects, resolveMeterTypes, type MeterType } from "@/lib/projects";
 import {
   clearDiagramState,
   hydrateDiagramState,
   loadDiagramState,
   saveDiagramState,
-  type SavedDiagramState,
+  type SavedDiagramDisplay,
 } from "@/lib/diagram-db";
+import {
+  loadProjectGatewayLatest,
+  type ProjectGatewaySample,
+} from "@/lib/gateway-series";
+import { formatStoredVietnam } from "@/lib/vietnam-time";
 import { DiagramActionsContext } from "./diagram/context";
+import {
+  buildLiveMetrics,
+  DIAGRAM_ONLINE_MS,
+  normalizeMetricKeys,
+  parameterGroups,
+} from "./diagram/metrics";
 import { MeterNode, NodeGlyph } from "./diagram/nodes";
 import type {
   DiagramEdge,
   DiagramNode,
+  DiagramNodeDisplay,
   EnergyKind,
+  MeterFlowNode,
   MeterIcon,
   MeterNodeData,
-  MeterStatus,
 } from "./diagram/types";
 
 const ICON_OPTIONS: { id: MeterIcon; label: string }[] = [
@@ -80,6 +92,7 @@ function saveDiagramPositions(
     utility: energy,
     positions: { ...(current?.positions ?? {}), ...patches },
     viewport: current?.viewport,
+    displays: current?.displays,
   });
 }
 
@@ -99,6 +112,47 @@ function saveDiagramViewport(
       y: Math.round(viewport.y),
       zoom: Number(viewport.zoom.toFixed(3)),
     },
+    displays: current?.displays,
+  });
+}
+
+function toSavedDisplays(displays: Record<string, DiagramNodeDisplay>) {
+  const next: Record<string, SavedDiagramDisplay> = {};
+  for (const [id, display] of Object.entries(displays)) {
+    next[id] = {
+      title: display.title,
+      icon: display.icon,
+      metricKeys: display.metricKeys,
+    };
+  }
+  return next;
+}
+
+function fromSavedDisplays(raw: Record<string, SavedDiagramDisplay> | undefined) {
+  const next: Record<string, DiagramNodeDisplay> = {};
+  for (const [id, display] of Object.entries(raw ?? {})) {
+    next[id] = {
+      title: display.title,
+      icon: display.icon as MeterIcon | undefined,
+      metricKeys: display.metricKeys,
+    };
+  }
+  return next;
+}
+
+function saveDiagramDisplays(
+  projectId: string,
+  energy: string,
+  displays: Record<string, DiagramNodeDisplay>,
+) {
+  if (typeof window === "undefined") return;
+  const current = loadDiagramState(projectId, energy);
+  saveDiagramState({
+    projectId,
+    utility: energy,
+    positions: current?.positions ?? {},
+    viewport: current?.viewport,
+    displays: toSavedDisplays(displays),
   });
 }
 
@@ -109,28 +163,46 @@ function iconForUtility(utility: string): MeterIcon {
   return "meter";
 }
 
-function meterMetrics(meter: ClientMeter, status: MeterStatus): MeterNodeData["metrics"] {
-  if (!meter.deviceId || status === "offline") {
-    return [
-      { label: "Dữ liệu", value: "Chưa có dữ liệu" },
-      { label: "Trạng thái", value: meter.deviceId ? "Mất kết nối" : "Chưa gán đồng hồ" },
-    ];
-  }
-  return [
-    { label: "Mã", value: meter.code },
-    { label: "Trạng thái", value: "Đã gán đồng hồ" },
-  ];
+function isSampleOnline(at: string | undefined) {
+  if (!at) return false;
+  const ms = Date.parse(at.endsWith("Z") ? at : `${at}Z`);
+  if (!Number.isFinite(ms)) return false;
+  return Date.now() - ms <= DIAGRAM_ONLINE_MS;
 }
 
-function statusForMeter(meter: ClientMeter): { status: MeterStatus; statusLabel?: string } {
-  if (!meter.deviceId) {
-    return { status: "offline", statusLabel: "MẤT KẾT NỐI" };
-  }
-  return { status: "normal" };
+function nodeDataForMeter(
+  meter: ClientMeter,
+  display: DiagramNodeDisplay | undefined,
+  sample: ProjectGatewaySample | undefined,
+): MeterNodeData {
+  const metricKeys = normalizeMetricKeys(display?.metricKeys);
+  const live = buildLiveMetrics(metricKeys, sample?.values, {
+    hasDevice: Boolean(meter.deviceId),
+    online: isSampleOnline(sample?.at),
+    code: meter.code,
+  });
+  return {
+    title: display?.title ?? meter.name,
+    subtitle: meter.code,
+    status: live.status,
+    statusLabel: live.statusLabel,
+    icon:
+      display?.icon ??
+      (meter.parentId === null && meter.utility === "Điện" ? "plant" : iconForUtility(meter.utility)),
+    energy: meter.utility,
+    listed: true,
+    metricKeys,
+    metrics: live.metrics,
+    sampleAt: sample?.at ? formatStoredVietnam(sample.at) ?? sample.at : undefined,
+  };
 }
 
-function buildFlowFromMeters(meters: ClientMeter[]): {
-  nodes: DiagramNode[];
+function buildFlowFromMeters(
+  meters: ClientMeter[],
+  displays: Record<string, DiagramNodeDisplay>,
+  liveById: Record<string, ProjectGatewaySample>,
+): {
+  nodes: MeterFlowNode[];
   edges: DiagramEdge[];
 } {
   const byParent = new Map<string | null, ClientMeter[]>();
@@ -146,25 +218,15 @@ function buildFlowFromMeters(meters: ClientMeter[]): {
     return kids.reduce((sum, child) => sum + subtreeWidth(child.id), 0) + (kids.length - 1) * H_GAP;
   }
 
-  const nodes: DiagramNode[] = [];
+  const nodes: MeterFlowNode[] = [];
   const edges: DiagramEdge[] = [];
 
   function place(meter: ClientMeter, centerX: number, y: number) {
-    const { status, statusLabel } = statusForMeter(meter);
     nodes.push({
       id: meter.id,
       type: "meter",
       position: { x: centerX - NODE_W / 2, y },
-      data: {
-        title: meter.name,
-        subtitle: meter.code,
-        status,
-        statusLabel,
-        icon: meter.parentId === null && meter.utility === "Điện" ? "plant" : iconForUtility(meter.utility),
-        energy: meter.utility,
-        listed: true,
-        metrics: meterMetrics(meter, status),
-      },
+      data: nodeDataForMeter(meter, displays[meter.id], liveById[meter.id]),
     });
 
     const kids = byParent.get(meter.id) ?? [];
@@ -192,8 +254,6 @@ function buildFlowFromMeters(meters: ClientMeter[]): {
 
   const roots = byParent.get(null) ?? [];
   if (roots.length) {
-    const totalW =
-      roots.reduce((sum, root) => sum + subtreeWidth(root.id), 0) + (roots.length - 1) * H_GAP;
     let cursor = 80;
     for (const root of roots) {
       const w = subtreeWidth(root.id);
@@ -227,13 +287,22 @@ function SystemDiagramInner() {
   const [diagramVersion, setDiagramVersion] = useState(0);
   const [diagramStateReady, setDiagramStateReady] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [mobileListOpen, setMobileListOpen] = useState(false);
   const [savedNotice, setSavedNotice] = useState(false);
-  const [displayOverrides, setDisplayOverrides] = useState<
-    Record<string, Partial<MeterNodeData>>
-  >({});
+  const [displays, setDisplays] = useState<Record<string, DiagramNodeDisplay>>({});
+  const [liveById, setLiveById] = useState<Record<string, ProjectGatewaySample>>({});
+  const [liveTick, setLiveTick] = useState(0);
   const [nodes, setNodes, onNodesChange] = useNodesState<DiagramNode>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<DiagramEdge>([]);
   const { fitView, setCenter, getNode, getViewport, setViewport } = useReactFlow();
+  const displaysRef = useRef(displays);
+  const liveByIdRef = useRef(liveById);
+  displaysRef.current = displays;
+  liveByIdRef.current = liveById;
+
+  const refreshLive = useCallback(() => {
+    setLiveTick((value) => value + 1);
+  }, []);
 
   const saveCurrentViewport = useCallback(() => {
     saveDiagramViewport(projectId, energy, getViewport());
@@ -273,10 +342,14 @@ function SystemDiagramInner() {
     setDiagramStateReady(false);
     setNodes([]);
     setEdges([]);
+    setDisplays({});
     void hydrateDiagramState(projectId, energy)
       .catch(() => null)
-      .then(() => {
+      .then((state) => {
         if (!active) return;
+        setDisplays(
+          fromSavedDisplays(state?.displays ?? loadDiagramState(projectId, energy)?.displays),
+        );
         setDiagramStateReady(true);
         setDiagramVersion((value) => value + 1);
       });
@@ -285,29 +358,37 @@ function SystemDiagramInner() {
     };
   }, [projectId, energy, setNodes, setEdges]);
 
-  // Load or build diagram nodes, restoring saved positions & viewport
+  useEffect(() => {
+    let active = true;
+    const load = () => {
+      void loadProjectGatewayLatest(projectId).then((samples) => {
+        if (!active) return;
+        const next: Record<string, ProjectGatewaySample> = {};
+        for (const sample of samples) next[sample.meterPointId] = sample;
+        setLiveById(next);
+      });
+    };
+    load();
+    const timer = window.setInterval(load, 12_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [projectId, liveTick]);
+
+  // Build tree layout once meters / utility / saved state change
   useEffect(() => {
     if (!diagramStateReady) return;
     const filtered = meters.filter((meter) => meter.utility === energy);
-    const built = buildFlowFromMeters(filtered);
+    const built = buildFlowFromMeters(filtered, displaysRef.current, liveByIdRef.current);
     const savedState = loadDiagramState(projectId, energy);
     const savedPositions = savedState?.positions ?? {};
 
-    const restoredNodes: DiagramNode[] = built.nodes.map((node) => {
-      const patch = displayOverrides[node.id];
-      const data = patch
-        ? { ...(node.data as MeterNodeData), ...patch }
-        : (node.data as MeterNodeData);
-      // Restore previously dragged position if exists!
-      const position = savedPositions[node.id] ? { ...savedPositions[node.id] } : node.position;
-      return {
-        ...node,
-        type: "meter" as const,
-        position,
-        data,
-        selected: node.id === selectedId,
-      };
-    });
+    const restoredNodes: DiagramNode[] = built.nodes.map((node) => ({
+      ...node,
+      position: savedPositions[node.id] ? { ...savedPositions[node.id] } : node.position,
+      selected: node.id === selectedId,
+    }));
 
     setNodes(restoredNodes);
     setEdges(built.edges);
@@ -320,19 +401,39 @@ function SystemDiagramInner() {
       setSelectedId(filtered[0].id);
     }
 
-    // Restore viewport or auto-fit if first time
     if (savedState?.viewport) {
       const vp = savedState.viewport;
       const frame = requestAnimationFrame(() => {
         setViewport({ x: vp.x, y: vp.y, zoom: vp.zoom });
       });
       return () => cancelAnimationFrame(frame);
-    } else {
-      const frame = requestAnimationFrame(() => fitView({ padding: 0.28, duration: 200 }));
-      return () => cancelAnimationFrame(frame);
     }
+    const frame = requestAnimationFrame(() => fitView({ padding: 0.28, duration: 200 }));
+    return () => cancelAnimationFrame(frame);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [meters, energy, displayOverrides, setNodes, setEdges, fitView, setViewport, diagramVersion, diagramStateReady]);
+  }, [meters, energy, setNodes, setEdges, fitView, setViewport, diagramVersion, diagramStateReady]);
+
+  // Cập nhật giá trị realtime / lựa chọn thông số mà không reset vị trí / viewport
+  useEffect(() => {
+    if (!diagramStateReady) return;
+    setNodes((current) =>
+      current.map((item) => {
+        if (item.type !== "meter") return item;
+        const meter = meters.find((row) => row.id === item.id);
+        if (!meter) return item;
+        const nextData = nodeDataForMeter(meter, displays[item.id], liveById[item.id]);
+        const prev = item.data as MeterNodeData;
+        return {
+          ...item,
+          data: {
+            ...nextData,
+            iconImage: prev.iconImage,
+          },
+          selected: item.id === selectedId,
+        };
+      }),
+    );
+  }, [liveById, displays, meters, selectedId, diagramStateReady, setNodes]);
 
   useEffect(() => {
     setNodes((current) =>
@@ -346,6 +447,10 @@ function SystemDiagramInner() {
   );
 
   const selectedData = selectedNode?.data as MeterNodeData | undefined;
+  const selectedMeter = useMemo(
+    () => meters.find((meter) => meter.id === selectedId) ?? null,
+    [meters, selectedId],
+  );
 
   const diagramActions = useMemo(
     () => ({
@@ -356,42 +461,75 @@ function SystemDiagramInner() {
           current.map((item) => ({ ...item, selected: item.id === nodeId })),
         );
       },
+      refreshLive,
     }),
-    [setNodes],
+    [setNodes, refreshLive],
   );
 
   const updateSelectedDisplay = useCallback(
-    (patch: Partial<MeterNodeData>) => {
+    (patch: DiagramNodeDisplay & { iconImage?: string }) => {
       if (!selectedId) return;
-      setDisplayOverrides((current) => ({
-        ...current,
-        [selectedId]: { ...current[selectedId], ...patch },
-      }));
+      const { iconImage: _ignored, ...persisted } = patch;
+      setDisplays((current) => {
+        const next = {
+          ...current,
+          [selectedId]: {
+            ...current[selectedId],
+            ...persisted,
+            metricKeys: persisted.metricKeys
+              ? normalizeMetricKeys(persisted.metricKeys)
+              : current[selectedId]?.metricKeys,
+          },
+        };
+        saveDiagramDisplays(projectId, energy, next);
+        return next;
+      });
+      if ("iconImage" in patch) {
+        setNodes((current) =>
+          current.map((item) => {
+            if (item.id !== selectedId || item.type !== "meter") return item;
+            const data = item.data as MeterNodeData;
+            return {
+              ...item,
+              data: { ...data, iconImage: patch.iconImage },
+            };
+          }),
+        );
+      }
     },
-    [selectedId],
+    [selectedId, projectId, energy, setNodes],
   );
 
   const listedPoints = useMemo(() => {
     return meters
       .filter((meter) => meter.utility === energy)
       .map((meter) => {
-        const override = displayOverrides[meter.id];
-        const { status } = statusForMeter(meter);
+        const display = displays[meter.id];
+        const live = buildLiveMetrics(
+          normalizeMetricKeys(display?.metricKeys),
+          liveById[meter.id]?.values,
+          {
+            hasDevice: Boolean(meter.deviceId),
+            online: isSampleOnline(liveById[meter.id]?.at),
+            code: meter.code,
+          },
+        );
         return {
           id: meter.id,
-          name: override?.title ?? meter.name,
-          status: override?.status ?? status,
+          name: display?.title ?? meter.name,
+          status: live.status,
           energy: meter.utility,
           code: meter.code,
           deviceId: meter.deviceId,
           serialNumber: meter.serialNumber,
         };
       });
-  }, [meters, energy, displayOverrides]);
+  }, [meters, energy, displays, liveById]);
 
   const selectPoint = (id: string) => {
     setSelectedId(id);
     setSettingsOpen(false);
+    setMobileListOpen(false);
     setNodes((current) =>
       current.map((item) => ({ ...item, selected: item.id === id })),
     );
@@ -405,55 +543,76 @@ function SystemDiagramInner() {
     });
   };
 
-  // Reset layout back to default tree calculation
+  // Reset layout back to default tree calculation (giữ lựa chọn thông số hiển thị)
   const handleResetLayout = useCallback(() => {
     clearDiagramState(projectId, energy);
+    saveDiagramDisplays(projectId, energy, displays);
     const filtered = meters.filter((meter) => meter.utility === energy);
-    const built = buildFlowFromMeters(filtered);
+    const built = buildFlowFromMeters(filtered, displays, liveById);
     setNodes(
-      built.nodes.map((node) => {
-        const patch = displayOverrides[node.id];
-        const data = patch
-          ? { ...(node.data as MeterNodeData), ...patch }
-          : (node.data as MeterNodeData);
-        return {
-          ...node,
-          type: "meter" as const,
-          data,
-          selected: node.id === selectedId,
-        };
-      }),
+      built.nodes.map((node) => ({
+        ...node,
+        selected: node.id === selectedId,
+      })),
     );
     setEdges(built.edges);
     fitView({ padding: 0.28, duration: 250 });
     setSavedNotice(true);
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(() => setSavedNotice(false), 2000);
-  }, [projectId, energy, meters, displayOverrides, selectedId, setNodes, setEdges, fitView]);
+  }, [projectId, energy, meters, displays, liveById, selectedId, setNodes, setEdges, fitView]);
 
   const configHref = `/du-an/${projectId}/cau-hinh`;
 
   return (
     <DiagramActionsContext.Provider value={diagramActions}>
-      <div className="flex h-full min-h-0 bg-white font-sans">
-        {/* Left Sidebar: Points List */}
-        <aside className="flex w-[280px] shrink-0 flex-col border-r border-slate-200/80 bg-slate-50/70">
+      <div className="relative flex h-full min-h-0 bg-white font-sans">
+        {mobileListOpen ? (
+          <button
+            type="button"
+            aria-label="Đóng danh sách điểm đo"
+            className="fixed inset-0 z-30 bg-slate-900/40 md:hidden"
+            onClick={() => setMobileListOpen(false)}
+          />
+        ) : null}
+
+        {/* Left Sidebar: Points List (Mobile Drawer / Desktop Static) */}
+        <aside
+          className={`${
+            mobileListOpen ? "fixed inset-y-0 left-0 z-40 flex" : "hidden"
+          } w-[min(290px,85vw)] shrink-0 flex-col border-r border-slate-200/80 bg-white shadow-2xl md:relative md:z-0 md:flex md:w-[250px] md:bg-slate-50/70 md:shadow-none lg:w-[280px]`}
+        >
           <div className="flex items-center justify-between px-4 pt-4 pb-3 border-b border-slate-200/60 bg-white">
             <div>
               <h2 className="text-xs font-bold tracking-wider uppercase text-slate-700">
                 Danh sách điểm đo
               </h2>
             </div>
-            <button
-              type="button"
-              className="flex h-7 w-7 items-center justify-center rounded-lg border border-slate-200 text-slate-500 hover:bg-slate-50 hover:text-slate-800 disabled:opacity-40 transition-colors"
-              aria-label="Cài đặt điểm đo"
-              disabled={!selectedNode}
-              onClick={() => selectedNode && setSettingsOpen(true)}
-              title="Tùy chỉnh biểu tượng hiển thị"
-            >
-              <GearIcon className="h-3.5 w-3.5" />
-            </button>
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                className="flex h-7 w-7 items-center justify-center rounded-lg border border-slate-200 text-slate-500 hover:bg-slate-50 hover:text-slate-800 disabled:opacity-40 transition-colors"
+                aria-label="Cài đặt điểm đo"
+                disabled={!selectedNode}
+                onClick={() => {
+                  if (selectedNode) {
+                    setMobileListOpen(false);
+                    setSettingsOpen(true);
+                  }
+                }}
+                title="Tùy chỉnh hiển thị & thông số"
+              >
+                <GearIcon className="h-3.5 w-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setMobileListOpen(false)}
+                className="flex h-7 w-7 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 md:hidden"
+                aria-label="Đóng"
+              >
+                ✕
+              </button>
+            </div>
           </div>
           <ul className="min-h-0 flex-1 overflow-y-auto p-2 space-y-1">
             {listedPoints.length === 0 ? (
@@ -511,24 +670,45 @@ function SystemDiagramInner() {
         {/* Center: SCADA Canvas */}
         <section className="flex min-w-0 flex-1 flex-col">
           {/* Top Canvas Bar */}
-          <div className="flex flex-wrap items-center justify-start gap-4 border-b border-slate-200/80 bg-white px-6 py-3">
-            {/* Energy Utility Selector */}
-            <div className="flex items-center gap-1.5 rounded-xl border border-slate-200 bg-slate-50/60 p-1">
-              {energyFilters.map((item) => (
-                <button
-                  key={item}
-                  type="button"
-                  onClick={() => setEnergy(item)}
-                  className={`rounded-lg px-3 py-1 text-xs font-semibold transition-colors ${
-                    energy === item
-                      ? "bg-emerald-600 text-white shadow-xs"
-                      : "text-slate-600 hover:bg-white hover:text-slate-900"
-                  }`}
-                >
-                  {item}
-                </button>
-              ))}
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200/80 bg-white px-3 py-2 sm:px-6 sm:py-3">
+            <div className="flex items-center gap-2 overflow-x-auto scrollbar-none">
+              <button
+                type="button"
+                onClick={() => setMobileListOpen(true)}
+                className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-700 shadow-xs md:hidden"
+              >
+                <span>Điểm đo ({listedPoints.length})</span>
+              </button>
+
+              {/* Energy Utility Selector */}
+              <div className="flex shrink-0 items-center gap-1 rounded-xl border border-slate-200 bg-slate-50/60 p-1">
+                {energyFilters.map((item) => (
+                  <button
+                    key={item}
+                    type="button"
+                    onClick={() => setEnergy(item)}
+                    className={`rounded-lg px-2.5 py-1 text-xs font-semibold transition-colors sm:px-3 ${
+                      energy === item
+                        ? "bg-emerald-600 text-white shadow-xs"
+                        : "text-slate-600 hover:bg-white hover:text-slate-900"
+                    }`}
+                  >
+                    {item}
+                  </button>
+                ))}
+              </div>
             </div>
+
+            {selectedNode ? (
+              <button
+                type="button"
+                onClick={() => setSettingsOpen(true)}
+                className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-xl border border-emerald-200 bg-emerald-50 px-2.5 text-xs font-semibold text-emerald-700 md:hidden"
+              >
+                <GearIcon className="h-3.5 w-3.5" />
+                <span>Tùy chỉnh</span>
+              </button>
+            ) : null}
           </div>
 
           {/* React Flow Area */}
@@ -548,7 +728,6 @@ function SystemDiagramInner() {
                   }
                 }}
                 onPaneClick={() => setSettingsOpen(false)}
-                // Automatically save dragged positions on mouse release
                 onNodeDragStop={(_, node, draggedNodes) => {
                   const patches: Record<string, { x: number; y: number }> = {};
                   const list = draggedNodes && draggedNodes.length > 0 ? draggedNodes : [node];
@@ -560,7 +739,6 @@ function SystemDiagramInner() {
                   if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
                   saveTimerRef.current = setTimeout(() => setSavedNotice(false), 2000);
                 }}
-                // Automatically save viewport pan/zoom on canvas move
                 onMoveEnd={(_, viewport) => {
                   saveDiagramViewport(projectId, energy, viewport);
                 }}
@@ -568,15 +746,14 @@ function SystemDiagramInner() {
                 edgesFocusable={false}
                 elementsSelectable
                 nodesDraggable
-                minZoom={0.3}
+                minZoom={0.25}
                 maxZoom={2.0}
                 proOptions={{ hideAttribution: true }}
               >
                 <Background gap={24} size={1} color="#cbd5e1" />
 
-                {/* Status Notice on drag/save */}
                 {savedNotice && (
-                  <Panel position="top-right" className="m-3">
+                  <Panel position="top-right" className="m-2 sm:m-3">
                     <div className="flex items-center gap-2 rounded-xl bg-slate-900/90 px-3 py-1.5 text-xs font-medium text-white shadow-lg backdrop-blur-md animate-fadeIn">
                       <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
                       <span>Đã lưu vị trí sơ đồ tự động</span>
@@ -584,18 +761,16 @@ function SystemDiagramInner() {
                   </Panel>
                 )}
 
-                {/* Project diagram title */}
                 <Panel
                   position="top-center"
-                  className="m-3 rounded-xl border border-slate-200/80 bg-white/95 px-5 py-3 text-sm font-semibold text-slate-800 shadow-xs backdrop-blur-sm"
+                  className="m-2 max-w-[calc(100vw-24px)] rounded-xl border border-slate-200/80 bg-white/95 px-3 py-1.5 text-xs font-semibold text-slate-800 shadow-xs backdrop-blur-sm sm:m-3 sm:px-5 sm:py-3 sm:text-sm"
                 >
-                  <p className="flex items-center gap-2 whitespace-nowrap">
-                    <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
-                    Sơ đồ hệ thống {projectName}
+                  <p className="flex items-center gap-2 truncate">
+                    <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500" />
+                    <span className="truncate">Sơ đồ hệ thống {projectName}</span>
                   </p>
                 </Panel>
 
-                {/* Floating Controls */}
                 <CanvasControls
                   onFit={fitAndSaveViewport}
                   onZoomChange={saveCurrentViewport}
@@ -631,11 +806,12 @@ function SystemDiagramInner() {
             </div>
 
             {/* Right Panel: Display Customization */}
-            {settingsOpen && selectedData ? (
+            {settingsOpen && selectedData && selectedMeter ? (
               <NodeSettingsPanel
                 data={selectedData}
                 onClose={() => setSettingsOpen(false)}
                 onChange={updateSelectedDisplay}
+                onRefresh={refreshLive}
               />
             ) : null}
           </div>
@@ -651,22 +827,35 @@ function NodeSettingsPanel({
   data,
   onClose,
   onChange,
+  onRefresh,
 }: {
   data: MeterNodeData;
   onClose: () => void;
-  onChange: (patch: Partial<MeterNodeData>) => void;
+  onChange: (patch: DiagramNodeDisplay & { iconImage?: string }) => void;
+  onRefresh: () => void;
 }) {
+  const selectedKeys = new Set(normalizeMetricKeys(data.metricKeys));
+  const groups = parameterGroups();
+
+  const toggleKey = (key: string) => {
+    const current = normalizeMetricKeys(data.metricKeys);
+    const next = current.includes(key)
+      ? current.filter((item) => item !== key)
+      : [...current, key];
+    onChange({ metricKeys: next.length ? next : [...normalizeMetricKeys(null)] });
+  };
+
   return (
-    <aside className="flex w-[300px] shrink-0 flex-col border-l border-slate-200 bg-white font-sans shadow-lg">
+    <aside className="flex w-[320px] shrink-0 flex-col border-l border-slate-200 bg-white font-sans shadow-lg">
       <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3.5">
         <div>
-          <h2 className="text-xs font-bold text-slate-800 uppercase tracking-wide">Tùy chỉnh Điểm đo</h2>
-          <p className="text-[11px] text-slate-400">Thay đổi icon và tên hiển thị sơ đồ</p>
+          <h2 className="text-xs font-bold uppercase tracking-wide text-slate-800">Tùy chỉnh điểm đo</h2>
+          <p className="text-[11px] text-slate-400">Chọn thông số thực hiển thị trên sơ đồ</p>
         </div>
         <button
           type="button"
           onClick={onClose}
-          className="flex h-7 w-7 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-slate-600 transition-colors"
+          className="flex h-7 w-7 items-center justify-center rounded-lg text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-600"
           aria-label="Đóng cài đặt"
         >
           ×
@@ -674,12 +863,84 @@ function NodeSettingsPanel({
       </div>
 
       <div className="min-h-0 flex-1 space-y-5 overflow-y-auto p-4 text-xs">
+        <div className="flex items-center justify-between gap-2 rounded-xl border border-emerald-100 bg-emerald-50/60 px-3 py-2">
+          <div className="min-w-0">
+            <p className="font-semibold text-emerald-800">Số liệu realtime</p>
+            <p className="truncate text-[11px] text-emerald-700/80">
+              {data.sampleAt ? `Cập nhật ${data.sampleAt}` : "Chưa có bản tin gateway"}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onRefresh}
+            className="shrink-0 rounded-lg bg-white px-2.5 py-1.5 text-[11px] font-semibold text-emerald-700 shadow-xs ring-1 ring-emerald-200 hover:bg-emerald-50"
+          >
+            Làm mới
+          </button>
+        </div>
+
         <SettingsField label="TÊN HIỂN THỊ">
           <input
             value={data.title}
             onChange={(e) => onChange({ title: e.target.value })}
             className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-800 outline-none focus:border-emerald-500 focus:bg-white focus:ring-1 focus:ring-emerald-500"
           />
+        </SettingsField>
+
+        <SettingsField label="GIÁ TRỊ HIỂN THỊ TRÊN THẺ">
+          <p className="mb-2 text-[11px] leading-relaxed text-slate-400">
+            Tick các thông số (dòng điện, điện áp, công suất…). Thẻ sơ đồ sẽ hiện giá trị gateway thực.
+          </p>
+          <div className="mb-2 flex flex-wrap gap-1.5">
+            {normalizeMetricKeys(data.metricKeys).map((key) => (
+              <button
+                key={key}
+                type="button"
+                onClick={() => toggleKey(key)}
+                className="rounded-full bg-emerald-600 px-2 py-0.5 text-[10px] font-semibold text-white"
+                title="Bỏ chọn"
+              >
+                {key} ×
+              </button>
+            ))}
+          </div>
+          <div className="max-h-[280px] space-y-3 overflow-y-auto rounded-xl border border-slate-200 bg-slate-50/80 p-2">
+            {groups.map(([group, params]) => (
+              <div key={group}>
+                <p className="mb-1 px-1 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                  {group}
+                </p>
+                <ul className="space-y-0.5">
+                  {params.map((param) => {
+                    const active = selectedKeys.has(param.key);
+                    return (
+                      <li key={param.key}>
+                        <label
+                          className={`flex cursor-pointer items-start gap-2 rounded-lg px-2 py-1.5 transition-colors ${
+                            active ? "bg-white shadow-xs ring-1 ring-emerald-200" : "hover:bg-white/80"
+                          }`}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={active}
+                            onChange={() => toggleKey(param.key)}
+                            className="mt-0.5 h-3.5 w-3.5 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                          />
+                          <span className="min-w-0">
+                            <span className="block font-medium text-slate-700">{param.name}</span>
+                            <span className="block text-[10px] text-slate-400">
+                              {param.key}
+                              {param.unit ? ` · ${param.unit}` : ""}
+                            </span>
+                          </span>
+                        </label>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
+            ))}
+          </div>
         </SettingsField>
 
         <SettingsField label="BIỂU TƯỢNG HỆ THỐNG">
@@ -694,7 +955,7 @@ function NodeSettingsPanel({
                   onClick={() => onChange({ icon: option.id, iconImage: undefined })}
                   className={`flex flex-col items-center gap-1 rounded-xl border px-1.5 py-2 text-[10px] transition-colors ${
                     active
-                      ? "border-emerald-500 bg-emerald-50/70 text-emerald-700 font-semibold"
+                      ? "border-emerald-500 bg-emerald-50/70 font-semibold text-emerald-700"
                       : "border-slate-200 bg-slate-50 text-slate-600 hover:border-slate-300 hover:bg-white"
                   }`}
                 >
@@ -709,7 +970,7 @@ function NodeSettingsPanel({
         </SettingsField>
 
         <SettingsField label="ẢNH MINH HỌA TÙY CHỈNH">
-          <label className="flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-slate-200 bg-slate-50 px-4 py-5 text-center hover:border-emerald-500 hover:bg-emerald-50/30 transition-colors">
+          <label className="flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-slate-200 bg-slate-50 px-4 py-5 text-center transition-colors hover:border-emerald-500 hover:bg-emerald-50/30">
             {data.iconImage ? (
               <img
                 src={data.iconImage}

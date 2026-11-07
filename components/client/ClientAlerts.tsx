@@ -2,24 +2,49 @@
 
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import { CustomSelect } from "@/components/ui/CustomSelect";
 import type { Project } from "@/lib/projects";
 import {
   alertCategory,
-  alertStatus,
   hydrateAlertEvents,
   loadAlertEvents,
-  updateAlertEvent,
   type AlertEvent,
 } from "@/lib/alert-events";
-import { formatStoredVietnam } from "@/lib/vietnam-time";
+import {
+  DEFAULT_NOTIFICATION_CHANNELS,
+  normalizeAlertConfig,
+  resolveConfiguredSeverity,
+  type AlertConfig,
+  type NotificationChannelsConfig,
+} from "@/lib/alert-config";
+import { hydrateClientMeters, loadClientMeters } from "@/lib/client-meters";
+import { exportToExcel } from "@/lib/excel-export";
+import { loadProjectGatewayLatest } from "@/lib/gateway-series";
+import { METER_PARAMETERS, readMeterValue } from "@/lib/meter-parameters";
+import { hydrateProjectSettings } from "@/lib/project-settings";
+import { formatStoredVietnam, vietnamFromStored, vietnamNow } from "@/lib/vietnam-time";
 
 export type AlertSeverity = "critical" | "warning" | "info";
-export type AlertStatus = "active" | "acknowledged" | "resolved";
-export type AlertCategory = "frequency" | "voltage" | "current" | "unbalance" | "harmonics" | "connectivity" | "power";
+export type AlertCategory =
+  | "frequency"
+  | "voltage"
+  | "current"
+  | "unbalance"
+  | "harmonics"
+  | "connectivity"
+  | "power";
+
+export type DeliveryChannelStatus = {
+  channel: "Zalo" | "Telegram" | "Email";
+  recipient: string;
+  delivered: boolean;
+};
 
 export interface AlertItem {
   id: string;
   code: string;
+  rawOccurredAt: string;
+  monthKey: string;
   timestamp: string;
   pointCode: string;
   pointName: string;
@@ -31,62 +56,211 @@ export interface AlertItem {
   unit: string;
   severity: AlertSeverity;
   category: AlertCategory;
-  status: AlertStatus;
   message: string;
-  acknowledgedBy?: string;
-  acknowledgedAt?: string;
-  notes?: string;
+  deliveries: DeliveryChannelStatus[];
 }
 
-function dbAlertToItem(event: AlertEvent): AlertItem {
+function buildDeliveryStatuses(
+  notifications: NotificationChannelsConfig,
+  note?: string,
+): DeliveryChannelStatus[] {
+  const failedInNote = note ? /fail|lỗi|thất bại/i.test(note) : false;
+  const list: DeliveryChannelStatus[] = [];
+  if (notifications.zaloEnabled) {
+    list.push({
+      channel: "Zalo",
+      recipient: notifications.zaloRecipient || "Zalo OA",
+      delivered: !failedInNote,
+    });
+  }
+  if (notifications.telegramEnabled) {
+    list.push({
+      channel: "Telegram",
+      recipient: notifications.telegramChatId || "@ems_alert_bot",
+      delivered: !failedInNote,
+    });
+  }
+  if (notifications.emailEnabled && notifications.emailRecipient.trim()) {
+    list.push({
+      channel: "Email",
+      recipient: notifications.emailRecipient.trim(),
+      delivered: !failedInNote,
+    });
+  }
+  return list;
+}
+
+function extractMonthKey(rawAt: string): string {
+  const vn = vietnamFromStored(rawAt);
+  if (vn) return vn.monthKey;
+  const match = rawAt.match(/^(\d{4}-\d{2})/);
+  if (match) return match[1];
+  return vietnamNow().monthKey;
+}
+
+function dbAlertToItem(event: AlertEvent, config: AlertConfig): AlertItem {
+  const paramMeta = METER_PARAMETERS.find((p) => p.key === event.parameter);
   const parameterNames: Record<string, string> = {
     F_avg: "Tần số trung bình",
     U_unb: "Độ mất cân bằng điện áp",
     I_rms: "Dòng điện hiệu dụng",
     P_sum: "Công suất hữu công",
   };
+  const category = alertCategory(event.parameter, event.category) as AlertCategory;
+  const storedSeverity: AlertSeverity =
+    event.severity === "critical" || event.severity === "info" ? event.severity : "warning";
+  const unit = event.unit || paramMeta?.unit || "";
+
+  // Tìm ngưỡng từ cấu hình người dùng nếu bản ghi chưa có thresholdValue
+  const matchedRule = Object.values(config.rulesByGroup ?? {})
+    .flat()
+    .find((r) => r.parameterKey === event.parameter);
+  const thresholdDisplay =
+    event.thresholdValue != null
+      ? String(event.thresholdValue)
+      : matchedRule
+        ? [
+            matchedRule.minValue ? `Min ${matchedRule.minValue}` : "",
+            matchedRule.maxValue ? `Max ${matchedRule.maxValue}` : "",
+          ]
+            .filter(Boolean)
+            .join(" · ") || "--"
+        : "--";
+
   return {
     id: event.id,
     code: event.parameter,
+    rawOccurredAt: event.occurredAt,
+    monthKey: extractMonthKey(event.occurredAt),
     timestamp: formatStoredVietnam(event.occurredAt) ?? event.occurredAt,
     pointCode: event.pointCode ?? event.meterPointId ?? "--",
-    pointName: event.pointName ?? "Điểm đo chưa gán",
-    location: event.utility ?? "EMS",
+    pointName: event.pointName ?? "Điểm đo dự án",
+    location: event.utility ?? "Điện",
     parameter: event.parameter,
-    paramName: parameterNames[event.parameter] ?? event.parameter,
+    paramName: paramMeta?.name ?? parameterNames[event.parameter] ?? event.parameter,
     actualValue: String(event.value),
-    thresholdValue: event.thresholdValue == null ? "--" : String(event.thresholdValue),
-    unit: event.unit ?? "",
-    severity: event.severity === "critical" || event.severity === "info" ? event.severity : "warning",
-    category: alertCategory(event.parameter, event.category) as AlertCategory,
-    status: alertStatus(event.status),
-    message: event.message ?? `Sự kiện ${event.parameter} tại ${event.pointName ?? "điểm đo"}`,
-    acknowledgedBy: event.acknowledgedBy,
-    acknowledgedAt: formatStoredVietnam(event.acknowledgedAt) ?? event.acknowledgedAt,
-    notes: event.note,
+    thresholdValue: thresholdDisplay,
+    unit,
+    severity: resolveConfiguredSeverity(category, storedSeverity, config, event.parameter),
+    category,
+    message:
+      event.message ??
+      `${paramMeta?.name ?? event.parameter}: giá trị đo ${event.value}${unit ? ` ${unit}` : ""}`,
+    deliveries: buildDeliveryStatuses(config.notifications ?? DEFAULT_NOTIFICATION_CHANNELS, event.note),
   };
 }
 
 export function ClientAlerts({ project }: { project: Project }) {
   const [alerts, setAlerts] = useState<AlertItem[]>([]);
+  const [notificationsConfig, setNotificationsConfig] = useState<NotificationChannelsConfig>(
+    DEFAULT_NOTIFICATION_CHANNELS,
+  );
   const [search, setSearch] = useState("");
+  const [selectedMonth, setSelectedMonth] = useState<string>(() => vietnamNow().monthKey);
+  const [monthAligned, setMonthAligned] = useState(false);
   const [selectedSeverity, setSelectedSeverity] = useState<string>("all");
-  const [selectedStatus, setSelectedStatus] = useState<string>("all");
   const [selectedCategory, setSelectedCategory] = useState<string>("all");
   const [selectedPoint, setSelectedPoint] = useState<string>("all");
-  const [timeRange, setTimeRange] = useState<string>("24h");
-  const [selectedAlertIds, setSelectedAlertIds] = useState<string[]>([]);
+  const [selectedDelivery, setSelectedDelivery] = useState<string>("all");
   const [liveMode, setLiveMode] = useState(true);
-  const [inspectAlert, setInspectAlert] = useState<AlertItem | null>(null);
-  const [inspectNote, setInspectNote] = useState("");
+  const [reloadTick, setReloadTick] = useState(0);
+
+  useEffect(() => {
+    if (!liveMode) return;
+    const timer = window.setInterval(() => {
+      setReloadTick((v) => v + 1);
+    }, 8000);
+    return () => window.clearInterval(timer);
+  }, [liveMode]);
 
   useEffect(() => {
     let active = true;
-    void hydrateAlertEvents(project.id)
-      .then((events) => {
+    void Promise.all([
+      hydrateAlertEvents(project.id),
+      hydrateProjectSettings(project.id, { force: true }).catch(() => ({})),
+      loadProjectGatewayLatest(project.id).catch(() => []),
+      hydrateClientMeters(project.id).catch(() => loadClientMeters(project.id)),
+    ])
+      .then(([events, settings, latestList, meterList]) => {
         if (!active) return;
-        const rows = events.length ? events.map(dbAlertToItem) : loadAlertEvents(project.id).map(dbAlertToItem);
-        setAlerts(rows);
+        const userConfig = normalizeAlertConfig(
+          (settings as Record<string, unknown>).alertsConfig,
+        );
+        setNotificationsConfig(userConfig.notifications);
+        const source = events.length ? events : loadAlertEvents(project.id);
+        const dbItems = source.map((event) => dbAlertToItem(event, userConfig));
+
+        // Đối chiếu trực tiếp các quy tắc ngưỡng đã bật ở phần Cấu hình với mẫu đo mới nhất từ Gateway
+        const liveItems: AlertItem[] = [];
+        const allRules = Object.values(userConfig.rulesByGroup ?? {}).flat();
+        for (const sample of latestList) {
+          const meterPointId = sample.meterPointId;
+          const meter = meterList.find((m) => m.id === meterPointId);
+          for (const rule of allRules) {
+            if (!rule.enabled || !rule.parameterKey) continue;
+            if (rule.meterPointId && rule.meterPointId !== meterPointId) continue;
+            const actual = readMeterValue(sample.values, rule.parameterKey);
+            if (actual === null) continue;
+            const minNum = rule.minValue.trim() !== "" ? Number(rule.minValue) : null;
+            const maxNum = rule.maxValue.trim() !== "" ? Number(rule.maxValue) : null;
+            const belowMin = minNum !== null && Number.isFinite(minNum) && actual < minNum;
+            const aboveMax = maxNum !== null && Number.isFinite(maxNum) && actual > maxNum;
+            if (!belowMin && !aboveMax) continue;
+
+            const duplicate = dbItems.some(
+              (item) =>
+                item.parameter === rule.parameterKey &&
+                (item.pointCode === (meter?.code ?? meterPointId) || item.pointName === meter?.name),
+            );
+            if (duplicate) continue;
+
+            const paramMeta = METER_PARAMETERS.find((p) => p.key === rule.parameterKey);
+            const cat = alertCategory(
+              rule.parameterKey,
+              rule.groupId === "imbalance"
+                ? "unbalance"
+                : rule.groupId === "harmonics"
+                  ? "harmonics"
+                  : undefined,
+            ) as AlertCategory;
+            const thresholdStr =
+              belowMin && aboveMax
+                ? `${minNum} – ${maxNum}`
+                : belowMin
+                  ? `< ${minNum}`
+                  : `> ${maxNum}`;
+            const unit = rule.unit || paramMeta?.unit || "";
+
+            liveItems.push({
+              id: `ALM-${meterPointId}-${rule.id}`,
+              code: rule.parameterKey,
+              rawOccurredAt: sample.at,
+              monthKey: extractMonthKey(sample.at),
+              timestamp: formatStoredVietnam(sample.at) ?? sample.at,
+              pointCode: meter?.code ?? meterPointId,
+              pointName: meter?.name ?? "Điểm đo Gateway",
+              location: meter?.utility ?? "Điện",
+              parameter: rule.parameterKey,
+              paramName: paramMeta?.name ?? rule.name,
+              actualValue: String(actual),
+              thresholdValue: thresholdStr,
+              unit,
+              severity: rule.severity,
+              category: cat,
+              message: `${rule.name}: giá trị đo ${actual}${unit ? ` ${unit}` : ""} vượt ngưỡng cài đặt (${thresholdStr}${unit ? ` ${unit}` : ""})`,
+              deliveries: buildDeliveryStatuses(userConfig.notifications),
+            });
+          }
+        }
+
+        const merged = [...liveItems, ...dbItems];
+        setAlerts(merged);
+        if (!monthAligned && merged.length > 0) {
+          const months = Array.from(new Set(merged.map((a) => a.monthKey))).sort();
+          const latestMonth = months[months.length - 1];
+          if (latestMonth) setSelectedMonth(latestMonth);
+          setMonthAligned(true);
+        }
       })
       .catch(() => {
         if (active) setAlerts([]);
@@ -94,7 +268,26 @@ export function ClientAlerts({ project }: { project: Project }) {
     return () => {
       active = false;
     };
-  }, [project.id]);
+  }, [project.id, reloadTick, monthAligned]);
+
+  // Danh sách các tháng có dữ liệu + 6 tháng gần nhất
+  const availableMonths = useMemo(() => {
+    const now = vietnamNow();
+    const set = new Set<string>();
+    for (let offset = 0; offset < 6; offset += 1) {
+      let y = now.year;
+      let m = now.month - offset;
+      while (m <= 0) {
+        m += 12;
+        y -= 1;
+      }
+      set.add(`${y}-${String(m).padStart(2, "0")}`);
+    }
+    for (const a of alerts) {
+      if (a.monthKey) set.add(a.monthKey);
+    }
+    return Array.from(set).sort().reverse();
+  }, [alerts]);
 
   // Điểm đo unique
   const points = useMemo(() => {
@@ -103,13 +296,37 @@ export function ClientAlerts({ project }: { project: Project }) {
     return Array.from(map.entries()).map(([code, name]) => ({ code, name }));
   }, [alerts]);
 
-  // Bộ lọc
+  // Cảnh báo thuộc tháng đang chọn (dùng cho thống kê KPI trong tháng)
+  const monthlyAlerts = useMemo(() => {
+    if (selectedMonth === "all") return alerts;
+    return alerts.filter((item) => item.monthKey === selectedMonth);
+  }, [alerts, selectedMonth]);
+
+  // Thống kê số lượng cảnh báo trong tháng chia theo mức độ đã cấu hình
+  const stats = useMemo(() => {
+    const total = monthlyAlerts.length;
+    const critical = monthlyAlerts.filter((a) => a.severity === "critical").length;
+    const warning = monthlyAlerts.filter((a) => a.severity === "warning").length;
+    const info = monthlyAlerts.filter((a) => a.severity === "info").length;
+    const sentSuccess = monthlyAlerts.filter(
+      (a) => a.deliveries.length > 0 && a.deliveries.every((d) => d.delivered),
+    ).length;
+    return { total, critical, warning, info, sentSuccess };
+  }, [monthlyAlerts]);
+
+  // Bộ lọc chi tiết trên bảng
   const filteredAlerts = useMemo(() => {
-    return alerts.filter((item) => {
+    return monthlyAlerts.filter((item) => {
       if (selectedSeverity !== "all" && item.severity !== selectedSeverity) return false;
-      if (selectedStatus !== "all" && item.status !== selectedStatus) return false;
       if (selectedCategory !== "all" && item.category !== selectedCategory) return false;
       if (selectedPoint !== "all" && item.pointCode !== selectedPoint) return false;
+      if (selectedDelivery === "sent") {
+        if (item.deliveries.length === 0 || !item.deliveries.every((d) => d.delivered)) return false;
+      } else if (selectedDelivery === "failed") {
+        if (item.deliveries.length === 0 || item.deliveries.every((d) => d.delivered)) return false;
+      } else if (selectedDelivery === "unconfigured") {
+        if (item.deliveries.length > 0) return false;
+      }
       if (search.trim()) {
         const q = search.toLowerCase();
         const match =
@@ -117,334 +334,250 @@ export function ClientAlerts({ project }: { project: Project }) {
           item.pointName.toLowerCase().includes(q) ||
           item.pointCode.toLowerCase().includes(q) ||
           item.parameter.toLowerCase().includes(q) ||
+          item.paramName.toLowerCase().includes(q) ||
           item.message.toLowerCase().includes(q);
         if (!match) return false;
       }
       return true;
     });
-  }, [alerts, selectedSeverity, selectedStatus, selectedCategory, selectedPoint, search]);
+  }, [monthlyAlerts, selectedSeverity, selectedCategory, selectedPoint, selectedDelivery, search]);
 
-  // KPIs
-  const stats = useMemo(() => {
-    const total = alerts.length;
-    const critical = alerts.filter((a) => a.severity === "critical" && a.status !== "resolved").length;
-    const warning = alerts.filter((a) => a.severity === "warning" && a.status !== "resolved").length;
-    const active = alerts.filter((a) => a.status === "active").length;
-    const resolved = alerts.filter((a) => a.status === "resolved").length;
-    return { total, critical, warning, active, resolved };
-  }, [alerts]);
+  const monthLabel =
+    selectedMonth === "all"
+      ? "Tất cả các tháng"
+      : `Tháng ${selectedMonth.slice(5, 7)}/${selectedMonth.slice(0, 4)}`;
 
-  // Toggle chọn 1 alert
-  const toggleSelectOne = (id: string) => {
-    setSelectedAlertIds((prev) =>
-      prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]
-    );
-  };
-
-  // Toggle chọn tất cả
-  const toggleSelectAll = () => {
-    if (selectedAlertIds.length === filteredAlerts.length) {
-      setSelectedAlertIds([]);
-    } else {
-      setSelectedAlertIds(filteredAlerts.map((a) => a.id));
-    }
-  };
-
-  // Xác nhận hàng loạt
-  const batchAcknowledge = () => {
-    if (selectedAlertIds.length === 0) return;
-    const acknowledgedAt = new Date().toISOString().replace("T", " ").substring(0, 19);
-    setAlerts((prev) =>
-      prev.map((item) => {
-        if (selectedAlertIds.includes(item.id) && item.status === "active") {
-          void updateAlertEvent(project.id, item.id, {
-            status: "acknowledged",
-            acknowledgedBy: "Người vận hành",
-            acknowledgedAt,
-          }).catch(() => undefined);
-          return {
-            ...item,
-            status: "acknowledged",
-            acknowledgedBy: "Người vận hành",
-            acknowledgedAt,
-          };
-        }
-        return item;
-      })
-    );
-    setSelectedAlertIds([]);
-  };
-
-  // Đóng / giải quyết hàng loạt
-  const batchResolve = () => {
-    if (selectedAlertIds.length === 0) return;
-    const acknowledgedAt = new Date().toISOString().replace("T", " ").substring(0, 19);
-    setAlerts((prev) =>
-      prev.map((item) => {
-        if (selectedAlertIds.includes(item.id)) {
-          void updateAlertEvent(project.id, item.id, {
-            status: "resolved",
-            acknowledgedBy: item.acknowledgedBy || "Người vận hành",
-            acknowledgedAt: item.acknowledgedAt || acknowledgedAt,
-          }).catch(() => undefined);
-          return {
-            ...item,
-            status: "resolved",
-            acknowledgedBy: item.acknowledgedBy || "Người vận hành",
-            acknowledgedAt: item.acknowledgedAt || acknowledgedAt,
-          };
-        }
-        return item;
-      })
-    );
-    setSelectedAlertIds([]);
-  };
-
-  // Lưu ghi chú chi tiết
-  const saveInspectNote = () => {
-    if (!inspectAlert) return;
-    const acknowledgedAt = inspectAlert.acknowledgedAt || new Date().toISOString().replace("T", " ").substring(0, 19);
-    const nextStatus = inspectAlert.status === "active" ? "acknowledged" : inspectAlert.status;
-    void updateAlertEvent(project.id, inspectAlert.id, {
-      status: nextStatus,
-      note: inspectNote,
-      acknowledgedBy: inspectAlert.acknowledgedBy || "Kỹ sư ca trực",
-      acknowledgedAt,
-    }).catch(() => undefined);
-    setAlerts((prev) =>
-      prev.map((a) =>
-        a.id === inspectAlert.id
-          ? {
-              ...a,
-              notes: inspectNote,
-              status: a.status === "active" ? "acknowledged" : a.status,
-              acknowledgedBy: a.acknowledgedBy || "Kỹ sư ca trực",
-              acknowledgedAt: a.acknowledgedAt || acknowledgedAt,
-            }
-          : a
-      )
-    );
-    setInspectAlert(null);
-  };
-
-  // Xuất file CSV nhật ký cảnh báo
-  const exportCsv = () => {
-    const headers = [
-      "Mã cảnh báo",
-      "Thời gian",
-      "Mã điểm đo",
-      "Tên điểm đo",
-      "Tham số",
-      "Giá trị",
-      "Ngưỡng",
-      "Đơn vị",
-      "Mức độ",
-      "Trạng thái",
-      "Nội dung",
-      "Người xác nhận",
-      "Ghi chú",
-    ];
-    const rows = filteredAlerts.map((a) => [
-      a.id,
-      a.timestamp,
-      a.pointCode,
-      `"${a.pointName}"`,
-      a.parameter,
-      a.actualValue,
-      a.thresholdValue,
-      a.unit,
-      a.severity === "critical" ? "Nghiêm trọng" : a.severity === "warning" ? "Cảnh báo" : "Thông tin",
-      a.status === "active" ? "Đang xảy ra" : a.status === "acknowledged" ? "Đã xác nhận" : "Đã xử lý",
-      `"${a.message}"`,
-      `"${a.acknowledgedBy || ""}"`,
-      `"${a.notes || ""}"`,
-    ]);
-    const csvContent = "data:text/csv;charset=utf-8,\uFEFF" + [headers.join(","), ...rows.map((e) => e.join(","))].join("\n");
-    const encodedUri = encodeURI(csvContent);
-    const link = document.createElement("a");
-    link.setAttribute("href", encodedUri);
-    link.setAttribute("download", `nhat-ky-canh-bao-${project.id}-${new Date().toISOString().slice(0, 10)}.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+  // Xuất file Excel (.xlsx) nhật ký cảnh báo trong tháng
+  const handleExportExcel = () => {
+    exportToExcel({
+      filename: `canh-bao-${project.id}-${selectedMonth}`,
+      sheetName: `Cảnh báo ${monthLabel}`,
+      title: `Nhật ký cảnh báo dự án ${project.name} — ${monthLabel}`,
+      subtitle: `Tổng số: ${filteredAlerts.length} cảnh báo (Nghiêm trọng: ${stats.critical}, Cảnh báo: ${stats.warning}, Thông tin: ${stats.info})`,
+      columns: [
+        { header: "Thời điểm xảy ra", width: 22 },
+        { header: "Mức độ", width: 16 },
+        { header: "Mã điểm đo", width: 18 },
+        { header: "Tên điểm đo", width: 24 },
+        { header: "Thông số", width: 22 },
+        { header: "Giá trị thực tế", width: 16 },
+        { header: "Ngưỡng cài đặt", width: 18 },
+        { header: "Đơn vị", width: 10 },
+        { header: "Trạng thái gửi (Zalo / Telegram)", width: 32 },
+        { header: "Nội dung cảnh báo", width: 42 },
+      ],
+      rows: filteredAlerts.map((a) => {
+        const deliverySummary =
+          a.deliveries.length === 0
+            ? "Chưa cấu hình kênh nhận"
+            : a.deliveries
+                .map((d) => `${d.channel}: ${d.delivered ? "Đã gửi thành công" : "Gửi thất bại"}`)
+                .join(" | ");
+        return [
+          a.timestamp,
+          a.severity === "critical" ? "Nghiêm trọng" : a.severity === "warning" ? "Cảnh báo" : "Thông tin",
+          a.pointCode,
+          a.pointName,
+          `${a.parameter} (${a.paramName})`,
+          a.actualValue,
+          a.thresholdValue,
+          a.unit,
+          deliverySummary,
+          a.message,
+        ];
+      }),
+    });
   };
 
   return (
-    <div className="flex h-full min-h-0 flex-1 flex-col overflow-hidden bg-[#f8fafc]">
+    <div className="flex h-full min-h-0 flex-1 flex-col overflow-y-auto md:overflow-hidden bg-[#f8fafc]">
       {/* Top Banner Header */}
-      <div className="shrink-0 border-b border-slate-200/80 bg-white px-5 py-4 lg:px-8">
-        <div className="flex flex-wrap items-center justify-between gap-4">
-          <div>
-            <div className="flex items-center gap-2.5">
-              <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-amber-500/10 text-amber-600">
-                <AlertBellIcon className="h-5 w-5" />
-              </span>
-              <div>
-                <h1 className="text-xl font-bold tracking-tight text-slate-900">
-                  Trung Tâm Giám Sát & Xử Lý Cảnh Báo
-                </h1>
-                <p className="text-xs text-slate-500 mt-0.5">
-                  Theo dõi sự cố, ngưỡng cảnh báo điện năng & an toàn phụ tải dự án {project.name}
-                </p>
-              </div>
+      <div className="shrink-0 border-b border-slate-200/80 bg-white px-3.5 py-3.5 sm:px-5 sm:py-4 lg:px-8">
+        <div className="flex flex-wrap items-center justify-between gap-3 sm:gap-4">
+          <div className="flex items-center gap-2.5">
+            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-amber-500/10 text-amber-600">
+              <AlertBellIcon className="h-5 w-5" />
+            </span>
+            <div>
+              <h1 className="text-base sm:text-xl font-bold tracking-tight text-slate-900">
+                Nhật Ký Cảnh Báo Hệ Thống · {monthLabel}
+              </h1>
+              <p className="mt-0.5 text-xs text-slate-500">
+                Thống kê thời điểm phát sinh cảnh báo trong tháng, phân loại mức độ theo cấu hình và trạng thái gửi thông báo qua Zalo / Telegram
+              </p>
             </div>
           </div>
 
-          <div className="flex flex-wrap items-center gap-2.5">
+          <div className="flex flex-wrap items-center gap-2">
             {/* Live Mode Toggle */}
             <button
               type="button"
               onClick={() => setLiveMode(!liveMode)}
-              className={`inline-flex h-9 items-center gap-2 rounded-xl border px-3 text-xs font-semibold transition-all ${
+              className={`inline-flex h-8 sm:h-9 items-center gap-2 rounded-xl border px-2.5 sm:px-3 text-xs font-semibold transition-all ${
                 liveMode
                   ? "border-emerald-200 bg-emerald-50/80 text-emerald-800 shadow-xs"
                   : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
               }`}
             >
-              <span className={`h-2 w-2 rounded-full ${liveMode ? "bg-emerald-500 animate-pulse" : "bg-slate-400"}`} />
-              {liveMode ? "Trực tiếp (Live 5s)" : "Tạm dừng đồng bộ"}
+              <span
+                className={`h-2 w-2 rounded-full ${
+                  liveMode ? "bg-emerald-500 animate-pulse" : "bg-slate-400"
+                }`}
+              />
+              {liveMode ? "Tự động cập nhật" : "Tạm dừng cập nhật"}
             </button>
 
-            {/* Nút Cấu hình ngưỡng */}
+            {/* Nút Cấu hình mức độ & ngưỡng */}
             <Link
-              href={`/du-an/${project.id}/cau-hinh`}
-              className="inline-flex h-9 items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3.5 text-xs font-semibold text-slate-700 shadow-xs hover:bg-slate-50 transition-colors"
+              href={`/du-an/${project.id}/cau-hinh?tab=alerts`}
+              className="inline-flex h-8 sm:h-9 items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-2.5 sm:px-3.5 text-xs font-semibold text-slate-700 shadow-xs transition-colors hover:bg-slate-50"
             >
               <GearIcon className="h-3.5 w-3.5 text-slate-500" />
-              Cấu hình ngưỡng
+              Cấu hình mức độ & kênh gửi
             </Link>
 
-            {/* Nút Xuất CSV */}
+            {/* Nút Xuất Excel */}
             <button
               type="button"
-              onClick={exportCsv}
-              className="inline-flex h-9 items-center gap-1.5 rounded-xl bg-emerald-600 px-4 text-xs font-semibold text-white shadow-xs hover:bg-emerald-700 transition-colors"
+              onClick={handleExportExcel}
+              className="inline-flex h-8 sm:h-9 items-center gap-1.5 rounded-xl bg-emerald-600 px-3 sm:px-4 text-xs font-semibold text-white shadow-xs transition-colors hover:bg-emerald-700"
             >
               <DownloadIcon className="h-3.5 w-3.5" />
-              Xuất nhật ký CSV
+              Xuất Excel (.xlsx)
             </button>
           </div>
         </div>
 
-        {/* KPI Cards */}
-        <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-5">
+        {/* Thống kê số lượng cảnh báo trong tháng theo mức độ cấu hình & trạng thái gửi Zalo/Tele */}
+        <div className="mt-3 sm:mt-4 grid grid-cols-2 gap-2.5 sm:gap-3 sm:grid-cols-5">
           <div className="rounded-xl border border-slate-200/80 bg-slate-50/60 p-3">
-            <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider">Tổng sự kiện</span>
+            <span className="text-[11px] font-semibold tracking-wider text-slate-500 uppercase">
+              Tổng cảnh báo ({monthLabel})
+            </span>
             <div className="mt-1 flex items-baseline gap-2">
               <span className="text-2xl font-bold text-slate-900">{stats.total}</span>
-              <span className="text-[11px] text-slate-400">bản ghi</span>
+              <span className="text-[11px] text-slate-400">lần phát sinh</span>
             </div>
           </div>
 
           <div className="rounded-xl border border-rose-200/80 bg-rose-50/50 p-3">
-            <span className="text-[11px] font-semibold text-rose-700 uppercase tracking-wider flex items-center gap-1">
-              <span className="h-1.5 w-1.5 rounded-full bg-rose-500 animate-ping" />
-              Nghiêm trọng (Active)
+            <span className="flex items-center gap-1.5 text-[11px] font-semibold tracking-wider text-rose-700 uppercase">
+              <span className="h-2 w-2 rounded-full bg-rose-500" />
+              Mức độ Nghiêm trọng
             </span>
             <div className="mt-1 flex items-baseline gap-2">
               <span className="text-2xl font-bold text-rose-600">{stats.critical}</span>
-              <span className="text-[11px] text-rose-500">cần can thiệp</span>
+              <span className="text-[11px] text-rose-500">theo cấu hình</span>
             </div>
           </div>
 
           <div className="rounded-xl border border-amber-200/80 bg-amber-50/50 p-3">
-            <span className="text-[11px] font-semibold text-amber-700 uppercase tracking-wider">
-              Cảnh báo (Chưa xử lý)
+            <span className="flex items-center gap-1.5 text-[11px] font-semibold tracking-wider text-amber-700 uppercase">
+              <span className="h-2 w-2 rounded-full bg-amber-500" />
+              Mức độ Cảnh báo
             </span>
             <div className="mt-1 flex items-baseline gap-2">
               <span className="text-2xl font-bold text-amber-600">{stats.warning}</span>
-              <span className="text-[11px] text-amber-500">vượt ngưỡng</span>
+              <span className="text-[11px] text-amber-600">theo cấu hình</span>
             </div>
           </div>
 
-          <div className="rounded-xl border border-blue-200/80 bg-blue-50/40 p-3">
-            <span className="text-[11px] font-semibold text-slate-600 uppercase tracking-wider">Đang chờ xử lý</span>
+          <div className="rounded-xl border border-slate-200/80 bg-slate-50/80 p-3">
+            <span className="flex items-center gap-1.5 text-[11px] font-semibold tracking-wider text-slate-600 uppercase">
+              <span className="h-2 w-2 rounded-full bg-slate-400" />
+              Mức độ Thông tin
+            </span>
             <div className="mt-1 flex items-baseline gap-2">
-              <span className="text-2xl font-bold text-slate-800">{stats.active}</span>
-              <span className="text-[11px] text-slate-500">chưa xác nhận</span>
+              <span className="text-2xl font-bold text-slate-800">{stats.info}</span>
+              <span className="text-[11px] text-slate-500">theo cấu hình</span>
             </div>
           </div>
 
-          <div className="col-span-2 sm:col-span-1 rounded-xl border border-emerald-200/80 bg-emerald-50/50 p-3">
-            <span className="text-[11px] font-semibold text-emerald-700 uppercase tracking-wider">Đã hoàn tất xử lý</span>
+          <div className="col-span-2 rounded-xl border border-emerald-200/80 bg-emerald-50/50 p-3 sm:col-span-1">
+            <span className="text-[11px] font-semibold tracking-wider text-emerald-700 uppercase">
+              Đã gửi Zalo / Telegram
+            </span>
             <div className="mt-1 flex items-baseline gap-2">
-              <span className="text-2xl font-bold text-emerald-600">{stats.resolved}</span>
-              <span className="text-[11px] text-emerald-600 font-medium">bình thường</span>
+              <span className="text-2xl font-bold text-emerald-600">
+                {stats.sentSuccess}/{stats.total}
+              </span>
+              <span className="text-[11px] font-medium text-emerald-700">thành công</span>
             </div>
           </div>
         </div>
       </div>
 
       {/* Filter Toolbar */}
-      <div className="shrink-0 border-b border-slate-200 bg-white px-5 py-3 lg:px-8">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          {/* Ô tìm kiếm & các dropdown lọc */}
-          <div className="flex flex-wrap items-center gap-2 flex-1 min-w-[280px]">
-            {/* Search Input */}
-            <div className="relative min-w-[220px] max-w-[320px] flex-1">
+      <div className="shrink-0 border-b border-slate-200 bg-white px-3.5 py-2.5 sm:px-5 sm:py-3 lg:px-8">
+        <div className="flex flex-wrap items-center justify-between gap-2.5 sm:gap-3">
+          <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+            {/* Chọn Tháng */}
+            <CustomSelect
+              value={selectedMonth}
+              onChange={(e) => setSelectedMonth(e.target.value)}
+              className="h-9 rounded-xl border border-slate-200 bg-white px-2.5 text-xs font-semibold text-slate-800 outline-none focus:border-emerald-500"
+            >
+              <option value="all">Tất cả các tháng</option>
+              {availableMonths.map((m) => (
+                <option key={m} value={m}>
+                  Tháng {m.slice(5, 7)}/{m.slice(0, 4)}
+                </option>
+              ))}
+            </CustomSelect>
+
+            {/* Ô tìm kiếm */}
+            <div className="relative min-w-[180px] max-w-[300px] flex-1">
               <input
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
-                placeholder="Tìm mã lỗi, điểm đo, thông số..."
-                className="h-9 w-full rounded-xl border border-slate-200 bg-slate-50/70 pl-8 pr-3 text-xs text-slate-800 outline-none placeholder:text-slate-400 focus:border-emerald-500 focus:bg-white focus:ring-1 focus:ring-emerald-500 transition-all"
+                placeholder="Tìm điểm đo, thông số, nội dung..."
+                className="h-9 w-full rounded-xl border border-slate-200 bg-slate-50/70 pr-3 pl-8 text-xs text-slate-800 transition-all outline-none placeholder:text-slate-400 focus:border-emerald-500 focus:bg-white focus:ring-1 focus:ring-emerald-500"
               />
-              <SearchIcon className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-slate-400" />
-              {search && (
+              <SearchIcon className="pointer-events-none absolute top-1/2 left-2.5 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
+              {search ? (
                 <button
                   type="button"
                   onClick={() => setSearch("")}
-                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 text-xs"
+                  className="absolute top-1/2 right-2.5 -translate-y-1/2 text-xs text-slate-400 hover:text-slate-600"
                 >
                   ×
                 </button>
-              )}
+              ) : null}
             </div>
 
-            {/* Mức độ */}
-            <select
+            {/* Lọc theo Mức độ */}
+            <CustomSelect
               value={selectedSeverity}
               onChange={(e) => setSelectedSeverity(e.target.value)}
-              className="h-9 rounded-xl border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500"
+              className="h-9 rounded-xl border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 outline-none focus:border-emerald-500"
             >
               <option value="all">Tất cả mức độ</option>
-              <option value="critical">🔴 Nghiêm trọng</option>
-              <option value="warning">🟠 Cảnh báo</option>
-              <option value="info">🔵 Thông tin</option>
-            </select>
+              <option value="critical">Nghiêm trọng</option>
+              <option value="warning">Cảnh báo</option>
+              <option value="info">Thông tin</option>
+            </CustomSelect>
 
-            {/* Trạng thái */}
-            <select
-              value={selectedStatus}
-              onChange={(e) => setSelectedStatus(e.target.value)}
-              className="h-9 rounded-xl border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500"
-            >
-              <option value="all">Tất cả trạng thái</option>
-              <option value="active">Chưa xử lý</option>
-              <option value="acknowledged">Đã xác nhận</option>
-              <option value="resolved">Đã khắc phục</option>
-            </select>
-
-            {/* Nhóm lỗi */}
-            <select
+            {/* Lọc theo Nhóm thông số */}
+            <CustomSelect
               value={selectedCategory}
               onChange={(e) => setSelectedCategory(e.target.value)}
-              className="h-9 rounded-xl border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500"
+              className="h-9 rounded-xl border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 outline-none focus:border-emerald-500"
             >
-              <option value="all">Tất cả danh mục lỗi</option>
-              <option value="frequency">Tần số (Frequency)</option>
-              <option value="voltage">Điện áp & Sụt áp</option>
-              <option value="current">Quá dòng (Overcurrent)</option>
-              <option value="unbalance">Lệch pha (Unbalance)</option>
-              <option value="harmonics">Sóng hài (THD)</option>
-              <option value="power">Công suất giờ cao điểm</option>
-              <option value="connectivity">Mất kết nối RTU/Gateway</option>
-            </select>
+              <option value="all">Tất cả nhóm thông số</option>
+              <option value="frequency">Tần số</option>
+              <option value="voltage">Điện áp</option>
+              <option value="current">Dòng điện</option>
+              <option value="unbalance">Mất cân bằng pha</option>
+              <option value="harmonics">Sóng hài</option>
+              <option value="power">Công suất</option>
+              <option value="connectivity">Kết nối Gateway</option>
+            </CustomSelect>
 
-            {/* Điểm đo */}
-            <select
+            {/* Lọc theo Điểm đo */}
+            <CustomSelect
               value={selectedPoint}
               onChange={(e) => setSelectedPoint(e.target.value)}
-              className="h-9 rounded-xl border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500"
+              className="h-9 rounded-xl border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 outline-none focus:border-emerald-500"
             >
               <option value="all">Tất cả điểm đo</option>
               {points.map((p) => (
@@ -452,343 +585,304 @@ export function ClientAlerts({ project }: { project: Project }) {
                   ({p.code}) {p.name}
                 </option>
               ))}
-            </select>
+            </CustomSelect>
 
-            {/* Khoảng thời gian */}
-            <select
-              value={timeRange}
-              onChange={(e) => setTimeRange(e.target.value)}
-              className="h-9 rounded-xl border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500"
+            {/* Lọc theo Trạng thái gửi thông báo Zalo/Telegram */}
+            <CustomSelect
+              value={selectedDelivery}
+              onChange={(e) => setSelectedDelivery(e.target.value)}
+              className="h-9 rounded-xl border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 outline-none focus:border-emerald-500"
             >
-              <option value="today">Hôm nay</option>
-              <option value="24h">24 giờ qua</option>
-              <option value="7d">7 ngày gần nhất</option>
-              <option value="30d">30 ngày gần nhất</option>
-            </select>
+              <option value="all">Tất cả trạng thái gửi</option>
+              <option value="sent">Đã gửi Zalo / Telegram thành công</option>
+              <option value="failed">Gửi thông báo thất bại</option>
+              <option value="unconfigured">Chưa bật kênh gửi</option>
+            </CustomSelect>
           </div>
 
-          {/* Nút hành động hàng loạt khi tick chọn */}
-          {selectedAlertIds.length > 0 && (
-            <div className="flex items-center gap-2 bg-slate-100 px-3 py-1 rounded-xl">
-              <span className="text-xs font-semibold text-slate-700">
-                Đã chọn {selectedAlertIds.length} mục
+          {/* Tóm tắt kênh nhận đang bật */}
+          <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-slate-500">
+            <span>Kênh nhận đang bật:</span>
+            {notificationsConfig.zaloEnabled ? (
+              <span className="inline-flex items-center gap-1 rounded-md border border-blue-200 bg-blue-50 px-2 py-0.5 font-semibold text-blue-700">
+                Zalo ({notificationsConfig.zaloRecipient || "Zalo OA"})
               </span>
-              <button
-                type="button"
-                onClick={batchAcknowledge}
-                className="rounded-lg bg-white border border-slate-300 px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50 transition-colors"
-              >
-                Xác nhận đã xem
-              </button>
-              <button
-                type="button"
-                onClick={batchResolve}
-                className="rounded-lg bg-emerald-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-emerald-700 transition-colors"
-              >
-                Đánh dấu đã giải quyết
-              </button>
-            </div>
-          )}
+            ) : null}
+            {notificationsConfig.telegramEnabled ? (
+              <span className="inline-flex items-center gap-1 rounded-md border border-sky-200 bg-sky-50 px-2 py-0.5 font-semibold text-sky-700">
+                Telegram ({notificationsConfig.telegramChatId || "@ems_alert_bot"})
+              </span>
+            ) : null}
+            {notificationsConfig.emailEnabled && notificationsConfig.emailRecipient ? (
+              <span className="inline-flex items-center gap-1 rounded-md border border-amber-200 bg-amber-50 px-2 py-0.5 font-semibold text-amber-800">
+                Email ({notificationsConfig.emailRecipient})
+              </span>
+            ) : null}
+            {!notificationsConfig.zaloEnabled &&
+            !notificationsConfig.telegramEnabled &&
+            !notificationsConfig.emailEnabled ? (
+              <span className="text-slate-400">Chưa bật kênh nhận</span>
+            ) : null}
+          </div>
         </div>
       </div>
 
-      {/* Main Table Content */}
-      <div className="flex-1 min-h-0 overflow-y-auto px-5 py-4 lg:px-8">
-        <div className="overflow-hidden rounded-2xl border border-slate-200/80 bg-white shadow-xs">
+      {/* Bảng / Thẻ danh sách thời điểm cảnh báo & trạng thái gửi Zalo/Telegram */}
+      <div className="min-h-0 flex-1 md:overflow-y-auto px-3.5 py-3.5 sm:px-5 sm:py-4 lg:px-8">
+        {/* Danh sách thẻ dễ đọc trên Mobile (< md) */}
+        <div className="space-y-2.5 md:hidden">
+          {filteredAlerts.length === 0 ? (
+            <div className="flex flex-col items-center justify-center rounded-2xl border border-slate-200/80 bg-white px-4 py-12 text-center shadow-xs">
+              <CheckCircleIcon className="mb-2 h-9 w-9 text-emerald-500 opacity-80" />
+              <p className="text-sm font-semibold text-slate-700">
+                Không có cảnh báo nào phát sinh trong {monthLabel.toLowerCase()}
+              </p>
+              <p className="mt-1 text-xs text-slate-400">
+                Các thông số đo của dự án đều nằm trong ngưỡng cài đặt
+              </p>
+            </div>
+          ) : (
+            filteredAlerts.map((item) => (
+              <article
+                key={item.id}
+                className="rounded-xl border border-slate-200/80 bg-white p-3.5 shadow-xs space-y-2"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-mono text-xs font-bold text-slate-800">
+                    {item.timestamp}
+                  </span>
+                  <span
+                    className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-[10px] font-bold tracking-wider uppercase ${
+                      item.severity === "critical"
+                        ? "border border-rose-200 bg-rose-100 text-rose-700"
+                        : item.severity === "warning"
+                          ? "border border-amber-200 bg-amber-100 text-amber-800"
+                          : "border border-slate-200 bg-slate-100 text-slate-700"
+                    }`}
+                  >
+                    {item.severity === "critical"
+                      ? "Nghiêm trọng"
+                      : item.severity === "warning"
+                        ? "Cảnh báo"
+                        : "Thông tin"}
+                  </span>
+                </div>
+
+                <div className="flex items-baseline justify-between gap-2 border-t border-slate-100 pt-2">
+                  <div className="min-w-0">
+                    <p className="truncate text-xs font-semibold text-slate-800">
+                      {item.pointName}{" "}
+                      <span className="font-mono text-[11px] text-emerald-700">
+                        ({item.pointCode})
+                      </span>
+                    </p>
+                    <p className="mt-0.5 text-[11px] text-slate-500">
+                      <span className="rounded bg-slate-100 px-1 py-0.5 font-mono font-bold text-slate-800">
+                        {item.parameter}
+                      </span>{" "}
+                      {item.paramName}
+                    </p>
+                  </div>
+                  <div className="shrink-0 text-right font-mono">
+                    <span
+                      className={`text-sm font-bold ${
+                        item.severity === "critical"
+                          ? "text-rose-600"
+                          : item.severity === "warning"
+                            ? "text-amber-600"
+                            : "text-slate-800"
+                      }`}
+                    >
+                      {item.actualValue}
+                    </span>
+                    <span className="text-[11px] text-slate-400"> / {item.thresholdValue}</span>{" "}
+                    <span className="text-[10.5px] font-medium text-slate-500">{item.unit}</span>
+                  </div>
+                </div>
+
+                <p className="text-xs leading-relaxed text-slate-600">{item.message}</p>
+
+                <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                  {item.deliveries.length === 0 ? (
+                    <span className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2.5 py-0.5 text-[10.5px] font-medium text-slate-500">
+                      Chưa cấu hình kênh gửi
+                    </span>
+                  ) : (
+                    item.deliveries.map((d) => (
+                      <span
+                        key={d.channel}
+                        className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10.5px] font-semibold ${
+                          d.delivered
+                            ? d.channel === "Zalo"
+                              ? "border-blue-200 bg-blue-50 text-blue-700"
+                              : d.channel === "Telegram"
+                                ? "border-sky-200 bg-sky-50 text-sky-700"
+                                : "border-emerald-200 bg-emerald-50 text-emerald-700"
+                            : "border-rose-200 bg-rose-50 text-rose-700"
+                        }`}
+                      >
+                        <span
+                          className={`h-1.5 w-1.5 rounded-full ${
+                            d.delivered ? "bg-emerald-500" : "bg-rose-500"
+                          }`}
+                        />
+                        {d.channel}: {d.delivered ? "Đã gửi thành công" : "Gửi thất bại"}
+                      </span>
+                    ))
+                  )}
+                </div>
+              </article>
+            ))
+          )}
+        </div>
+
+        {/* Bảng đầy đủ trên Desktop / Tablet (≥ md) */}
+        <div className="hidden md:block overflow-hidden rounded-2xl border border-slate-200/80 bg-white shadow-xs">
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[1000px] text-left text-xs">
+            <table className="w-full min-w-[960px] text-left text-xs">
               <thead>
                 <tr className="border-b border-slate-100 bg-slate-50/80 text-[11px] font-bold tracking-wider text-slate-500 uppercase">
-                  <th className="w-10 px-4 py-3.5">
-                    <input
-                      type="checkbox"
-                      checked={
-                        filteredAlerts.length > 0 &&
-                        selectedAlertIds.length === filteredAlerts.length
-                      }
-                      onChange={toggleSelectAll}
-                      className="h-4 w-4 rounded border-slate-300 accent-emerald-600"
-                    />
-                  </th>
-                  <th className="px-3 py-3.5">Mã & Mức độ</th>
-                  <th className="px-3 py-3.5">Thời gian phát hiện</th>
-                  <th className="px-3 py-3.5">Điểm đo & Vị trí</th>
-                  <th className="px-3 py-3.5">Thông số vi phạm</th>
-                  <th className="px-3 py-3.5">Thực tế / Ngưỡng</th>
+                  <th className="px-4 py-3.5">Thời điểm phát sinh</th>
+                  <th className="px-3 py-3.5">Mức độ cảnh báo</th>
+                  <th className="px-3 py-3.5">Điểm đo</th>
+                  <th className="px-3 py-3.5">Thông số vượt ngưỡng</th>
+                  <th className="px-3 py-3.5">Giá trị đo / Ngưỡng</th>
                   <th className="px-3 py-3.5">Nội dung cảnh báo</th>
-                  <th className="px-3 py-3.5">Trạng thái</th>
-                  <th className="px-4 py-3.5 text-right">Thao tác</th>
+                  <th className="px-4 py-3.5">Trạng thái gửi (Zalo / Telegram)</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {filteredAlerts.length === 0 ? (
                   <tr>
-                    <td colSpan={9} className="py-16 text-center text-slate-400">
+                    <td colSpan={7} className="py-16 text-center text-slate-400">
                       <div className="flex flex-col items-center justify-center">
-                        <CheckCircleIcon className="h-10 w-10 text-emerald-500 mb-2 opacity-80" />
+                        <CheckCircleIcon className="mb-2 h-10 w-10 text-emerald-500 opacity-80" />
                         <p className="text-sm font-semibold text-slate-700">
-                          Hệ thống hoạt động an toàn, không có cảnh báo nào phù hợp bộ lọc
+                          Không có cảnh báo nào phát sinh trong {monthLabel.toLowerCase()}
                         </p>
-                        <p className="text-xs text-slate-400 mt-1">
-                          Thử thay đổi bộ lọc tìm kiếm hoặc xem lại tất cả các mức độ
+                        <p className="mt-1 text-xs text-slate-400">
+                          Các thông số đo của dự án đều nằm trong ngưỡng cài đặt
                         </p>
                       </div>
                     </td>
                   </tr>
                 ) : (
-                  filteredAlerts.map((item) => {
-                    const isChecked = selectedAlertIds.includes(item.id);
-                    return (
-                      <tr
-                        key={item.id}
-                        className={`transition-colors hover:bg-slate-50/80 ${
-                          isChecked ? "bg-emerald-50/40" : ""
-                        }`}
-                      >
-                        {/* Checkbox */}
-                        <td className="px-4 py-3.5">
-                          <input
-                            type="checkbox"
-                            checked={isChecked}
-                            onChange={() => toggleSelectOne(item.id)}
-                            className="h-4 w-4 rounded border-slate-300 accent-emerald-600"
-                          />
-                        </td>
+                  filteredAlerts.map((item) => (
+                    <tr key={item.id} className="transition-colors hover:bg-slate-50/80">
+                      {/* Thời điểm phát sinh */}
+                      <td className="px-4 py-3.5 font-mono text-[12px] font-semibold whitespace-nowrap text-slate-800">
+                        {item.timestamp}
+                      </td>
 
-                        {/* Mã & Mức độ */}
-                        <td className="px-3 py-3.5 whitespace-nowrap">
-                          <div className="flex items-center gap-2">
-                            <span
-                              className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${
-                                item.severity === "critical"
-                                  ? "bg-rose-100 text-rose-700 border border-rose-200"
-                                  : item.severity === "warning"
-                                    ? "bg-amber-100 text-amber-800 border border-amber-200"
-                                    : "bg-slate-100 text-slate-700 border border-slate-200"
-                              }`}
-                            >
-                              {item.severity === "critical"
-                                ? "Nghiêm trọng"
+                      {/* Mức độ cảnh báo (từ cấu hình) */}
+                      <td className="px-3 py-3.5 whitespace-nowrap">
+                        <span
+                          className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-[10.5px] font-bold tracking-wider uppercase ${
+                            item.severity === "critical"
+                              ? "border border-rose-200 bg-rose-100 text-rose-700"
+                              : item.severity === "warning"
+                                ? "border border-amber-200 bg-amber-100 text-amber-800"
+                                : "border border-slate-200 bg-slate-100 text-slate-700"
+                          }`}
+                        >
+                          {item.severity === "critical"
+                            ? "Nghiêm trọng"
+                            : item.severity === "warning"
+                              ? "Cảnh báo"
+                              : "Thông tin"}
+                        </span>
+                      </td>
+
+                      {/* Điểm đo */}
+                      <td className="px-3 py-3.5">
+                        <p className="font-semibold text-slate-800">{item.pointName}</p>
+                        <div className="flex items-center gap-1 text-[11px] text-slate-400">
+                          <span className="font-mono font-medium text-emerald-700">
+                            {item.pointCode}
+                          </span>
+                          <span>• {item.location}</span>
+                        </div>
+                      </td>
+
+                      {/* Thông số vượt ngưỡng */}
+                      <td className="px-3 py-3.5 whitespace-nowrap">
+                        <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono font-bold text-slate-800">
+                          {item.parameter}
+                        </span>
+                        <span className="mt-0.5 block text-[11px] text-slate-500">
+                          {item.paramName}
+                        </span>
+                      </td>
+
+                      {/* Giá trị thực tế / Ngưỡng */}
+                      <td className="px-3 py-3.5 whitespace-nowrap">
+                        <div className="flex items-baseline gap-1 font-mono">
+                          <span
+                            className={`text-sm font-bold ${
+                              item.severity === "critical"
+                                ? "text-rose-600"
                                 : item.severity === "warning"
-                                  ? "Cảnh báo"
-                                  : "Thông tin"}
-                            </span>
-                          </div>
-                          <span className="block font-mono text-[10.5px] text-slate-400 mt-0.5">
-                            {item.id}
-                          </span>
-                        </td>
-
-                        {/* Thời gian */}
-                        <td className="px-3 py-3.5 whitespace-nowrap text-slate-600 font-mono text-[11.5px]">
-                          {item.timestamp}
-                        </td>
-
-                        {/* Điểm đo */}
-                        <td className="px-3 py-3.5">
-                          <p className="font-semibold text-slate-800">{item.pointName}</p>
-                          <div className="flex items-center gap-1 text-[11px] text-slate-400">
-                            <span className="font-mono font-medium text-emerald-700">
-                              {item.pointCode}
-                            </span>
-                            <span>• {item.location}</span>
-                          </div>
-                        </td>
-
-                        {/* Thông số vi phạm */}
-                        <td className="px-3 py-3.5 whitespace-nowrap">
-                          <span className="font-mono font-bold text-slate-800 bg-slate-100 px-1.5 py-0.5 rounded">
-                            {item.parameter}
-                          </span>
-                          <span className="block text-[11px] text-slate-500 mt-0.5">
-                            {item.paramName}
-                          </span>
-                        </td>
-
-                        {/* Giá trị thực tế / Ngưỡng */}
-                        <td className="px-3 py-3.5 whitespace-nowrap">
-                          <div className="flex items-baseline gap-1">
-                            <span
-                              className={`text-sm font-bold ${
-                                item.severity === "critical"
-                                  ? "text-rose-600"
-                                  : item.severity === "warning"
-                                    ? "text-amber-600"
-                                    : "text-slate-800"
-                              }`}
-                            >
-                              {item.actualValue}
-                            </span>
-                            <span className="text-[10.5px] text-slate-400">/ {item.thresholdValue}</span>
-                            <span className="text-[10px] text-slate-500 font-medium">{item.unit}</span>
-                          </div>
-                        </td>
-
-                        {/* Nội dung */}
-                        <td className="px-3 py-3.5 max-w-[280px]">
-                          <p className="line-clamp-2 text-slate-700 leading-relaxed">
-                            {item.message}
-                          </p>
-                          {item.notes && (
-                            <p className="mt-1 text-[11px] text-emerald-700 font-medium italic truncate">
-                              Ghi chú: {item.notes}
-                            </p>
-                          )}
-                        </td>
-
-                        {/* Trạng thái */}
-                        <td className="px-3 py-3.5 whitespace-nowrap">
-                          {item.status === "active" ? (
-                            <span className="inline-flex items-center gap-1.5 rounded-full bg-rose-50 px-2.5 py-0.5 text-[11px] font-semibold text-rose-700 border border-rose-100">
-                              <span className="h-1.5 w-1.5 rounded-full bg-rose-500 animate-pulse" />
-                              Đang xảy ra
-                            </span>
-                          ) : item.status === "acknowledged" ? (
-                            <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-50 px-2.5 py-0.5 text-[11px] font-semibold text-amber-700 border border-amber-100">
-                              <span className="h-1.5 w-1.5 rounded-full bg-amber-500" />
-                              Đã tiếp nhận
-                            </span>
-                          ) : (
-                            <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-2.5 py-0.5 text-[11px] font-semibold text-emerald-700 border border-emerald-100">
-                              <CheckIcon className="h-3 w-3 text-emerald-600" />
-                              Đã giải quyết
-                            </span>
-                          )}
-                        </td>
-
-                        {/* Thao tác */}
-                        <td className="px-4 py-3.5 text-right whitespace-nowrap">
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setInspectAlert(item);
-                              setInspectNote(item.notes || "");
-                            }}
-                            className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-semibold text-slate-700 shadow-xs hover:bg-slate-50 transition-colors"
+                                  ? "text-amber-600"
+                                  : "text-slate-800"
+                            }`}
                           >
-                            Chi tiết & Xử lý
-                          </button>
-                        </td>
-                      </tr>
-                    );
-                  })
+                            {item.actualValue}
+                          </span>
+                          <span className="text-[11px] text-slate-400">
+                            / {item.thresholdValue}
+                          </span>
+                          <span className="text-[10.5px] font-medium text-slate-500">
+                            {item.unit}
+                          </span>
+                        </div>
+                      </td>
+
+                      {/* Nội dung cảnh báo */}
+                      <td className="max-w-[300px] px-3 py-3.5">
+                        <p className="leading-relaxed text-slate-700">{item.message}</p>
+                      </td>
+
+                      {/* Trạng thái gửi thông báo qua Zalo / Telegram / Email */}
+                      <td className="px-4 py-3.5 whitespace-nowrap">
+                        {item.deliveries.length === 0 ? (
+                          <span className="inline-flex items-center gap-1.5 rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-[11px] font-medium text-slate-500">
+                            Chưa cấu hình kênh gửi
+                          </span>
+                        ) : (
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            {item.deliveries.map((d) => (
+                              <span
+                                key={d.channel}
+                                title={`${d.channel}: ${d.recipient}`}
+                                className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[11px] font-semibold ${
+                                  d.delivered
+                                    ? d.channel === "Zalo"
+                                      ? "border-blue-200 bg-blue-50 text-blue-700"
+                                      : d.channel === "Telegram"
+                                        ? "border-sky-200 bg-sky-50 text-sky-700"
+                                        : "border-emerald-200 bg-emerald-50 text-emerald-700"
+                                    : "border-rose-200 bg-rose-50 text-rose-700"
+                                }`}
+                              >
+                                <span
+                                  className={`h-1.5 w-1.5 rounded-full ${
+                                    d.delivered ? "bg-emerald-500" : "bg-rose-500"
+                                  }`}
+                                />
+                                {d.channel}: {d.delivered ? "Đã gửi thành công" : "Gửi thất bại"}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      </td>
+                    </tr>
+                  ))
                 )}
               </tbody>
             </table>
           </div>
         </div>
       </div>
-
-      {/* Modal / Drawer chi tiết sự kiện cảnh báo */}
-      {inspectAlert && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-xs p-4">
-          <div className="w-full max-w-xl rounded-2xl border border-slate-200 bg-white p-6 shadow-xl animate-in fade-in zoom-in-95 duration-150">
-            <div className="flex items-start justify-between gap-4 border-b border-slate-100 pb-4">
-              <div>
-                <span
-                  className={`inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-bold uppercase tracking-wider ${
-                    inspectAlert.severity === "critical"
-                      ? "bg-rose-100 text-rose-700"
-                      : inspectAlert.severity === "warning"
-                        ? "bg-amber-100 text-amber-800"
-                        : "bg-slate-100 text-slate-700"
-                  }`}
-                >
-                  {inspectAlert.severity === "critical"
-                    ? "Sự cố nghiêm trọng"
-                    : inspectAlert.severity === "warning"
-                      ? "Cảnh báo vượt ngưỡng"
-                      : "Thông tin hệ thống"}
-                </span>
-                <h3 className="mt-1.5 text-lg font-bold text-slate-900">
-                  {inspectAlert.pointName} ({inspectAlert.pointCode})
-                </h3>
-                <p className="text-xs text-slate-400 font-mono">{inspectAlert.id} · {inspectAlert.timestamp}</p>
-              </div>
-              <button
-                type="button"
-                onClick={() => setInspectAlert(null)}
-                className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-600"
-              >
-                ✕
-              </button>
-            </div>
-
-            <div className="mt-4 space-y-3.5 text-xs text-slate-600">
-              <div className="grid grid-cols-2 gap-3 bg-slate-50 p-3 rounded-xl">
-                <div>
-                  <span className="text-[11px] text-slate-400">Tham số vi phạm:</span>
-                  <p className="font-bold text-slate-800">{inspectAlert.paramName} ({inspectAlert.parameter})</p>
-                </div>
-                <div>
-                  <span className="text-[11px] text-slate-400">Vị trí lắp đặt:</span>
-                  <p className="font-semibold text-slate-800">{inspectAlert.location}</p>
-                </div>
-                <div>
-                  <span className="text-[11px] text-slate-400">Giá trị đo được:</span>
-                  <p className="text-base font-bold text-rose-600">
-                    {inspectAlert.actualValue} {inspectAlert.unit}
-                  </p>
-                </div>
-                <div>
-                  <span className="text-[11px] text-slate-400">Ngưỡng cho phép:</span>
-                  <p className="text-base font-bold text-slate-700">
-                    {inspectAlert.thresholdValue} {inspectAlert.unit}
-                  </p>
-                </div>
-              </div>
-
-              <div>
-                <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wider">
-                  Mô tả chi tiết sự kiện
-                </span>
-                <p className="mt-1 rounded-xl border border-slate-200 bg-white p-3 text-slate-800 leading-relaxed font-medium">
-                  {inspectAlert.message}
-                </p>
-              </div>
-
-              <div>
-                <label className="block text-[11px] font-semibold text-slate-500 uppercase tracking-wider mb-1">
-                  Nhật ký & Phương án khắc phục
-                </label>
-                <textarea
-                  rows={3}
-                  value={inspectNote}
-                  onChange={(e) => setInspectNote(e.target.value)}
-                  placeholder="Nhập nội dung xử lý, người thực hiện, kiểm tra hiện trường..."
-                  className="w-full rounded-xl border border-slate-200 p-3 text-xs text-slate-800 outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500"
-                />
-              </div>
-            </div>
-
-            <div className="mt-5 flex items-center justify-between gap-3 border-t border-slate-100 pt-4">
-              <div className="text-[11px] text-slate-400">
-                {inspectAlert.acknowledgedBy ? (
-                  <span>Đã tiếp nhận bởi: <strong className="text-slate-700">{inspectAlert.acknowledgedBy}</strong></span>
-                ) : (
-                  <span>Trạng thái: <strong className="text-rose-600">Chưa tiếp nhận</strong></span>
-                )}
-              </div>
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => setInspectAlert(null)}
-                  className="rounded-xl border border-slate-200 px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50"
-                >
-                  Đóng
-                </button>
-                <button
-                  type="button"
-                  onClick={saveInspectNote}
-                  className="rounded-xl bg-emerald-600 px-4 py-2 text-xs font-semibold text-white hover:bg-emerald-700 shadow-xs"
-                >
-                  Lưu & Cập nhật trạng thái
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
@@ -796,7 +890,15 @@ export function ClientAlerts({ project }: { project: Project }) {
 // Icons
 function AlertBellIcon({ className }: { className?: string }) {
   return (
-    <svg viewBox="0 0 24 24" className={className} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <svg
+      viewBox="0 0 24 24"
+      className={className}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
       <path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9" />
       <path d="M10.3 21a1.94 1.94 0 0 0 3.4 0" />
       <path d="M4 2C2.8 3.7 2 5.7 2 8" strokeWidth="1.5" />
@@ -807,7 +909,15 @@ function AlertBellIcon({ className }: { className?: string }) {
 
 function SearchIcon({ className }: { className?: string }) {
   return (
-    <svg viewBox="0 0 24 24" className={className} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <svg
+      viewBox="0 0 24 24"
+      className={className}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
       <circle cx="11" cy="11" r="8" />
       <line x1="21" y1="21" x2="16.65" y2="16.65" />
     </svg>
@@ -816,7 +926,15 @@ function SearchIcon({ className }: { className?: string }) {
 
 function DownloadIcon({ className }: { className?: string }) {
   return (
-    <svg viewBox="0 0 24 24" className={className} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <svg
+      viewBox="0 0 24 24"
+      className={className}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
       <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
       <polyline points="7 10 12 15 17 10" />
       <line x1="12" y1="15" x2="12" y2="3" />
@@ -826,24 +944,32 @@ function DownloadIcon({ className }: { className?: string }) {
 
 function GearIcon({ className }: { className?: string }) {
   return (
-    <svg viewBox="0 0 24 24" className={className} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <svg
+      viewBox="0 0 24 24"
+      className={className}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
       <circle cx="12" cy="12" r="3" />
-      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
-    </svg>
-  );
-}
-
-function CheckIcon({ className }: { className?: string }) {
-  return (
-    <svg viewBox="0 0 24 24" className={className} fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-      <polyline points="20 6 9 17 4 12" />
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
     </svg>
   );
 }
 
 function CheckCircleIcon({ className }: { className?: string }) {
   return (
-    <svg viewBox="0 0 24 24" className={className} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <svg
+      viewBox="0 0 24 24"
+      className={className}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
       <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
       <polyline points="22 4 12 14.01 9 11.01" />
     </svg>

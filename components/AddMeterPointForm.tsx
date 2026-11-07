@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { CustomSelect } from "@/components/ui/CustomSelect";
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import {
@@ -382,7 +383,7 @@ export function AddMeterPointForm({
 
             <Field label="ĐIỂM ĐO CHA">
               <div className="relative">
-                <select
+                <CustomSelect
                   value={parentId}
                   onChange={(e) => selectParent(e.target.value)}
                   className="input appearance-none pr-9"
@@ -393,7 +394,7 @@ export function AddMeterPointForm({
                       {meter.name} ({meter.code})
                     </option>
                   ))}
-                </select>
+                </CustomSelect>
                 <ChevronIcon className="pointer-events-none absolute top-1/2 right-3 h-4 w-4 -translate-y-1/2 text-slate-400" />
               </div>
               <p className="mt-1.5 text-xs text-slate-400">

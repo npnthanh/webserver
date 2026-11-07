@@ -1,6 +1,7 @@
 "use client";
 
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
+import { CustomSelect } from "@/components/ui/CustomSelect";
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -318,7 +319,7 @@ export function AddProjectForm({ initialProject }: { initialProject?: Project })
             </Field>
             <Field label="TRẠNG THÁI">
               <div className="relative">
-                <select
+                <CustomSelect
                   value={status}
                   onChange={(e) => setStatus(e.target.value as ProjectStatus)}
                   className="input appearance-none pr-9"
@@ -326,7 +327,7 @@ export function AddProjectForm({ initialProject }: { initialProject?: Project })
                   <option value="active">Hoạt động</option>
                   <option value="maintenance">Bảo trì</option>
                   <option value="paused">Tạm dừng</option>
-                </select>
+                </CustomSelect>
                 <ChevronIcon className="pointer-events-none absolute top-1/2 right-3 h-4 w-4 -translate-y-1/2 text-slate-400" />
               </div>
             </Field>

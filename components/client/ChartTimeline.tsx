@@ -86,22 +86,24 @@ export function ChartTimeline({
             {startLabel || "Bắt đầu"} → {endLabel || "Kết thúc"}
           </p>
         ) : (
-          <p className="text-[11px] font-semibold tracking-wide text-slate-500">
+          <p className="hidden sm:block text-[11px] font-semibold tracking-wide text-slate-500">
             KÉO THANH ĐỂ CHỌN KHOẢNG THỜI GIAN
           </p>
         )}
-        <div className="flex items-center gap-1">
-          <button type="button" aria-label="Lùi khoảng xem" onClick={() => shiftWindow(-Math.max(minSpan, 1))} className={btnClass}>
-            ‹
-          </button>
-          {compact ? null : (
-            <span className="min-w-[9.5rem] text-center text-[12px] font-semibold text-slate-800">
-              {startLabel} → {endLabel}
-            </span>
-          )}
-          <button type="button" aria-label="Tới khoảng xem" onClick={() => shiftWindow(Math.max(minSpan, 1))} className={btnClass}>
-            ›
-          </button>
+        <div className="flex w-full sm:w-auto items-center justify-between sm:justify-end gap-1">
+          <div className="flex items-center gap-1">
+            <button type="button" aria-label="Lùi khoảng xem" onClick={() => shiftWindow(-Math.max(minSpan, 1))} className={btnClass}>
+              ‹
+            </button>
+            {compact ? null : (
+              <span className="min-w-[8rem] sm:min-w-[9.5rem] text-center text-[11.5px] sm:text-[12px] font-semibold text-slate-800">
+                {startLabel} → {endLabel}
+              </span>
+            )}
+            <button type="button" aria-label="Tới khoảng xem" onClick={() => shiftWindow(Math.max(minSpan, 1))} className={btnClass}>
+              ›
+            </button>
+          </div>
           <button
             type="button"
             onClick={() => onRange({ start: 0, end: last })}
@@ -121,7 +123,7 @@ export function ChartTimeline({
         className={
           compact
             ? "relative h-8 w-full touch-none select-none overflow-hidden rounded-md bg-white ring-1 ring-slate-200"
-            : "relative h-14 w-full touch-none select-none overflow-hidden rounded-lg bg-white ring-1 ring-slate-200"
+            : "relative h-10 sm:h-14 w-full touch-none select-none overflow-hidden rounded-lg bg-white ring-1 ring-slate-200"
         }
         onPointerDown={(event) => {
           const box = event.currentTarget.getBoundingClientRect();

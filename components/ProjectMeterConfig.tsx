@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { CustomSelect } from "@/components/ui/CustomSelect";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { ProjectConfigHeader } from "@/components/ProjectConfigHeader";
@@ -347,7 +348,7 @@ export function ProjectMeterConfig({ project }: { project: Project }) {
                 className="h-10 w-full rounded-xl border border-slate-200 bg-white pr-3 pl-9 text-sm outline-none placeholder:text-slate-400 focus:border-emerald-500 transition-colors"
               />
             </label>
-            <select
+            <CustomSelect
               value={deviceType}
               onChange={(e) => {
                 setDeviceType(e.target.value);
@@ -361,7 +362,7 @@ export function ProjectMeterConfig({ project }: { project: Project }) {
                   {type}
                 </option>
               ))}
-            </select>
+            </CustomSelect>
           </div>
 
           <section className="rounded-xl border border-slate-200 bg-white shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
