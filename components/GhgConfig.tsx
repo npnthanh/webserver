@@ -439,6 +439,16 @@ export function GhgConfig({ projectId }: { projectId: string }) {
       {formOpen ? (
       <>
       <div className="flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          onClick={() => {
+            setTableFilter("all");
+            closeForm();
+          }}
+          className="inline-flex h-9 items-center rounded-xl bg-white px-3.5 text-sm font-semibold text-slate-600 ring-1 ring-slate-200 transition-all hover:bg-emerald-50 hover:text-emerald-700 hover:ring-emerald-300"
+        >
+          Tất cả nguồn ({sources.length})
+        </button>
         {SCOPES.map((scope) => {
           const active = activeScope === scope.id;
           return (
@@ -954,7 +964,7 @@ export function GhgConfig({ projectId }: { projectId: string }) {
         </aside>
       </div>
       </>
-      ) : (
+      ) : null}
       <section className="rounded-xl border border-slate-200 bg-white shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 px-5 py-4">
           <h2 className="text-[15px] font-semibold text-slate-800">
@@ -965,7 +975,7 @@ export function GhgConfig({ projectId }: { projectId: string }) {
               active={tableFilter === "all"}
               onClick={() => setTableFilter("all")}
             >
-              Tổng các nguồn phát thải
+              Tất cả nguồn
             </FilterChip>
             {SCOPES.map((scope) => (
               <FilterChip
@@ -1072,7 +1082,6 @@ export function GhgConfig({ projectId }: { projectId: string }) {
           </table>
         </div>
       </section>
-      )}
     </div>
   );
 }

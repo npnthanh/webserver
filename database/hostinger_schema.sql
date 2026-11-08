@@ -212,7 +212,7 @@ CREATE TABLE `devices` (
 
 LOCK TABLES `devices` WRITE;
 /*!40000 ALTER TABLE `devices` DISABLE KEYS */;
-INSERT INTO `devices` VALUES ('dev-1791304329170','PM5000','250384934','SBANK PM5000','SBANK','3 pha','PM2230','power','active','23:32:09 6/10/2026','Modbus TCP',NULL,NULL,'[]','[{\"id\":\"r1\",\"address\":\"250384934\",\"name\":\"250384934\",\"dataType\":\"FLOAT32\",\"multiplier\":\"1.0\"}]'),('dev-1791532720603','PM2230','123456','Schneider PM2230','Schneider','Đồng hồ điện','PM2230','power','active','09/10/2026 14:58:40','Modbus TCP',NULL,NULL,'[]','[]');
+INSERT INTO `devices` VALUES ('dev-1791304329170','PM2230','250384934','Schneider PM2230','Schneider Electric','Đồng hồ điện 3 pha','PM2230','power','active','03/11/2026 22:08:58','Modbus TCP',NULL,NULL,'[]','[]');
 /*!40000 ALTER TABLE `devices` ENABLE KEYS */;
 UNLOCK TABLES;
 
@@ -536,7 +536,7 @@ CREATE TABLE `meter_points` (
 
 LOCK TABLES `meter_points` WRITE;
 /*!40000 ALTER TABLE `meter_points` DISABLE KEYS */;
-INSERT INTO `meter_points` VALUES ('m-1791304382926','PRJ-2401','Demo','PM5000','SBANK PM5000',NULL,'Điện','dev-1791304329170','250384934');
+INSERT INTO `meter_points` VALUES ('m-1791304382926','PRJ-2401','Demo','PM2230','Schneider PM2230',NULL,'Điện','dev-1791304329170','250384934');
 /*!40000 ALTER TABLE `meter_points` ENABLE KEYS */;
 UNLOCK TABLES;
 
@@ -646,7 +646,7 @@ CREATE TABLE `project_settings` (
 
 LOCK TABLES `project_settings` WRITE;
 /*!40000 ALTER TABLE `project_settings` DISABLE KEYS */;
-INSERT INTO `project_settings` VALUES ('PRJ-2401','{\"alertConfig\":{\"categoriesByUtility\":{\"Điện\":[{\"id\":\"energy\",\"label\":\"Energy\"},{\"id\":\"ui\",\"label\":\"U/I\"},{\"id\":\"frequency\",\"label\":\"Tần số\"},{\"id\":\"power\",\"label\":\"Công suất\"},{\"id\":\"harmonics\",\"label\":\"Sóng hài\"},{\"id\":\"imbalance\",\"label\":\"Mất cân bằng pha\"}]},\"activeUtility\":\"Điện\",\"activeId\":\"harmonics\",\"alarmsByCategory\":{\"harmonics\":[{\"id\":\"harmonics-1793607753760\",\"alarmId\":\"1\",\"name\":\"400\",\"description\":\"Mô tả điều kiện kích hoạt cảnh báo\",\"threshold\":\"0\",\"unit\":\"V\",\"current\":\"--.-\"},{\"id\":\"harmonics-1793607776207\",\"alarmId\":\"2\",\"name\":\"\",\"description\":\"Mô tả điều kiện kích hoạt cảnh báo\",\"threshold\":\"0\",\"unit\":\"V\",\"current\":\"--.-\"}]}},\"costConfig\":{\"utility\":\"Điện\",\"applyDate\":\"\",\"slots\":[],\"flatPrices\":{},\"electricity\":{\"voltageLevel\":\"kv22\",\"prices\":{\"normal\":\"1\",\"off\":\"1\",\"peak\":\"1\"}}}}','2026-11-07 15:46:55'),('PRJ-2402','{\"alertConfig\":{\"categoriesByUtility\":{\"Điện\":[{\"id\":\"energy\",\"label\":\"Energy\"},{\"id\":\"ui\",\"label\":\"U/I\"},{\"id\":\"frequency\",\"label\":\"Tần số\"},{\"id\":\"power\",\"label\":\"Công suất\"},{\"id\":\"harmonics\",\"label\":\"Sóng hài\"},{\"id\":\"imbalance\",\"label\":\"Mất cân bằng pha\"}]},\"activeUtility\":\"Điện\",\"activeId\":\"energy\",\"alarmsByCategory\":{}}}','2026-11-07 15:32:55');
+INSERT INTO `project_settings` VALUES ('PRJ-2401','{\"alertConfig\":{\"categoriesByUtility\":{\"Điện\":[{\"id\":\"energy\",\"label\":\"Energy\"},{\"id\":\"ui\",\"label\":\"U/I\"},{\"id\":\"frequency\",\"label\":\"Tần số\"},{\"id\":\"power\",\"label\":\"Công suất\"},{\"id\":\"harmonics\",\"label\":\"Sóng hài\"},{\"id\":\"imbalance\",\"label\":\"Mất cân bằng pha\"}]},\"activeUtility\":\"Điện\",\"activeId\":\"harmonics\",\"alarmsByCategory\":{}},\"costConfig\":{\"utility\":\"Điện\",\"applyDate\":\"\",\"slots\":[],\"flatPrices\":{},\"electricity\":{\"voltageLevel\":\"kv22\",\"prices\":{\"normal\":\"1\",\"off\":\"1\",\"peak\":\"1\"}}}}','2026-11-08 09:45:00'),('PRJ-2402','{\"alertConfig\":{\"categoriesByUtility\":{\"Điện\":[{\"id\":\"energy\",\"label\":\"Energy\"},{\"id\":\"ui\",\"label\":\"U/I\"},{\"id\":\"frequency\",\"label\":\"Tần số\"},{\"id\":\"power\",\"label\":\"Công suất\"},{\"id\":\"harmonics\",\"label\":\"Sóng hài\"},{\"id\":\"imbalance\",\"label\":\"Mất cân bằng pha\"}]},\"activeUtility\":\"Điện\",\"activeId\":\"energy\",\"alarmsByCategory\":{}}}','2026-11-07 15:32:55');
 /*!40000 ALTER TABLE `project_settings` ENABLE KEYS */;
 UNLOCK TABLES;
 
