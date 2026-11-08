@@ -641,7 +641,7 @@ async function ensureUpstreamHistoryBackfill(base: string) {
         for (let i = 0; i < samples.length; i += chunkSize) {
           const chunk = samples.slice(i, i + chunkSize);
           const placeholders: string[] = [];
-          const params: unknown[] = [];
+          const params: Array<string | number | null> = [];
           chunk.forEach((item, idx) => {
             if (!item.at || !item.values) return;
             const sqlTime = item.at.replace("T", " ").replace("Z", "").slice(0, 23);
