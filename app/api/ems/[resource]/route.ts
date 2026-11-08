@@ -89,31 +89,9 @@ function ensureDiagramDisplaysColumn() {
 }
 
 function ensureDeviceColumns() {
-  deviceColumnsReady ??= Promise.all([
-    emsDb.execute("ALTER TABLE devices MODIFY COLUMN image MEDIUMTEXT NULL").catch(() => undefined),
-    emsDb
-      .execute(
-        `UPDATE devices
-            SET name = 'PM2230',
-                brand_model = 'Schneider PM2230',
-                brand = 'Schneider Electric',
-                device_type = 'Đồng hồ điện 3 pha',
-                category = 'PM2230'
-          WHERE name = 'PM5000' OR brand_model = 'SBANK PM5000'`,
-      )
-      .catch(() => undefined),
-    emsDb
-      .execute("DELETE FROM devices WHERE id = 'dev-1791532720603' AND serial_number = '123456'")
-      .catch(() => undefined),
-    emsDb
-      .execute(
-        `UPDATE meter_points
-            SET code = 'PM2230',
-                device_type = 'Schneider PM2230'
-          WHERE code = 'PM5000' OR device_type = 'SBANK PM5000'`,
-      )
-      .catch(() => undefined),
-  ]).then(() => undefined);
+  deviceColumnsReady ??= emsDb
+    .execute("ALTER TABLE devices MODIFY COLUMN image MEDIUMTEXT NULL")
+    .then(() => undefined);
   return deviceColumnsReady;
 }
 
@@ -342,7 +320,6 @@ async function getResource(resource: string, request: NextRequest) {
   }
   if (resource === "client-meters") {
     if (!projectId) throw new Error("projectId is required");
-    await ensureDeviceColumns();
     return queryRows<Row>(
       `SELECT id, name, code, device_type AS type, parent_id AS parentId,
               utility, device_id AS deviceId, serial_number AS serialNumber
