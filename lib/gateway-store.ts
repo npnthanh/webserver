@@ -277,6 +277,19 @@ const STATEMENTS = [
 ];
 
 let schemaReady: Promise<void> | null = null;
+let lastDirectIngestAt = 0;
+let lastUpstreamSyncAt = 0;
+let upstreamSyncInFlight: Promise<void> | null = null;
+let upstreamBackfillDone = false;
+let upstreamBackfillInFlight: Promise<void> | null = null;
+
+const DEFAULT_UPSTREAM_GATEWAY_URL = "https://webserver.demopage.top";
+
+function upstreamBaseUrl() {
+  const raw = (process.env.GATEWAY_UPSTREAM_URL ?? DEFAULT_UPSTREAM_GATEWAY_URL).trim();
+  if (!raw || raw.toLowerCase() === "none" || raw.toLowerCase() === "off") return "";
+  return raw.replace(/\/+$/, "");
+}
 
 export function ensureGatewaySchema() {
   schemaReady ??= createSchema().catch((error) => {
@@ -305,6 +318,7 @@ async function createSchema() {
 }
 
 export async function ingestGateway(rawText: string, headers?: Headers) {
+  lastDirectIngestAt = Date.now();
   await ensureGatewaySchema();
   const receivedAt = new Date().toISOString();
   const parsed = parseGatewayPacket(rawText);
@@ -588,8 +602,301 @@ export async function ingestGateway(rawText: string, headers?: Headers) {
   });
 }
 
+async function ensureUpstreamHistoryBackfill(base: string) {
+  if (upstreamBackfillDone || !base) return;
+  if (upstreamBackfillInFlight) return upstreamBackfillInFlight;
+
+  upstreamBackfillInFlight = (async () => {
+    try {
+      const countRows = await queryRows<RowDataPacket>(
+        "SELECT COUNT(*) AS cnt FROM gateway_samples WHERE received_at >= '2026-11-04 00:00:00'",
+      ).catch(() => []);
+      const existingCount = Number(countRows[0]?.cnt ?? 0);
+      if (existingCount >= 500) {
+        upstreamBackfillDone = true;
+        return;
+      }
+
+      const startDay = new Date("2026-11-03T00:00:00Z");
+      const nowVn = new Date(Date.now() + 7 * 60 * 60 * 1000);
+      const days: string[] = [];
+      for (let d = new Date(startDay); d <= nowVn; d.setUTCDate(d.getUTCDate() + 1)) {
+        days.push(d.toISOString().slice(0, 10));
+      }
+
+      for (const day of days) {
+        const res = await fetch(
+          `${base}/api/gateway/series?projectId=PRJ-2401&from=${day}&to=${day}&limit=8000`,
+          { cache: "no-store", signal: AbortSignal.timeout(12000) },
+        ).catch(() => null);
+        if (!res || !res.ok) continue;
+        const samples = (await res.json()) as Array<{
+          meterPointId?: string;
+          at?: string;
+          values?: Record<string, number>;
+        }>;
+        if (!Array.isArray(samples) || samples.length === 0) continue;
+
+        const chunkSize = 250;
+        for (let i = 0; i < samples.length; i += chunkSize) {
+          const chunk = samples.slice(i, i + chunkSize);
+          const placeholders: string[] = [];
+          const params: unknown[] = [];
+          chunk.forEach((item, idx) => {
+            if (!item.at || !item.values) return;
+            const sqlTime = item.at.replace("T", " ").replace("Z", "").slice(0, 23);
+            const unixMs = Date.parse(item.at.endsWith("Z") ? item.at : `${item.at}Z`);
+            const sampledUnix = Number.isFinite(unixMs) ? Math.trunc(unixMs / 1000) : null;
+            const syntheticPacketNum =
+              sampledUnix != null ? sampledUnix : 1700000000 + i + idx;
+            placeholders.push("(1, 1, 0, 250384934, ?, ?, ?, 0, 0, 1, ?)");
+            params.push(
+              syntheticPacketNum,
+              sqlTime,
+              sampledUnix,
+              JSON.stringify(item.values),
+            );
+          });
+          if (placeholders.length > 0) {
+            await emsDb
+              .execute(
+                `INSERT IGNORE INTO gateway_samples (
+                  gateway_id, meter_type, meter_model, meter_id, packet_number, received_at,
+                  sampled_unix, is_replay, error_code, crc_ok, values_json
+                ) VALUES ${placeholders.join(",")}`,
+                params,
+              )
+              .catch(() => undefined);
+          }
+        }
+      }
+      upstreamBackfillDone = true;
+    } catch (error) {
+      console.error("Upstream history backfill error", error);
+    } finally {
+      upstreamBackfillInFlight = null;
+    }
+  })();
+
+  return upstreamBackfillInFlight;
+}
+
+async function syncFromUpstreamGateway() {
+  const base = upstreamBaseUrl();
+  if (!base) return;
+  if (lastDirectIngestAt > Date.now() - 60_000) return;
+
+  void ensureUpstreamHistoryBackfill(base);
+
+  if (Date.now() - lastUpstreamSyncAt < 8_000) return;
+  if (upstreamSyncInFlight) return upstreamSyncInFlight;
+
+  upstreamSyncInFlight = (async () => {
+    try {
+      lastUpstreamSyncAt = Date.now();
+      const res = await fetch(`${base}/api/gateway/console`, {
+        cache: "no-store",
+        signal: AbortSignal.timeout(4500),
+      });
+      if (!res.ok) return;
+      const remote = (await res.json()) as Partial<GatewayConsole>;
+      const gateways = Array.isArray(remote.gateways) ? remote.gateways : [];
+      const packets = Array.isArray(remote.packets) ? remote.packets : [];
+
+      for (const gw of gateways) {
+        if (!gw?.gatewayId) continue;
+        const valuesJson = gw.lastValues ? JSON.stringify(gw.lastValues) : null;
+        const lastSeen = gw.lastSeenAt || new Date().toISOString();
+        await emsDb
+          .execute(
+            `INSERT INTO gateway_devices (
+              gateway_id, protocol_version, internet, gateway_temperature, gateway_humidity,
+              packet_number, meter_type, meter_model, meter_id, last_reading_time, last_is_replay,
+              last_error, last_values, last_disposition, last_seen_at, time_update_seconds
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON DUPLICATE KEY UPDATE
+              protocol_version = VALUES(protocol_version),
+              internet = VALUES(internet),
+              gateway_temperature = VALUES(gateway_temperature),
+              gateway_humidity = VALUES(gateway_humidity),
+              packet_number = VALUES(packet_number),
+              meter_type = VALUES(meter_type),
+              meter_model = VALUES(meter_model),
+              meter_id = VALUES(meter_id),
+              last_reading_time = COALESCE(VALUES(last_reading_time), last_reading_time),
+              last_is_replay = COALESCE(VALUES(last_is_replay), last_is_replay),
+              last_error = VALUES(last_error),
+              last_values = COALESCE(VALUES(last_values), last_values),
+              last_disposition = VALUES(last_disposition),
+              last_seen_at = VALUES(last_seen_at)`,
+            [
+              String(gw.gatewayId),
+              gw.protocolVersion ?? "1.0",
+              gw.internet ?? "W",
+              gw.temperature ?? null,
+              gw.humidity ?? null,
+              gw.packetNumber ?? "0",
+              gw.meterType ?? "E",
+              gw.meterModel ?? "PM2230",
+              gw.meterId ?? "250384934",
+              gw.lastReadingTime ?? null,
+              gw.lastIsReplay ? 1 : 0,
+              gw.lastError ?? 0,
+              valuesJson,
+              gw.lastDisposition ?? "accepted",
+              lastSeen,
+              gw.timeUpdate || DEFAULT_TIME_UPDATE_SECONDS,
+            ],
+          )
+          .catch(() => undefined);
+
+        const modelCode = modelCodeForCategory(gw.meterModel ?? "PM2230") ?? 0;
+        const meterIdNum = Number(gw.meterId ?? 250384934);
+        const gatewayIdNum = Number(gw.gatewayId) || 1;
+        const packetNum = Number(gw.packetNumber) || 0;
+        const sampledUnix = gw.lastReadingTime && /^\d+$/.test(String(gw.lastReadingTime))
+          ? Number(gw.lastReadingTime)
+          : null;
+        const receivedSql = lastSeen.slice(0, 23).replace("T", " ").replace("Z", "");
+
+        if (valuesJson && Number.isSafeInteger(meterIdNum)) {
+          await emsDb
+            .execute(
+              `INSERT INTO gateway_meter_latest (
+                meter_model, meter_id, gateway_id, meter_type, packet_number, received_at,
+                sampled_unix, error_code, values_json
+              ) VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)
+              ON DUPLICATE KEY UPDATE
+                gateway_id = VALUES(gateway_id),
+                packet_number = VALUES(packet_number),
+                received_at = VALUES(received_at),
+                sampled_unix = VALUES(sampled_unix),
+                error_code = VALUES(error_code),
+                values_json = VALUES(values_json)`,
+              [
+                modelCode,
+                meterIdNum,
+                gatewayIdNum,
+                packetNum,
+                receivedSql,
+                sampledUnix,
+                gw.lastError ?? 0,
+                valuesJson,
+              ],
+            )
+            .catch(() => undefined);
+        }
+      }
+
+      const recentPackets = packets.slice(0, 35).reverse();
+      for (const pkt of recentPackets) {
+        if (!pkt?.gatewayId || !pkt?.meterId || !pkt?.values) continue;
+        const receivedAt = pkt.receivedAt || new Date().toISOString();
+        const receivedSql = receivedAt.slice(0, 23).replace("T", " ").replace("Z", "");
+        const valuesJson = JSON.stringify(pkt.values);
+        const modelCode = modelCodeForCategory(pkt.meterModel ?? "PM2230") ?? 0;
+        const meterIdNum = Number(pkt.meterId);
+        const gatewayIdNum = Number(pkt.gatewayId) || 1;
+        const packetNum = Number(pkt.packetNumber) || 0;
+        const sampledUnix =
+          pkt.readingTime && /^\d+$/.test(String(pkt.readingTime))
+            ? Number(pkt.readingTime)
+            : null;
+
+        if (pkt.disposition === "accepted" && Number.isSafeInteger(meterIdNum)) {
+          await emsDb
+            .execute(
+              `INSERT IGNORE INTO gateway_samples (
+                gateway_id, meter_type, meter_model, meter_id, packet_number, received_at,
+                sampled_unix, is_replay, error_code, crc_ok, values_json
+              ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+              [
+                gatewayIdNum,
+                modelCode,
+                meterIdNum,
+                packetNum,
+                receivedSql,
+                sampledUnix,
+                pkt.isReplay ? 1 : 0,
+                pkt.error ?? 0,
+                valuesJson,
+              ],
+            )
+            .catch(() => undefined);
+        }
+
+        const existingPkt = await queryRows<RowDataPacket>(
+          `SELECT 1 AS ok FROM gateway_packets
+            WHERE gateway_id = ? AND packet_number = ? AND reading_time_raw = ?
+            LIMIT 1`,
+          [String(pkt.gatewayId), String(pkt.packetNumber), String(pkt.readingTime)],
+        ).catch(() => []);
+
+        if (existingPkt.length === 0) {
+          const [inserted] = await emsDb
+            .execute<ResultSetHeader>(
+              `INSERT INTO gateway_packets (
+                received_at, disposition, protocol_version, internet, packet_number, gateway_id,
+                gateway_temperature, gateway_humidity, meter_type, meter_model, meter_id,
+                reading_time_raw, is_replay, error_code, values_json, date_time_alarm,
+                id_alarm, value_alarm, checksum, raw_text
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              [
+                receivedAt,
+                pkt.disposition || "accepted",
+                pkt.protocolVersion || "1.0",
+                pkt.internet || "W",
+                String(pkt.packetNumber),
+                String(pkt.gatewayId),
+                pkt.gatewayTemperature ?? null,
+                pkt.gatewayHumidity ?? null,
+                pkt.meterType || "E",
+                pkt.meterModel || "PM2230",
+                String(pkt.meterId),
+                String(pkt.readingTime),
+                pkt.isReplay ? 1 : 0,
+                pkt.error ?? 0,
+                valuesJson,
+                pkt.dateTimeAlarm ?? null,
+                pkt.idAlarm ?? null,
+                pkt.valueAlarm ?? null,
+                pkt.checksum || "",
+                pkt.rawText || "",
+              ],
+            )
+            .catch(() => [{ insertId: 0 } as ResultSetHeader]);
+
+          const packetId = Number(inserted?.insertId ?? 0);
+          if (pkt.disposition === "accepted" && pkt.rawText) {
+            const parsed = parseGatewayPacket(pkt.rawText);
+            if (parsed.packet) {
+              const conn = await emsDb.getConnection().catch(() => null);
+              if (conn) {
+                try {
+                  await insertAcceptedAlarms(conn, parsed.packet, packetId, receivedAt);
+                } catch {
+                  // Ignore alarm evaluation errors during sync
+                } finally {
+                  conn.release();
+                }
+              }
+            }
+          }
+        }
+      }
+    } catch (error) {
+      console.error("Upstream gateway sync error", error);
+    } finally {
+      upstreamSyncInFlight = null;
+    }
+  })();
+
+  return upstreamSyncInFlight;
+}
+
 export async function getGatewayConsole(input: { from?: string; to?: string; gatewayId?: string }): Promise<GatewayConsole> {
   await ensureGatewaySchema();
+  await syncFromUpstreamGateway();
   const filters = ["1=1"];
   const params: string[] = [];
   if (input.from) {
@@ -1037,6 +1344,7 @@ export async function getProjectGatewaySeries(
   const id = projectId.trim();
   if (!id) return [];
   await ensureGatewaySchema();
+  await syncFromUpstreamGateway();
 
   let points: Array<{
     id: string;
@@ -1098,6 +1406,7 @@ export async function getProjectGatewayLatest(projectId: string): Promise<Projec
   const id = projectId.trim();
   if (!id) return [];
   await ensureGatewaySchema();
+  await syncFromUpstreamGateway();
 
   let points: Array<{
     id: string;
@@ -1207,6 +1516,7 @@ async function queryProjectGatewayDaily(
   const id = projectId.trim();
   if (!id) return empty;
   await ensureGatewaySchema();
+  await syncFromUpstreamGateway();
 
   let points: Array<{
     id: string;
@@ -1345,6 +1655,7 @@ export async function getProjectGatewayEnergySlots(
   const id = projectId.trim();
   if (!id || !bounds) return empty;
   await ensureGatewaySchema();
+  await syncFromUpstreamGateway();
 
   let points: Array<{
     id: string;
@@ -1503,6 +1814,7 @@ function powerKwFromValues(values: Record<string, number>) {
 /** Telemetry cho danh sách dự án: phụ tải (Papt), GHG, trạng thái điểm đo. */
 export async function getProjectsListTelemetry(): Promise<ProjectListTelemetry[]> {
   await ensureGatewaySchema();
+  await syncFromUpstreamGateway();
 
   const meterRows = await queryRows<{
     projectId: string;
