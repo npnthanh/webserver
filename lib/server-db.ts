@@ -20,7 +20,7 @@ function poolConfig() {
     password: process.env.DB_PASSWORD || process.env.MYSQL_PASSWORD || "",
     database: process.env.DB_NAME || process.env.MYSQL_DATABASE || "ems_local",
     charset: "utf8mb4",
-    connectionLimit: 10,
+    connectionLimit: 4,
     waitForConnections: true,
     queueLimit: 0,
   };

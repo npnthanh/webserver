@@ -282,6 +282,7 @@ let lastUpstreamSyncAt = 0;
 let upstreamSyncInFlight: Promise<void> | null = null;
 let upstreamBackfillDone = false;
 let upstreamBackfillInFlight: Promise<void> | null = null;
+let cachedUpstreamConsole: Partial<GatewayConsole> | null = null;
 
 const DEFAULT_UPSTREAM_GATEWAY_URL = "https://webserver.demopage.top";
 
@@ -700,6 +701,7 @@ async function syncFromUpstreamGateway() {
       });
       if (!res.ok) return;
       const remote = (await res.json()) as Partial<GatewayConsole>;
+      cachedUpstreamConsole = remote;
       const gateways = Array.isArray(remote.gateways) ? remote.gateways : [];
       const packets = Array.isArray(remote.packets) ? remote.packets : [];
 
@@ -929,10 +931,16 @@ export async function getGatewayConsole(input: { from?: string; to?: string; gat
   }
   const alarmWhere = alarmFilters.join(" AND ");
 
-  const [gateways, statsRows, packetCountRows, packets, alarmCountRows, alarms, logCountRows, logs, thresholds] =
+  const safeQuery = <T = RowDataPacket>(sql: string, queryParams: unknown[] = []) =>
+    queryRows<T>(sql, queryParams).catch((err) => {
+      console.error("Gateway console query failed:", err);
+      return [] as T[];
+    });
+
+  const [gateways, statsRows, packets, alarmCountRows, alarms, logCountRows, logs, thresholds] =
     await Promise.all([
-      queryRows<RowDataPacket>("SELECT * FROM gateway_devices ORDER BY last_seen_at DESC, gateway_id"),
-      queryRows<RowDataPacket>(
+      safeQuery<RowDataPacket>("SELECT * FROM gateway_devices ORDER BY gateway_id"),
+      safeQuery<RowDataPacket>(
         `SELECT COUNT(*) AS total,
                 SUM(internet = 'W') AS wifi,
                 SUM(internet = 'S') AS sim,
@@ -943,42 +951,51 @@ export async function getGatewayConsole(input: { from?: string; to?: string; gat
            FROM gateway_packets WHERE ${where}`,
         params,
       ),
-      queryRows<RowDataPacket>(`SELECT COUNT(*) AS total FROM gateway_packets WHERE ${where}`, params),
-      queryRows<RowDataPacket>(
-        `SELECT * FROM gateway_packets WHERE ${where} ORDER BY received_at DESC, id DESC LIMIT 500`,
+      safeQuery<RowDataPacket>(
+        `SELECT * FROM gateway_packets WHERE ${where} ORDER BY id DESC LIMIT 100`,
         params,
       ),
-      queryRows<RowDataPacket>(`SELECT COUNT(*) AS total FROM gateway_alarms WHERE ${alarmWhere}`, alarmParams),
-      queryRows<RowDataPacket>(
-        `SELECT * FROM gateway_alarms WHERE ${alarmWhere} ORDER BY created_at DESC, id DESC LIMIT 500`,
+      safeQuery<RowDataPacket>(`SELECT COUNT(*) AS total FROM gateway_alarms WHERE ${alarmWhere}`, alarmParams),
+      safeQuery<RowDataPacket>(
+        `SELECT * FROM gateway_alarms WHERE ${alarmWhere} ORDER BY id DESC LIMIT 200`,
         alarmParams,
       ),
-      queryRows<RowDataPacket>(`SELECT COUNT(*) AS total FROM gateway_logs WHERE ${where}`, params),
-      queryRows<RowDataPacket>(
-        `SELECT * FROM gateway_logs WHERE ${where} ORDER BY received_at DESC, id DESC LIMIT 300`,
+      safeQuery<RowDataPacket>(`SELECT COUNT(*) AS total FROM gateway_logs WHERE ${where}`, params),
+      safeQuery<RowDataPacket>(
+        `SELECT * FROM gateway_logs WHERE ${where} ORDER BY id DESC LIMIT 100`,
         params,
       ),
-      queryRows<RowDataPacket>(
+      safeQuery<RowDataPacket>(
         `SELECT * FROM gateway_thresholds
           WHERE (? = '' OR gateway_id = '' OR gateway_id = ?)
-          ORDER BY gateway_id, meter_model, meter_id, parameter_name`,
+          ORDER BY id`,
         [input.gatewayId ?? "", input.gatewayId ?? ""],
       ),
     ]);
 
-  const packetViews = packets.map(mapPacket);
+  const mappedGateways = gateways.length
+    ? gateways.map(mapDevice)
+    : Array.isArray(cachedUpstreamConsole?.gateways)
+      ? cachedUpstreamConsole.gateways
+      : [];
+  const packetViews = packets.length
+    ? packets.map(mapPacket)
+    : Array.isArray(cachedUpstreamConsole?.packets)
+      ? cachedUpstreamConsole.packets.slice(0, 100)
+      : [];
   const parameters = new Set<string>();
-  for (const gateway of gateways) {
-    collectParameters(jsonField<Record<string, unknown> | null>(gateway.last_values, null), parameters);
+  for (const gateway of mappedGateways) {
+    collectParameters(gateway.lastValues ?? null, parameters);
   }
   for (const packet of packetViews) collectParameters(packet.values, parameters);
 
   const stats = statsRows[0] ?? {};
+  const totalPackets = asCount(stats.total) || packetViews.length;
   return {
     serverTime: serverTimeNow(),
-    gateways: gateways.map(mapDevice),
+    gateways: mappedGateways,
     stats: {
-      total: asCount(stats.total),
+      total: totalPackets,
       wifi: asCount(stats.wifi),
       sim: asCount(stats.sim),
       realtime: asCount(stats.realtime),
@@ -987,7 +1004,7 @@ export async function getGatewayConsole(input: { from?: string; to?: string; gat
       ignored: asCount(stats.ignored),
     },
     packets: packetViews,
-    packetCount: asCount(packetCountRows[0]?.total),
+    packetCount: totalPackets,
     alarms: alarms.map(mapAlarm),
     alarmCount: asCount(alarmCountRows[0]?.total),
     logs: logs.map(mapLog),
