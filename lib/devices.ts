@@ -18,6 +18,13 @@ export type DeviceExtraField = {
   value: string;
 };
 
+export type DeviceProjectLink = {
+  projectId: string;
+  projectName: string;
+  meterId: string;
+  meterName: string;
+};
+
 export type CatalogDevice = {
   id: string;
   name: string;
@@ -34,6 +41,8 @@ export type CatalogDevice = {
   image?: string;
   extraFields?: DeviceExtraField[];
   registers?: DeviceRegister[];
+  /** Chỉ đọc: các dự án/điểm đo đang gắn đồng hồ này (server tính). */
+  projects?: DeviceProjectLink[];
 };
 
 let devicesCache: CatalogDevice[] = [];
@@ -65,10 +74,14 @@ export function hydrateDevices() {
   if (devicesHydration) return devicesHydration;
   devicesHydration = dbFetch<CatalogDevice[]>("devices")
     .then((devices) => {
+      const prevJson = JSON.stringify(devicesCache);
       devicesCache = devices;
-      emitDbChange("devices");
+      if (prevJson !== JSON.stringify(devices)) {
+        emitDbChange("devices");
+      }
       return devicesCache;
     })
+    .catch(() => devicesCache)
     .finally(() => {
       devicesHydration = null;
     });

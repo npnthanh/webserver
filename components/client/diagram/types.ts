@@ -38,7 +38,20 @@ export type MeterNodeData = {
   listed?: boolean;
 };
 
+export type SourceNodeData = {
+  title: string;
+  subtitle: string;
+  energy: EnergyKind;
+  totalPowerText: string;
+  voltageText: string;
+  freqText: string;
+  normalCount: number;
+  warningCount: number;
+  offlineCount: number;
+};
+
 export type MeterFlowNode = Node<MeterNodeData, "meter">;
+export type SourceFlowNode = Node<SourceNodeData, "source">;
 export type JunctionFlowNode = Node<Record<string, never>, "junction">;
-export type DiagramNode = MeterFlowNode | JunctionFlowNode;
+export type DiagramNode = MeterFlowNode | SourceFlowNode | JunctionFlowNode;
 export type DiagramEdge = Edge;

@@ -1,768 +1,133 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { ChartTimeline } from "@/components/client/ChartTimeline";
-import {
-  buildSampleTableRows,
-  ChartDataTable,
-  ChartViewToolbar,
-  type ChartViewMode,
-} from "@/components/client/ChartViewToolbar";
-import { useChartSize } from "@/components/client/useChartSize";
-import { chartTimeLabel, chartTimeTicks, domainTicks, latestValue, paddedDomain, valuesForKey, type ChartSample } from "@/lib/gateway-series";
-import { getTimeFilterLabel, type TimeFilterValue } from "./TimeFilterBar";
+import { SampleTrendChart, type TrendSeriesConfig } from "@/components/client/SampleTrendChart";
+import { CustomSelect } from "@/components/ui/CustomSelect";
+import type { ChartSample } from "@/lib/gateway-series";
+import type { TimeFilterValue } from "./TimeFilterBar";
 
-const N = 160;
-const CHANNELS = [1, 2, 3] as const;
-const AGGS = ["MAX", "AVG", "MIN"] as const;
-const ORDERS = [3, 5, 7, 9, 11, 13] as const;
-const PHASES = [
-  { ch: 1, u: "U12", i: "I1", color: "#e53935", dark: "#9b1c1c" },
-  { ch: 2, u: "U23", i: "I2", color: "#43a047", dark: "#1b5e20" },
-  { ch: 3, u: "U31", i: "I3", color: "#1e88e5", dark: "#0d47a1" },
-] as const;
-
-type Channel = (typeof CHANNELS)[number];
-type Agg = (typeof AGGS)[number];
-type ThduComponent = "up" | "ud";
-type Series = { key: string; name: string; color: string; values: number[] };
-
-function toggleIn<T>(list: T[], value: T) {
-  if (list.includes(value)) return list.length === 1 ? list : list.filter((item) => item !== value);
-  return [...list, value];
-}
-
-function smoothPath(pts: [number, number][]) {
-  if (pts.length < 2) return "";
-  let d = `M ${pts[0][0]} ${pts[0][1]}`;
-  for (let i = 0; i < pts.length - 1; i++) {
-    const p0 = pts[i - 1] ?? pts[i];
-    const p1 = pts[i];
-    const p2 = pts[i + 1];
-    const p3 = pts[i + 2] ?? p2;
-    d += ` C ${p1[0] + (p2[0] - p0[0]) / 6} ${p1[1] + (p2[1] - p0[1]) / 6}, ${p2[0] - (p3[0] - p1[0]) / 6} ${p2[1] - (p3[1] - p1[1]) / 6}, ${p2[0]} ${p2[1]}`;
-  }
-  return d;
-}
-
-function thduKey(component: ThduComponent, ch: number) {
-  if (component === "ud") return ["THDVan", "THDVbn", "THDVcn"][ch - 1] ?? "THDVan";
-  return ["THDVab", "THDVbc", "THDVca"][ch - 1] ?? "THDVab";
-}
-
-function thdiKey(ch: number) {
-  return ["THDCa", "THDCb", "THDCc"][ch - 1] ?? "THDCa";
-}
-
-function harmOrderKey(kind: "u" | "i", ch: number, order: number) {
-  if (kind === "i") return `H${order}${["Ca", "Cb", "Cc"][ch - 1] ?? "Ca"}`;
-  return `H${order}${["Vab", "Vbc", "Vca"][ch - 1] ?? "Vab"}`;
-}
-
-function peakDomainFromSamples(samples: ChartSample[] | undefined, kind: "u" | "i", fallback: [number, number]) {
-  if (!samples?.length) return fallback;
-  const nums = [3, 5, 7, 9]
-    .flatMap((order) => [1, 2, 3].map((ch) => latestValue(samples, harmOrderKey(kind, ch, order))))
-    .filter((value): value is number => value != null);
-  if (!nums.length) return fallback;
-  const max = Math.max(...nums, 0);
-  return [0, max === 0 ? 1 : max * 1.2] as [number, number];
-}
-
-function orderColor(phase: (typeof PHASES)[number], order: number) {
-  return order <= 5 ? phase.color : phase.dark;
-}
-
-function harmDomain(kind: "u" | "i"): { domain: [number, number]; ticks: number[]; unit: string } {
-  return kind === "u"
-    ? { domain: [0, 6], ticks: [0, 2, 4, 6], unit: "[%]" }
-    : { domain: [0, 8], ticks: [0, 2, 4, 6, 8], unit: "[%]" };
-}
-
-function peakHarmDomain(kind: "u" | "i"): { domain: [number, number]; ticks: number[]; unit: string } {
-  return kind === "u"
-    ? { domain: [0, 15], ticks: [0, 5, 10, 15], unit: "[V]" }
-    : { domain: [0, 40], ticks: [0, 10, 20, 30, 40], unit: "[A]" };
-}
+type ThdMode = "v_phase" | "v_line" | "i";
+type HarmChannelGroup = "van" | "vll" | "curr";
 
 export function HarmonicsChart({
   samples,
-  timeFilter,
   onRefresh,
 }: {
   samples?: ChartSample[];
   timeFilter?: TimeFilterValue;
   onRefresh?: () => void;
 }) {
-  const [view, setView] = useState<ChartViewMode>("chart");
-  const [tab, setTab] = useState<"trend" | "peak">("trend");
-  const [thduComponents, setThduComponents] = useState<ThduComponent[]>(["up"]);
-  const [thduChannels, setThduChannels] = useState<Channel[]>([1, 2, 3]);
-  const [thdiChannels, setThdiChannels] = useState<Channel[]>([1, 2, 3]);
-  const [thduSum, setThduSum] = useState(false);
-  const [aggs, setAggs] = useState<Agg[]>(["AVG"]);
-  const [orders, setOrders] = useState<number[]>([5, 7]);
-  const [orderOpen, setOrderOpen] = useState(false);
-  const [hover, setHover] = useState<number | null>(null);
-  const [viewWin, setViewWin] = useState({ start: 0, end: N - 1 });
-  const [crosshair, setCrosshair] = useState(true);
+  const [thdMode, setThdMode] = useState<ThdMode>("v_phase");
+  const [orderGroup, setOrderGroup] = useState<HarmChannelGroup>("van");
+  const [selectedOrder, setSelectedOrder] = useState<number>(3);
 
-  const thduSeries = useMemo<Series[]>(
-    () => {
-      if (thduSum) {
-        return aggs.map((agg) => ({
-          key: `thdu-sum-${agg}`,
-          name: `THDu Sum ${agg}`,
-          color: "#0f9f6e",
-          values: (() => {
-            if (samples?.length) {
-              const live = thduChannels.flatMap((ch) =>
-                thduComponents
-                  .map((component) => valuesForKey(samples, thduKey(component, ch), N))
-                  .filter((series): series is number[] => series != null),
-              );
-              if (live.length) {
-                return Array.from({ length: N }, (_, i) =>
-                  Math.sqrt(live.reduce((sum, series) => sum + series[i] ** 2, 0) / live.length),
-                );
-              }
-            }
-            return Array.from({ length: N }, () => 0);
-          })(),
-        }));
-      }
+  const thdSeries = useMemo<TrendSeriesConfig[]>(() => {
+    if (thdMode === "v_phase") {
+      return [
+        { key: "THDVan", label: "THD_U_Ph1 (THDVan)", color: "#5470c6", unit: "%", digits: 2 },
+        { key: "THDVbn", label: "THD_U_Ph2 (THDVbn)", color: "#91cc75", unit: "%", digits: 2 },
+        { key: "THDVcn", label: "THD_U_Ph3 (THDVcn)", color: "#fac858", unit: "%", digits: 2 },
+        { key: "THDVln", label: "THD_U_Ph_avg (THDVln)", color: "#ee6666", unit: "%", digits: 2 },
+      ];
+    }
+    if (thdMode === "v_line") {
+      return [
+        { key: "THDVab", label: "THD_U_L12 (THDVab)", color: "#5470c6", unit: "%", digits: 2 },
+        { key: "THDVbc", label: "THD_U_L23 (THDVbc)", color: "#91cc75", unit: "%", digits: 2 },
+        { key: "THDVca", label: "THD_U_L31 (THDVca)", color: "#fac858", unit: "%", digits: 2 },
+        { key: "THDVll", label: "THD_U_LL_avg (THDVll)", color: "#ee6666", unit: "%", digits: 2 },
+      ];
+    }
+    return [
+      { key: "THDCa", label: "THD_I_Ph1 (THDCa)", color: "#5470c6", unit: "%", digits: 2 },
+      { key: "THDCb", label: "THD_I_Ph2 (THDCb)", color: "#91cc75", unit: "%", digits: 2 },
+      { key: "THDCc", label: "THD_I_Ph3 (THDCc)", color: "#fac858", unit: "%", digits: 2 },
+      { key: "THDCn", label: "THD_I_N (THDCn)", color: "#ee6666", unit: "%", digits: 2 },
+    ];
+  }, [thdMode]);
 
-      return thduComponents.flatMap((component) =>
-        thduChannels.flatMap((ch) => {
-          const phase = PHASES[ch - 1];
-          return aggs.map((agg) => ({
-            key: `thdu-${component}-${ch}-${agg}`,
-            name: `${phase.u} ${component === "up" ? "Up" : "Ud"} ${agg}`,
-            color: component === "up" ? phase.color : phase.dark,
-            values:
-              valuesForKey(samples, thduKey(component, ch), N) ?? Array.from({ length: N }, () => 0),
-          }));
-        }),
-      );
-    },
-    [thduChannels, thduComponents, thduSum, aggs, samples],
-  );
-
-  const thdiSeries = useMemo<Series[]>(
-    () =>
-      thdiChannels.flatMap((ch) => {
-        const phase = PHASES[ch - 1];
-        return aggs.map((agg) => ({
-          key: `thdi-${ch}-${agg}`,
-          name: `${phase.i} THDi ${agg}`,
-          color: phase.color,
-          values:
-            valuesForKey(samples, thdiKey(ch), N) ?? Array.from({ length: N }, () => 0),
-        }));
-      }),
-    [thdiChannels, aggs, samples],
-  );
-
-  const thduBase = harmDomain("u");
-  const thdiBase = harmDomain("i");
-  const thduLiveDomain = samples?.length ? paddedDomain(thduSeries, thduBase.domain) : thduBase.domain;
-  const thdiLiveDomain = samples?.length ? paddedDomain(thdiSeries, thdiBase.domain) : thdiBase.domain;
-  const thduScale = samples?.length
-    ? { ...thduBase, domain: thduLiveDomain, ticks: domainTicks(thduLiveDomain) }
-    : thduBase;
-  const thdiScale = samples?.length
-    ? { ...thdiBase, domain: thdiLiveDomain, ticks: domainTicks(thdiLiveDomain) }
-    : thdiBase;
-  const peakUScale = peakHarmDomain("u");
-  const peakIScale = peakHarmDomain("i");
-
-  const span = viewWin.end - viewWin.start;
-  const zoomIn = () => {
-    const next = Math.max(32, Math.floor(span * 0.7));
-    const mid = Math.floor((viewWin.start + viewWin.end) / 2);
-    const start = Math.max(0, mid - Math.floor(next / 2));
-    setViewWin({ start, end: Math.min(N - 1, start + next) });
-  };
-  const zoomOut = () => {
-    const next = Math.min(N - 1, Math.floor(span / 0.7));
-    const mid = Math.floor((viewWin.start + viewWin.end) / 2);
-    const start = Math.max(0, mid - Math.floor(next / 2));
-    setViewWin({ start, end: Math.min(N - 1, start + next) });
-  };
-
-  const timelineLabels = useMemo(
-    () => Array.from({ length: N }, (_, index) => chartTimeLabel(samples, index, N, "full") || ""),
-    [samples],
-  );
-  const timelineValues = thduSeries[0]?.values ?? Array.from({ length: N }, () => 0);
-
-  const trendColumns = useMemo(
-    () => [
-      { header: "Thời điểm" },
-      ...thduSeries.map((s) => ({ header: `${s.name} (%)`, color: s.color })),
-      ...thdiSeries.map((s) => ({ header: `${s.name} (%)`, color: s.color })),
-    ],
-    [thduSeries, thdiSeries],
-  );
-
-  const trendRows = useMemo(
-    () =>
-      buildSampleTableRows(
-        samples,
-        [
-          ...thduSeries.map((s) => ({ ...s, unit: "%", digits: 2 })),
-          ...thdiSeries.map((s) => ({ ...s, unit: "%", digits: 2 })),
-        ],
-        viewWin,
-        N,
-      ),
-    [samples, thduSeries, thdiSeries, viewWin],
-  );
-
-  const peakColumns = useMemo(
-    () => [
-      { header: "Bậc sóng hài" },
-      ...thduChannels.map((ch) => ({
-        header: `${PHASES[ch - 1].u} (V)`,
-        color: PHASES[ch - 1].color,
-      })),
-      ...thdiChannels.map((ch) => ({
-        header: `${PHASES[ch - 1].i} (A)`,
-        color: PHASES[ch - 1].color,
-      })),
-    ],
-    [thduChannels, thdiChannels],
-  );
-
-  const peakRows = useMemo(
-    () =>
-      ORDERS.map((order) => ({
-        label: `Bậc H${order}`,
-        values: [
-          ...thduChannels.map((ch) => {
-            const raw = Number(
-              (samples?.length ? latestValue(samples, harmOrderKey("u", ch, order)) ?? 0 : 0).toFixed(2),
-            );
-            return { raw, display: `${raw.toFixed(2)} V` };
-          }),
-          ...thdiChannels.map((ch) => {
-            const raw = Number(
-              (samples?.length ? latestValue(samples, harmOrderKey("i", ch, order)) ?? 0 : 0).toFixed(2),
-            );
-            return { raw, display: `${raw.toFixed(2)} A` };
-          }),
-        ],
-      })),
-    [samples, thduChannels, thdiChannels],
-  );
+  const orderSeries = useMemo<TrendSeriesConfig[]>(() => {
+    const h = `H${selectedOrder}`;
+    if (orderGroup === "van") {
+      return [
+        { key: `${h}Van`, label: `${h}_Van (Pha A-N)`, color: "#5470c6", unit: "%", digits: 2 },
+        { key: `${h}Vbn`, label: `${h}_Vbn (Pha B-N)`, color: "#91cc75", unit: "%", digits: 2 },
+        { key: `${h}Vcn`, label: `${h}_Vcn (Pha C-N)`, color: "#fac858", unit: "%", digits: 2 },
+      ];
+    }
+    if (orderGroup === "vll") {
+      return [
+        { key: `${h}Vab`, label: `${h}_Vab (Dây A-B)`, color: "#5470c6", unit: "%", digits: 2 },
+        { key: `${h}Vbc`, label: `${h}_Vbc (Dây B-C)`, color: "#91cc75", unit: "%", digits: 2 },
+        { key: `${h}Vca`, label: `${h}_Vca (Dây C-A)`, color: "#fac858", unit: "%", digits: 2 },
+      ];
+    }
+    return [
+      { key: `${h}Ca`, label: `${h}_Ca (Dòng pha A)`, color: "#5470c6", unit: "%", digits: 2 },
+      { key: `${h}Cb`, label: `${h}_Cb (Dòng pha B)`, color: "#91cc75", unit: "%", digits: 2 },
+      { key: `${h}Cc`, label: `${h}_Cc (Dòng pha C)`, color: "#fac858", unit: "%", digits: 2 },
+    ];
+  }, [orderGroup, selectedOrder]);
 
   return (
-    <section className="mt-4 w-full min-w-0 rounded-lg border border-slate-200 bg-white p-3 shadow-[0_1px_2px_rgba(16,24,40,0.04)] lg:p-4">
-      <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2">
-        <div className="inline-flex overflow-hidden rounded-lg border border-slate-200 bg-slate-100/80 p-0.5 text-[12px] font-medium shadow-2xs">
-          <button
-            type="button"
-            onClick={() => setTab("trend")}
-            className={`h-8 rounded-md px-3.5 transition-all ${
-              tab === "trend"
-                ? "bg-white font-semibold text-emerald-700 shadow-xs"
-                : "text-slate-600 hover:text-slate-900"
-            }`}
+    <div className="space-y-4">
+      <SampleTrendChart
+        title="Tổng biến dạng sóng hài (THD)"
+        unitLabel="%"
+        series={thdSeries}
+        samples={samples}
+        onRefresh={onRefresh}
+        startAtZero
+        headerControls={
+          <CustomSelect
+            value={thdMode}
+            onChange={(e) => setThdMode(e.target.value as ThdMode)}
+            className="h-8 min-w-[230px] rounded-md border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-700 outline-none focus:border-emerald-500"
           >
-            Biểu đồ xu hướng
-          </button>
-          <button
-            type="button"
-            onClick={() => setTab("peak")}
-            className={`h-8 rounded-md px-3.5 transition-all ${
-              tab === "peak"
-                ? "bg-white font-semibold text-emerald-700 shadow-xs"
-                : "text-slate-600 hover:text-slate-900"
-            }`}
-          >
-            Mức đỉnh bậc
-          </button>
-        </div>
-        <ChartViewToolbar view={view} onViewChange={setView} onRefresh={onRefresh} />
-      </div>
+            <option value="v_phase">THD Điện áp pha (THDVan, THDVbn, THDVcn, THDVln)</option>
+            <option value="v_line">THD Điện áp dây (THDVab, THDVbc, THDVca, THDVll)</option>
+            <option value="i">THD Dòng điện (THDCa, THDCb, THDCc, THDCn)</option>
+          </CustomSelect>
+        }
+      />
 
-      <div className="mb-3 rounded border border-slate-300 bg-slate-50/80 px-3 py-2">
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <div className="space-y-1.5">
-            <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
-              <span className="w-12 text-[12px] font-semibold text-slate-700">THDu:</span>
-              <Check
-                checked={thduComponents.includes("up")}
-                onChange={() => setThduComponents((list) => toggleIn(list, "up"))}
-              >
-                Up
-              </Check>
-              <Check
-                checked={thduComponents.includes("ud")}
-                onChange={() => setThduComponents((list) => toggleIn(list, "ud"))}
-              >
-                Ud
-              </Check>
-              <Check checked={thduSum} onChange={() => setThduSum((checked) => !checked)}>
-                Sum
-              </Check>
-              {CHANNELS.map((ch) => (
-                <Check
-                  key={`thdu-${ch}`}
-                  checked={thduChannels.includes(ch)}
-                  onChange={() => setThduChannels((list) => toggleIn(list, ch))}
+      <SampleTrendChart
+        title={`Sóng hài theo bậc (Bậc H${selectedOrder} — 36 tham số H3..H9)`}
+        unitLabel="%"
+        series={orderSeries}
+        samples={samples}
+        onRefresh={onRefresh}
+        startAtZero
+        headerControls={
+          <div className="flex flex-wrap items-center gap-2">
+            <CustomSelect
+              value={orderGroup}
+              onChange={(e) => setOrderGroup(e.target.value as HarmChannelGroup)}
+              className="h-8 min-w-[200px] rounded-md border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-700 outline-none focus:border-emerald-500"
+            >
+              <option value="van">Sóng hài Điện áp pha (Van, Vbn, Vcn)</option>
+              <option value="vll">Sóng hài Điện áp dây (Vab, Vbc, Vca)</option>
+              <option value="curr">Sóng hài Dòng điện (Ca, Cb, Cc)</option>
+            </CustomSelect>
+            <div className="inline-flex rounded-md border border-slate-200 bg-slate-50 p-0.5">
+              {[3, 5, 7, 9].map((ord) => (
+                <button
+                  key={ord}
+                  type="button"
+                  onClick={() => setSelectedOrder(ord)}
+                  className={`h-7 rounded px-2.5 text-xs font-semibold transition-colors ${
+                    selectedOrder === ord
+                      ? "bg-emerald-600 text-white shadow-2xs"
+                      : "text-slate-600 hover:text-slate-900"
+                  }`}
                 >
-                  {ch}
-                </Check>
-              ))}
-            </div>
-            <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
-              <span className="w-12 text-[12px] font-semibold text-slate-700">THDi:</span>
-              {CHANNELS.map((ch) => (
-                <Check
-                  key={`thdi-${ch}`}
-                  checked={thdiChannels.includes(ch)}
-                  onChange={() => setThdiChannels((list) => toggleIn(list, ch))}
-                >
-                  {ch}
-                </Check>
+                  Bậc H{ord}
+                </button>
               ))}
             </div>
           </div>
-          <div className="flex items-center gap-3 pt-0.5">
-            <div className="flex items-center gap-3 rounded border border-slate-200 bg-white px-2.5 py-1 text-[12px] text-slate-600">
-              {AGGS.map((agg) => (
-                <Check key={agg} checked={aggs.includes(agg)} onChange={() => setAggs((list) => toggleIn(list, agg))}>
-                  {agg}
-                </Check>
-              ))}
-            </div>
-            <div className="relative">
-              <button
-                type="button"
-                onClick={() => setOrderOpen((v) => !v)}
-                className={`h-8 rounded border px-3 text-[12px] font-medium ${
-                  orderOpen ? "border-emerald-600 bg-emerald-50 text-emerald-700" : "border-slate-300 bg-white text-slate-600"
-                }`}
-              >
-                Order
-              </button>
-              {orderOpen ? (
-                <div className="absolute right-0 z-20 mt-1 w-32 rounded border border-slate-200 bg-white p-2 shadow-md">
-                  {ORDERS.map((order) => (
-                    <Check
-                      key={order}
-                      checked={orders.includes(order)}
-                      onChange={() => setOrders((list) => toggleIn(list, order))}
-                    >
-                      H{order}
-                    </Check>
-                  ))}
-                </div>
-              ) : null}
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {view === "chart" ? (
-        <>
-          {tab === "trend" ? (
-            <>
-              <div className="mb-2">
-                <ChartTimeline compact labels={timelineLabels} values={timelineValues} range={viewWin} onRange={setViewWin} />
-              </div>
-              <div className="min-w-0 w-full overflow-hidden rounded-[2px] border border-slate-400 bg-white">
-                <HarmPane
-                  title={`THDu ${thduScale.unit}`}
-                  series={thduSeries}
-                  samples={samples}
-                  viewWin={viewWin}
-                  hover={crosshair ? hover : null}
-                  onHover={setHover}
-                  domain={thduScale.domain}
-                  ticks={thduScale.ticks}
-                  formatTick={(v) => String(v)}
-                />
-                <div className="h-px bg-slate-400" />
-                <HarmPane
-                  title={`THDi ${thdiScale.unit}`}
-                  series={thdiSeries}
-                  samples={samples}
-                  viewWin={viewWin}
-                  hover={crosshair ? hover : null}
-                  onHover={setHover}
-                  domain={thdiScale.domain}
-                  ticks={thdiScale.ticks}
-                  formatTick={(v) => String(v)}
-                  axis
-                />
-              </div>
-            </>
-          ) : (
-            <PeakOrderView
-              uCh={thduChannels}
-              iCh={thdiChannels}
-              orders={orders}
-              samples={samples}
-              uTitle={`U harmonic ${peakUScale.unit}`}
-              iTitle={`I harmonic ${peakIScale.unit}`}
-              uDomain={peakDomainFromSamples(samples, "u", peakUScale.domain)}
-              iDomain={peakDomainFromSamples(samples, "i", peakIScale.domain)}
-            />
-          )}
-
-          <div className="mt-2 flex w-[68px] flex-wrap gap-1">
-            <ToolBtn label="Phóng to" onClick={zoomIn}>
-              <ZoomIcon plus />
-            </ToolBtn>
-            <ToolBtn label="Thu nhỏ" onClick={zoomOut}>
-              <ZoomIcon plus={false} />
-            </ToolBtn>
-            <ToolBtn label="Vừa khung" onClick={() => setViewWin({ start: 0, end: N - 1 })}>
-              <FitIcon />
-            </ToolBtn>
-            <ToolBtn label="Con trỏ" active={crosshair} onClick={() => setCrosshair((v) => !v)}>
-              <CursorIcon />
-            </ToolBtn>
-          </div>
-        </>
-      ) : tab === "trend" ? (
-        <ChartDataTable
-          title="Biểu đồ Sóng hài xu hướng (THDu / THDi)"
-          subtitle={timeFilter ? `Kỳ hiển thị: ${getTimeFilterLabel(timeFilter)}` : undefined}
-          filename="bieu-do-song-hai-xu-huong"
-          columns={trendColumns}
-          rows={trendRows}
-        />
-      ) : (
-        <ChartDataTable
-          title="Biểu đồ Sóng hài theo mức đỉnh bậc (H3 - H13)"
-          subtitle={timeFilter ? `Kỳ hiển thị: ${getTimeFilterLabel(timeFilter)}` : undefined}
-          filename="bieu-do-song-hai-dinh-bac"
-          columns={peakColumns}
-          rows={peakRows}
-          rowCountLabel={`Bảng số liệu sóng hài (${peakRows.length} bậc)`}
-        />
-      )}
-    </section>
-  );
-}
-
-function Check({
-  checked,
-  onChange,
-  children,
-}: {
-  checked: boolean;
-  onChange: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <label className="flex cursor-pointer items-center gap-1 text-[12px] text-slate-600">
-      <input type="checkbox" checked={checked} onChange={onChange} className="accent-emerald-600" />
-      {children}
-    </label>
-  );
-}
-
-function HarmPane({
-  title,
-  series,
-  samples,
-  viewWin,
-  hover,
-  onHover,
-  domain,
-  ticks,
-  formatTick,
-  axis = false,
-}: {
-  title: string;
-  series: Series[];
-  samples?: ChartSample[];
-  viewWin: { start: number; end: number };
-  hover: number | null;
-  onHover: (index: number | null) => void;
-  domain: [number, number];
-  ticks: number[];
-  formatTick: (value: number) => string;
-  axis?: boolean;
-}) {
-  const { ref, width: W, height: H } = useChartSize();
-  const pad = { l: 58, r: 10, t: 10, b: axis ? 40 : 10 };
-  const innerW = W - pad.l - pad.r;
-  const innerH = H - pad.t - pad.b;
-  const [yMin, yMax] = domain;
-  const xAt = (i: number) =>
-    pad.l + ((i - viewWin.start) / Math.max(1, viewWin.end - viewWin.start)) * innerW;
-  const yAt = (v: number) => pad.t + ((yMax - v) / (yMax - yMin || 1)) * innerH;
-
-  const timeTicks = axis ? chartTimeTicks(viewWin.start, viewWin.end) : [];
-  const timeLabel = (index: number, kind: "full" | "min" | "sec") =>
-    chartTimeLabel(samples, index, N, kind);
-
-  return (
-    <div ref={ref} className="h-[160px] w-full min-w-0 sm:h-[176px]">
-    {W > 0 && H > 0 ? (
-    <svg
-      viewBox={`0 0 ${W} ${H}`}
-      className="block h-full w-full"
-      onMouseLeave={() => onHover(null)}
-      onMouseMove={(e) => {
-        const box = e.currentTarget.getBoundingClientRect();
-        const x = ((e.clientX - box.left) / box.width) * W;
-        const t = (x - pad.l) / innerW;
-        const i = Math.round(viewWin.start + t * (viewWin.end - viewWin.start));
-        onHover(Math.max(viewWin.start, Math.min(viewWin.end, i)));
-      }}
-    >
-      <rect x={pad.l} y={pad.t} width={innerW} height={innerH} fill="white" stroke="#6b7280" />
-      <text x="14" y={H / 2} className="fill-slate-600" fontSize="11" transform={`rotate(-90 14 ${H / 2})`}>
-        {title}
-      </text>
-      {ticks.map((v) => {
-        const y = yAt(v);
-        return (
-          <g key={v}>
-            <line x1={pad.l} x2={W - pad.r} y1={y} y2={y} stroke="#e5e7eb" />
-            <text x={pad.l - 6} y={y + 3} textAnchor="end" className="fill-slate-500" fontSize="10">
-              {formatTick(v)}
-            </text>
-          </g>
-        );
-      })}
-      {Array.from({ length: 9 }, (_, n) => {
-        const i = viewWin.start + ((viewWin.end - viewWin.start) * n) / 8;
-        return <line key={n} x1={xAt(i)} x2={xAt(i)} y1={pad.t} y2={H - pad.b} stroke="#eef0f2" />;
-      })}
-      {series.map((s) => {
-        const pts: [number, number][] = [];
-        for (let i = viewWin.start; i <= viewWin.end; i++) pts.push([xAt(i), yAt(s.values[i])]);
-        return (
-          <path
-            key={s.key}
-            d={smoothPath(pts)}
-            fill="none"
-            stroke={s.color}
-            strokeWidth="1.5"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          />
-        );
-      })}
-      {hover != null ? (
-        <line x1={xAt(hover)} x2={xAt(hover)} y1={pad.t} y2={H - pad.b} stroke="#94a3b8" strokeDasharray="3 3" />
-      ) : null}
-      {timeTicks.map((tick) => (
-        <text
-          key={`${tick.i}-${tick.kind}`}
-          x={xAt(tick.i)}
-          y={H - 10}
-          textAnchor="middle"
-          className="fill-slate-600"
-          fontSize="10"
-        >
-          {timeLabel(tick.i, tick.kind)}
-        </text>
-      ))}
-    </svg>
-    ) : null}
-    </div>
-  );
-}
-
-function PeakOrderView({
-  uCh,
-  iCh,
-  orders,
-  samples,
-  uTitle,
-  iTitle,
-  uDomain,
-  iDomain,
-}: {
-  uCh: Channel[];
-  iCh: Channel[];
-  orders: number[];
-  samples?: ChartSample[];
-  uTitle: string;
-  iTitle: string;
-  uDomain: [number, number];
-  iDomain: [number, number];
-}) {
-  const showOrders = [...ORDERS];
-  return (
-    <div className="overflow-hidden rounded-[2px] border border-slate-400 bg-white">
-      <PeakPane
-        title={uTitle}
-        domain={uDomain}
-        channels={uCh}
-        orders={showOrders}
-        highlight={orders}
-        values={(ch, order) => {
-          if (samples?.length) return latestValue(samples, harmOrderKey("u", ch, order)) ?? 0;
-          return 0;
-        }}
-        kind="u"
-      />
-      <div className="h-px bg-slate-400" />
-      <PeakPane
-        title={iTitle}
-        domain={iDomain}
-        channels={iCh}
-        orders={showOrders}
-        highlight={orders}
-        values={(ch, order) => {
-          if (samples?.length) return latestValue(samples, harmOrderKey("i", ch, order)) ?? 0;
-          return 0;
-        }}
-        kind="i"
-        axis
+        }
       />
     </div>
-  );
-}
-
-function PeakPane({
-  title,
-  domain,
-  channels,
-  orders,
-  highlight,
-  values,
-  kind,
-  axis = false,
-}: {
-  title: string;
-  domain: [number, number];
-  channels: Channel[];
-  orders: readonly number[];
-  highlight: number[];
-  values: (ch: Channel, order: number) => number;
-  kind: "u" | "i";
-  axis?: boolean;
-}) {
-  const { ref, width: W, height: H } = useChartSize();
-  const pad = { l: 58, r: 16, t: 12, b: axis ? 36 : 12 };
-  const innerW = W - pad.l - pad.r;
-  const innerH = H - pad.t - pad.b;
-  const [yMin, yMax] = domain;
-  const yAt = (v: number) => pad.t + ((yMax - v) / (yMax - yMin || 1)) * innerH;
-  const groupW = innerW / orders.length;
-  const barW = Math.max(4, (groupW * 0.62) / Math.max(1, channels.length));
-
-  return (
-    <div ref={ref} className="h-[180px] w-full min-w-0 sm:h-[220px]">
-    {W > 0 && H > 0 ? (
-    <svg
-      viewBox={`0 0 ${W} ${H}`}
-      className="block h-full w-full"
-    >
-      <rect x={pad.l} y={pad.t} width={innerW} height={innerH} fill="white" stroke="#6b7280" />
-      <text x="14" y={H / 2} className="fill-slate-600" fontSize="11" transform={`rotate(-90 14 ${H / 2})`}>
-        {title}
-      </text>
-      {[0, 1, 2, 3, 4].map((n) => {
-        const v = yMin + ((yMax - yMin) * n) / 4;
-        const y = yAt(v);
-        return (
-          <g key={n}>
-            <line x1={pad.l} x2={W - pad.r} y1={y} y2={y} stroke="#e5e7eb" />
-            <text x={pad.l - 6} y={y + 3} textAnchor="end" className="fill-slate-500" fontSize="10">
-              {Number.isInteger(v) ? v : v.toFixed(1)}
-            </text>
-          </g>
-        );
-      })}
-      {orders.map((order, oi) => {
-        const gx = pad.l + oi * groupW;
-        return (
-          <g key={order}>
-            {channels.map((ch, ci) => {
-              const phase = PHASES[ch - 1];
-              const v = Math.min(yMax, Math.max(yMin, values(ch, order)));
-              const x = gx + groupW * 0.19 + ci * barW;
-              const y = yAt(v);
-              const h = Math.max(1, yAt(yMin) - y);
-              return (
-                <rect
-                  key={ch}
-                  x={x}
-                  y={y}
-                  width={barW - 1}
-                  height={h}
-                  fill={kind === "u" ? phase.color : orderColor(phase, order)}
-                  opacity={highlight.includes(order) ? 1 : 0.35}
-                />
-              );
-            })}
-            {axis ? (
-              <text x={gx + groupW / 2} y={H - 10} textAnchor="middle" className="fill-slate-600" fontSize="10">
-                {order}
-              </text>
-            ) : null}
-          </g>
-        );
-      })}
-    </svg>
-    ) : null}
-    </div>
-  );
-}
-
-function ToolBtn({
-  children,
-  label,
-  onClick,
-  active = false,
-}: {
-  children: React.ReactNode;
-  label: string;
-  onClick: () => void;
-  active?: boolean;
-}) {
-  return (
-    <button
-      type="button"
-      title={label}
-      onClick={onClick}
-      className={`flex h-7 w-7 items-center justify-center rounded-sm border text-slate-500 ${
-        active ? "border-emerald-600 bg-emerald-50 text-emerald-700" : "border-slate-300 bg-white hover:bg-slate-50"
-      }`}
-    >
-      {children}
-    </button>
-  );
-}
-
-function ZoomIcon({ plus }: { plus: boolean }) {
-  return (
-    <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" aria-hidden>
-      <circle cx="10.5" cy="10.5" r="5.5" stroke="currentColor" strokeWidth="1.7" />
-      <path d="m15 15 4 4" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
-      <path
-        d={plus ? "M10.5 8v5M8 10.5h5" : "M8 10.5h5"}
-        stroke="currentColor"
-        strokeWidth="1.7"
-        strokeLinecap="round"
-      />
-    </svg>
-  );
-}
-
-function FitIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" aria-hidden>
-      <path d="M8 5H5v3M16 5h3v3M8 19H5v-3M16 19h3v-3" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
-    </svg>
-  );
-}
-
-function CursorIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" aria-hidden>
-      <path d="M12 4v16M4 12h16" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
-    </svg>
   );
 }

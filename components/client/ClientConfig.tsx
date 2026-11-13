@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useParams } from "next/navigation";
 import { CustomSelect } from "@/components/ui/CustomSelect";
 import { useEffect, useMemo, useState, type DragEvent } from "react";
@@ -27,6 +28,7 @@ import {
   type CustomerBranchRole,
 } from "@/lib/customer-accounts";
 import { loadDevices, type CatalogDevice } from "@/lib/devices";
+import { hasPermission } from "@/lib/permissions";
 import { hydrateProjects, loadProjects, resolveMeterTypes } from "@/lib/projects";
 import {
   DEFAULT_VOLTAGE_LEVEL,
@@ -37,6 +39,7 @@ import {
   INDUSTRIAL_VOLTAGE_LEVELS,
   pricesForLevel,
   resolveTouPrices,
+  type TariffHistoryEntry,
   type TouBand,
   type VoltageLevelId,
 } from "@/lib/industrial-electricity";
@@ -55,6 +58,7 @@ import {
   type UserAlertGroupId,
   type UserAlertRule,
 } from "@/lib/alert-config";
+import { hydrateAlertEvents } from "@/lib/alert-events";
 import { loadProjectGatewayLatest } from "@/lib/gateway-series";
 import {
   METER_PARAMETERS,
@@ -114,6 +118,7 @@ type SavedCostConfig = {
   utility?: string;
   applyDate?: string;
   slots?: Slot[];
+  tariffHistory?: TariffHistoryEntry[];
   flatPrices?: Record<string, string>;
   electricity?: {
     voltageLevel?: VoltageLevelId;
@@ -143,6 +148,7 @@ export function ClientConfig() {
   const [meters, setMeters] = useState<ClientMeter[]>([]);
   const [devices, setDevices] = useState<CatalogDevice[]>([]);
   const [slots, setSlots] = useState<Slot[]>([]);
+  const [tariffHistory, setTariffHistory] = useState<TariffHistoryEntry[]>([]);
   const [applyDate, setApplyDate] = useState("");
   const [flatPrices, setFlatPrices] = useState<Record<string, string>>({});
   const [voltageLevel, setVoltageLevel] = useState<VoltageLevelId>(DEFAULT_VOLTAGE_LEVEL);
@@ -163,6 +169,14 @@ export function ClientConfig() {
     () => canEditCustomerConfig(session, projectId),
     [session, projectId],
   );
+
+  /** Thêm điểm đo dùng form quản trị: chỉ hiện với tài khoản quản trị có quyền quản lý dự án. */
+  const addMeterHref = useMemo(() => {
+    if (!hasPermission(session, "manageProjects")) return undefined;
+    const id = encodeURIComponent(projectId);
+    const returnTo = `/du-an/${id}/cau-hinh?tab=meters`;
+    return `/chinh-sua-du-an/${id}/them-diem-do?returnTo=${encodeURIComponent(returnTo)}`;
+  }, [session, projectId]);
 
   const [classify, setClassify] = useState("Thông tin chung (Info)");
   const [startTime, setStartTime] = useState("");
@@ -247,7 +261,10 @@ export function ClientConfig() {
     }
 
     const savedAlerts = settings.alertsConfig as SavedAlertsConfig | undefined;
-    const normalized = normalizeAlertConfig(savedAlerts);
+    const normalized = normalizeAlertConfig(
+      savedAlerts,
+      (settings as Record<string, unknown>).alertConfig,
+    );
     setAlertClassify(normalized.classify ?? "Cấu hình ngưỡng theo thông số đo");
     setAlertCategories(normalized.categories);
     setActiveAlertGroupId((current) =>
@@ -264,6 +281,7 @@ export function ClientConfig() {
     if (!savedCost) {
       setApplyDate("");
       setSlots([]);
+      setTariffHistory([]);
       setFlatPrices({});
       setVoltageLevel(DEFAULT_VOLTAGE_LEVEL);
       setTouPrices(tariffInputs(DEFAULT_VOLTAGE_LEVEL));
@@ -271,6 +289,7 @@ export function ClientConfig() {
     }
     setApplyDate(savedCost.applyDate ?? "");
     setSlots(savedCost.slots?.length ? savedCost.slots.map((slot) => ({ ...slot })) : []);
+    setTariffHistory(savedCost.tariffHistory?.length ? savedCost.tariffHistory.map((h) => ({ ...h })) : []);
     setFlatPrices(savedCost.flatPrices ? { ...savedCost.flatPrices } : {});
     const tariff = resolveTouPrices(savedCost.electricity?.voltageLevel, savedCost.electricity?.prices);
     setVoltageLevel(tariff.levelId);
@@ -336,6 +355,7 @@ export function ClientConfig() {
           },
         });
         applyCostSettings(stored);
+        void hydrateAlertEvents(projectId, { force: true }).catch(() => undefined);
       } else if (tab === "alerts") {
         const stored = await saveProjectSettings(projectId, {
           alertsConfig: {
@@ -353,6 +373,7 @@ export function ClientConfig() {
           },
         });
         applyCostSettings(stored);
+        void hydrateAlertEvents(projectId, { force: true }).catch(() => undefined);
         // Đồng bộ các quy tắc ngưỡng đang bật xuống bảng gateway_thresholds
         const allRules = Object.values(alertRulesByGroup).flat();
         for (const rule of allRules) {
@@ -376,7 +397,7 @@ export function ClientConfig() {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify({
-              action: "saveThreshold",
+              action: "threshold",
               gatewayId: "",
               meterModel: "",
               meterId,
@@ -387,11 +408,29 @@ export function ClientConfig() {
           }).catch(() => undefined);
         }
       } else if (tab === "cost") {
+        // Tự động ghi mốc lịch sử biểu giá theo ngày bắt đầu áp dụng (applyDate) để bảo toàn kỳ tính giá trước đó
+        let nextHistory = [...tariffHistory];
+        if (applyDate) {
+          const entry: TariffHistoryEntry = {
+            applyDate,
+            voltageLevel,
+            prices: { ...touPrices },
+            slots: slots.map((s) => ({ ...s })),
+          };
+          const existingIdx = nextHistory.findIndex((item) => item.applyDate === applyDate);
+          if (existingIdx >= 0) {
+            nextHistory[existingIdx] = entry;
+          } else {
+            nextHistory.push(entry);
+          }
+          nextHistory = nextHistory.sort((a, b) => a.applyDate.localeCompare(b.applyDate));
+        }
         const stored = await saveProjectSettings(projectId, {
           costConfig: {
             utility,
             applyDate,
             slots,
+            tariffHistory: nextHistory,
             flatPrices,
             electricity: {
               voltageLevel,
@@ -402,6 +441,8 @@ export function ClientConfig() {
         applyCostSettings(stored);
       } else {
         await saveClientMeters(projectId, meters);
+        const refreshed = await hydrateClientMeters(projectId);
+        if (refreshed.length) setMeters(refreshed);
       }
       setSaved(true);
       window.setTimeout(() => setSaved(false), 1600);
@@ -547,6 +588,7 @@ export function ClientConfig() {
                 onUtility={setUtility}
                 meters={visibleMeters}
                 devices={devices}
+                addMeterHref={addMeterHref}
                 onMetersChange={(nextVisible) => {
                   if (!canEditConfig) return;
                   setMeters((current) => {
@@ -566,6 +608,10 @@ export function ClientConfig() {
                 onApplyDate={setApplyDate}
                 voltageLevel={voltageLevel}
                 touPrices={touPrices}
+                slots={slots}
+                onSlotsChange={setSlots}
+                tariffHistory={tariffHistory}
+                onTariffHistoryChange={setTariffHistory}
                 onVoltageLevel={(levelId) => {
                   setVoltageLevel(levelId);
                   setTouPrices(tariffInputs(levelId));
@@ -802,6 +848,7 @@ function MetersPanel({
   onUtility,
   meters,
   devices,
+  addMeterHref,
   onMetersChange,
 }: {
   utility: Utility;
@@ -809,6 +856,7 @@ function MetersPanel({
   onUtility: (v: Utility) => void;
   meters: Meter[];
   devices: CatalogDevice[];
+  addMeterHref?: string;
   onMetersChange: (rows: Meter[]) => void;
 }) {
   const [dragId, setDragId] = useState<string | null>(null);
@@ -856,10 +904,20 @@ function MetersPanel({
     <div>
       <div className="flex flex-wrap items-center justify-between gap-3">
         <UtilityTabs value={utility} options={utilities} onChange={onUtility} />
-        <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-3 py-1 text-xs font-semibold text-emerald-800 ring-1 ring-emerald-600/20">
-          <span className="h-1.5 w-1.5 rounded-full bg-emerald-600" />
-          Kéo thả hoặc chọn điểm cha để phân cấp
-        </span>
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-3 py-1 text-xs font-semibold text-emerald-800 ring-1 ring-emerald-600/20">
+            <span className="h-1.5 w-1.5 rounded-full bg-emerald-600" />
+            Kéo thả hoặc chọn điểm cha để phân cấp
+          </span>
+          {addMeterHref ? (
+            <Link
+              href={addMeterHref}
+              className="inline-flex h-8 items-center gap-1 rounded-lg bg-emerald-600 px-3 text-xs font-semibold text-white shadow-sm transition-colors hover:bg-emerald-700"
+            >
+              + Thêm điểm đo
+            </Link>
+          ) : null}
+        </div>
       </div>
       <p className="mt-3 text-[12px] text-slate-500">
         Kéo thả các hàng hoặc chọn trong cột <span className="font-semibold text-slate-700">ĐIỂM CHA</span> để thiết lập quan hệ cây phân cấp cha–con. Cấu trúc cây sẽ tự động đồng bộ và hiển thị trên <span className="font-semibold text-emerald-700">Sơ đồ hệ thống</span>.
@@ -974,30 +1032,83 @@ function MetersPanel({
                       </CustomSelect>
                     </td>
                     <td className="py-3 pr-2">
-                      {assigned ? (
-                        <div>
-                          <span className="inline-flex items-center gap-1.5 rounded-md border border-emerald-200 bg-emerald-50 px-2 py-1 text-[12px] font-medium text-emerald-800">
-                            <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
-                            {assigned.name} · {assigned.sn}
-                          </span>
-                          <span className="mt-0.5 block truncate text-[10px] text-slate-400">
-                            ID: {assigned.id}
-                          </span>
-                        </div>
-                      ) : item.serialNumber ? (
-                        <div>
+                      <div className="space-y-1.5">
+                        {assigned ? (
+                          <div>
+                            <span className="inline-flex items-center gap-1.5 rounded-md border border-emerald-200 bg-emerald-50 px-2 py-1 text-[12px] font-medium text-emerald-800">
+                              <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                              {assigned.name} · {assigned.sn}
+                            </span>
+                            <span className="mt-0.5 block truncate text-[10px] text-slate-400">
+                              ID: {assigned.id}
+                            </span>
+                          </div>
+                        ) : item.serialNumber ? (
+                          <div>
+                            <span className="inline-flex items-center rounded-md border border-amber-200 bg-amber-50 px-2 py-1 text-[12px] font-medium text-amber-700">
+                              Serial: {item.serialNumber}
+                            </span>
+                          </div>
+                        ) : (
                           <span className="inline-flex items-center rounded-md border border-amber-200 bg-amber-50 px-2 py-1 text-[12px] font-medium text-amber-700">
-                            Serial: {item.serialNumber}
+                            Chưa gán thiết bị
                           </span>
-                          <span className="mt-0.5 block text-[10px] text-slate-400">
-                            Chờ ghép nối đồng hồ
-                          </span>
+                        )}
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <CustomSelect
+                            value={item.deviceId ?? ""}
+                            onChange={(e) => {
+                              const nextDevId = e.target.value;
+                              const dev = devices.find((d) => d.id === nextDevId);
+                              onMetersChange(
+                                meters.map((m) =>
+                                  m.id === item.id
+                                    ? {
+                                        ...m,
+                                        deviceId: nextDevId,
+                                        serialNumber: dev?.sn ?? m.serialNumber ?? "",
+                                      }
+                                    : m,
+                                ),
+                              );
+                            }}
+                            className="h-7 max-w-[180px] rounded border border-slate-200 bg-white px-2 text-[11px] font-medium text-slate-700 outline-none focus:border-emerald-500"
+                          >
+                            <option value="">-- Đổi / Gán đồng hồ --</option>
+                            {devices.map((dev) => (
+                              <option key={dev.id} value={dev.id}>
+                                {dev.name} ({dev.sn})
+                              </option>
+                            ))}
+                          </CustomSelect>
+                          <input
+                            value={item.serialNumber ?? assigned?.sn ?? ""}
+                            onChange={(e) => {
+                              const sn = e.target.value;
+                              onMetersChange(
+                                meters.map((m) =>
+                                  m.id === item.id ? { ...m, serialNumber: sn } : m,
+                                ),
+                              );
+                            }}
+                            placeholder="Nhập SN công tơ mới..."
+                            title="Thay đổi Serial đồng hồ tại điểm đo này (dữ liệu đồng hồ cũ vẫn được bảo toàn theo lịch sử)"
+                            className="h-7 w-36 rounded border border-slate-200 bg-white px-2 font-mono text-[11px] text-slate-700 outline-none focus:border-emerald-500"
+                          />
                         </div>
-                      ) : (
-                        <span className="inline-flex items-center rounded-md border border-amber-200 bg-amber-50 px-2 py-1 text-[12px] font-medium text-amber-700">
-                          Chưa gán thiết bị
-                        </span>
-                      )}
+                        {item.serialHistory && item.serialHistory.length > 1 ? (
+                          <div className="rounded border border-sky-200 bg-sky-50/70 px-2 py-1 text-[10px] text-sky-800">
+                            <span className="font-semibold">Lịch sử thay đồng hồ:</span>{" "}
+                            {item.serialHistory.map((h, idx) => (
+                              <span key={`${h.serialNumber}-${idx}`}>
+                                {idx > 0 ? " → " : ""}
+                                <span className="font-mono font-semibold">{h.serialNumber}</span>
+                                {h.validTo ? ` (đến ${h.validTo.slice(0, 16).replace("T", " ")})` : " (đang đo)"}
+                              </span>
+                            ))}
+                          </div>
+                        ) : null}
+                      </div>
                     </td>
                     <td className="py-3 pr-2 text-[12px] text-slate-600">{item.type}</td>
                   </tr>
@@ -1074,6 +1185,10 @@ function CostPanel({
   onApplyDate,
   voltageLevel,
   touPrices,
+  slots,
+  onSlotsChange,
+  tariffHistory,
+  onTariffHistoryChange,
   onVoltageLevel,
   onTouPrice,
   flatPrice,
@@ -1086,6 +1201,10 @@ function CostPanel({
   onApplyDate: (v: string) => void;
   voltageLevel: VoltageLevelId;
   touPrices: TouPriceInputs;
+  slots: Slot[];
+  onSlotsChange: (next: Slot[]) => void;
+  tariffHistory: TariffHistoryEntry[];
+  onTariffHistoryChange: (next: TariffHistoryEntry[]) => void;
   onVoltageLevel: (levelId: VoltageLevelId) => void;
   onTouPrice: (band: TouBand, value: string) => void;
   flatPrice?: string;
@@ -1133,7 +1252,7 @@ function CostPanel({
         <div>
           <p className="text-[15px] font-semibold text-slate-800">Ngày bắt đầu áp dụng</p>
           <p className="mt-1 text-[12px] text-slate-500">
-            Thời gian chi phí mới bắt đầu có hiệu lực trong hệ thống
+            Thời gian chi phí mới bắt đầu có hiệu lực trong hệ thống (dữ liệu trước ngày này vẫn giữ nguyên biểu giá cũ)
           </p>
         </div>
         <DateInput value={applyDate} onChange={onApplyDate} />
@@ -1194,32 +1313,34 @@ function CostPanel({
             ))}
           </div>
 
-          <div className="overflow-hidden rounded-md border border-slate-200">
-            <div className="grid grid-cols-4 bg-slate-50 px-4 py-2 text-[11px] font-semibold tracking-wide text-slate-400">
-              <span>CẤP ĐIỆN ÁP</span>
-              <span>BÌNH THƯỜNG</span>
-              <span>THẤP ĐIỂM</span>
-              <span>CAO ĐIỂM</span>
+          <div className="overflow-x-auto rounded-md border border-slate-200">
+            <div className="min-w-[480px]">
+              <div className="grid grid-cols-4 bg-slate-50 px-4 py-2 text-[11px] font-semibold tracking-wide text-slate-400">
+                <span>CẤP ĐIỆN ÁP</span>
+                <span>BÌNH THƯỜNG</span>
+                <span>THẤP ĐIỂM</span>
+                <span>CAO ĐIỂM</span>
+              </div>
+              {INDUSTRIAL_VOLTAGE_LEVELS.map((level) => {
+                const selected = level.id === voltageLevel;
+                const normal = selected ? parseTariffPrice(touPrices.normal) : level.normal;
+                const off = selected ? parseTariffPrice(touPrices.off) : level.off;
+                const peak = selected ? parseTariffPrice(touPrices.peak) : level.peak;
+                return (
+                  <div
+                    key={level.id}
+                    className={`grid grid-cols-4 border-t border-slate-100 px-4 py-2.5 text-sm ${
+                      selected ? "bg-emerald-50/70 font-semibold text-slate-800" : "text-slate-600"
+                    }`}
+                  >
+                    <span>{level.label}{selected ? " · đang dùng" : ""}</span>
+                    <span className="font-mono">{formatTariffPrice(normal)}</span>
+                    <span className="font-mono">{formatTariffPrice(off)}</span>
+                    <span className="font-mono">{formatTariffPrice(peak)}</span>
+                  </div>
+                );
+              })}
             </div>
-            {INDUSTRIAL_VOLTAGE_LEVELS.map((level) => {
-              const selected = level.id === voltageLevel;
-              const normal = selected ? parseTariffPrice(touPrices.normal) : level.normal;
-              const off = selected ? parseTariffPrice(touPrices.off) : level.off;
-              const peak = selected ? parseTariffPrice(touPrices.peak) : level.peak;
-              return (
-                <div
-                  key={level.id}
-                  className={`grid grid-cols-4 border-t border-slate-100 px-4 py-2.5 text-sm ${
-                    selected ? "bg-emerald-50/70 font-semibold text-slate-800" : "text-slate-600"
-                  }`}
-                >
-                  <span>{level.label}{selected ? " · đang dùng" : ""}</span>
-                  <span className="font-mono">{formatTariffPrice(normal)}</span>
-                  <span className="font-mono">{formatTariffPrice(off)}</span>
-                  <span className="font-mono">{formatTariffPrice(peak)}</span>
-                </div>
-              );
-            })}
           </div>
           <p className="text-[12px] text-slate-400">
             Dòng được tô là đơn giá đang áp dụng và sẽ ghi vào database khi bấm Lưu cấu hình. Các dòng còn lại là biểu giá nhà nước để đối chiếu. Đổi cấp điện áp sẽ điền lại đơn giá theo biểu giá đó.
@@ -1239,6 +1360,160 @@ function CostPanel({
               17:30 – 22:30 từ thứ Hai đến thứ Bảy. Chủ nhật không có giờ cao điểm.
             </p>
           </div>
+
+          {/* Khung giờ tùy chỉnh mở rộng (VD: chuyển từ 3 khung giá sang 4 khung giá từ ngày áp dụng) */}
+          <div className="rounded-lg border border-slate-200 bg-slate-50/50 p-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <p className="text-[13px] font-bold text-slate-800">
+                  Khung giá điện tùy chỉnh mở rộng (3 khung → 4+ khung giờ)
+                </p>
+                <p className="mt-0.5 text-[11px] text-slate-500">
+                  Khi thêm các khung giờ tùy chỉnh bên dưới, hệ thống sẽ ưu tiên áp dụng các khung giờ này từ{" "}
+                  <strong>{applyDate || "ngày hiệu lực"}</strong>.
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                {slots.length === 0 ? (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onSlotsChange([
+                        { id: "slot-1", name: "Khung 1 (Thấp điểm)", color: "#7ec8e3", from: "00:00", to: "06:00", price: touPrices.off },
+                        { id: "slot-2", name: "Khung 2 (Bình thường sáng)", color: "#27ae60", from: "06:00", to: "17:30", price: touPrices.normal },
+                        { id: "slot-3", name: "Khung 3 (Cao điểm)", color: "#e67e22", from: "17:30", to: "22:30", price: touPrices.peak },
+                        { id: "slot-4", name: "Khung 4 (Đêm / Phụ tải đặc biệt)", color: "#8b5cf6", from: "22:30", to: "24:00", price: touPrices.normal },
+                      ])
+                    }
+                    className="h-8 rounded-md border border-emerald-200 bg-emerald-50 px-3 text-xs font-semibold text-emerald-700 hover:bg-emerald-100"
+                  >
+                    + Tạo mẫu 4 khung giá
+                  </button>
+                ) : null}
+                <button
+                  type="button"
+                  onClick={() =>
+                    onSlotsChange([
+                      ...slots,
+                      {
+                        id: `slot-${Date.now()}`,
+                        name: `Khung giá #${slots.length + 1}`,
+                        color: ["#27ae60", "#7ec8e3", "#e67e22", "#8b5cf6", "#ef4444"][slots.length % 5],
+                        from: "00:00",
+                        to: "24:00",
+                        price: touPrices.normal,
+                      },
+                    ])
+                  }
+                  className="h-8 rounded-md bg-emerald-600 px-3 text-xs font-semibold text-white hover:bg-emerald-700"
+                >
+                  + Thêm khung giá
+                </button>
+              </div>
+            </div>
+
+            {slots.length > 0 ? (
+              <div className="mt-3 space-y-2">
+                {slots.map((slot, idx) => (
+                  <div
+                    key={slot.id}
+                    className="grid grid-cols-1 gap-2 rounded-md border border-slate-200 bg-white p-2.5 sm:grid-cols-[1.4fr_110px_110px_140px_auto]"
+                  >
+                    <input
+                      value={slot.name}
+                      onChange={(e) =>
+                        onSlotsChange(
+                          slots.map((s, i) => (i === idx ? { ...s, name: e.target.value } : s)),
+                        )
+                      }
+                      placeholder="Tên khung giờ..."
+                      className="h-8 rounded border border-slate-200 px-2.5 text-xs font-medium text-slate-800 outline-none focus:border-emerald-500"
+                    />
+                    <input
+                      value={slot.from}
+                      onChange={(e) =>
+                        onSlotsChange(
+                          slots.map((s, i) => (i === idx ? { ...s, from: e.target.value } : s)),
+                        )
+                      }
+                      placeholder="Từ (HH:mm)"
+                      className="h-8 rounded border border-slate-200 px-2.5 font-mono text-xs text-slate-700 outline-none focus:border-emerald-500"
+                    />
+                    <input
+                      value={slot.to}
+                      onChange={(e) =>
+                        onSlotsChange(
+                          slots.map((s, i) => (i === idx ? { ...s, to: e.target.value } : s)),
+                        )
+                      }
+                      placeholder="Đến (HH:mm)"
+                      className="h-8 rounded border border-slate-200 px-2.5 font-mono text-xs text-slate-700 outline-none focus:border-emerald-500"
+                    />
+                    <div className="relative">
+                      <input
+                        value={slot.price}
+                        onChange={(e) =>
+                          onSlotsChange(
+                            slots.map((s, i) => (i === idx ? { ...s, price: e.target.value } : s)),
+                          )
+                        }
+                        placeholder="Đơn giá"
+                        className="h-8 w-full rounded border border-slate-200 pr-12 pl-2.5 font-mono text-xs font-semibold text-slate-800 outline-none focus:border-emerald-500"
+                      />
+                      <span className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 text-[10px] text-slate-400">
+                        đ/kWh
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => onSlotsChange(slots.filter((_, i) => i !== idx))}
+                      className="h-8 rounded border border-rose-200 bg-rose-50 px-2.5 text-xs font-medium text-rose-600 hover:bg-rose-100"
+                    >
+                      Xóa
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </div>
+
+          {/* Lịch sử các mốc thay đổi biểu giá theo ngày áp dụng */}
+          {tariffHistory.length > 0 ? (
+            <div className="rounded-lg border border-slate-200 bg-white p-4">
+              <p className="text-[12px] font-bold tracking-wide text-slate-700 uppercase">
+                Lịch sử các mốc áp dụng biểu giá điện ({tariffHistory.length} mốc)
+              </p>
+              <div className="mt-2 space-y-1.5 text-xs text-slate-600">
+                {tariffHistory.map((h, i) => (
+                  <div
+                    key={`${h.applyDate}-${i}`}
+                    className="flex flex-wrap items-center justify-between gap-2 rounded border border-slate-100 bg-slate-50 px-3 py-2"
+                  >
+                    <div>
+                      <span className="font-semibold text-slate-800">Từ ngày {h.applyDate}:</span>{" "}
+                      {h.slots && h.slots.length > 0 ? (
+                        <span>
+                          {h.slots.length} khung giá tùy chỉnh (
+                          {h.slots.map((s) => `${s.name}: ${s.price} đ`).join(", ")})
+                        </span>
+                      ) : (
+                        <span>
+                          3 khung EVN (BT: {h.prices?.normal} · TĐ: {h.prices?.off} · CĐ: {h.prices?.peak} đ/kWh)
+                        </span>
+                      )}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => onTariffHistoryChange(tariffHistory.filter((_, idx) => idx !== i))}
+                      className="text-[11px] font-medium text-rose-600 hover:underline"
+                    >
+                      Xóa mốc
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
         </div>
       ) : (
         <div className="mt-5">
@@ -1843,7 +2118,7 @@ function AlertsPanel({
                   </div>
 
                   {/* Dòng thông tin phụ: Giá trị đo thực tế hiện tại + mô tả */}
-                  <div className="mt-2 flex flex-wrap items-center justify-between gap-2 pl-11 text-[11px]">
+                  <div className="mt-2 flex flex-wrap items-center justify-between gap-2 pl-0 sm:pl-11 text-[11px]">
                     <div className="flex flex-wrap items-center gap-3">
                       <span
                         className={`inline-flex items-center gap-1.5 rounded-md px-2 py-0.5 font-mono font-semibold ${

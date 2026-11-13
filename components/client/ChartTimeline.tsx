@@ -18,10 +18,8 @@ export function ChartTimeline({
   compact?: boolean;
 }) {
   const trackRef = useRef<HTMLDivElement>(null);
-  const drag = useRef<"start" | "end" | "move" | null>(null);
-  const origin = useRef({ x: 0, start: 0, end: 0 });
   const last = Math.max(labels.length - 1, 0);
-  const minSpan = last <= 0 ? 0 : Math.max(1, Math.min(3, last));
+  const minSpan = last <= 0 ? 0 : Math.max(1, Math.min(2, last));
   const minVal = values.length ? Math.min(...values) : 0;
   const maxVal = values.length ? Math.max(...values) : 1;
   const spanVal = Math.max(1e-9, maxVal - minVal);
@@ -29,147 +27,186 @@ export function ChartTimeline({
   const right = last === 0 ? 1 : range.end / last;
   const startLabel = labels[range.start] ?? labels[0] ?? "--";
   const endLabel = labels[range.end] ?? labels[last] ?? "--";
+  const isZoomed = range.start > 0 || range.end < last;
 
-  const toIndex = (clientX: number) => {
-    const box = trackRef.current?.getBoundingClientRect();
-    if (!box || box.width <= 0) return 0;
-    const t = (clientX - box.left) / box.width;
-    return Math.round(Math.max(0, Math.min(1, t)) * last);
+  const beginDrag = (
+    e: React.PointerEvent<HTMLElement>,
+    mode: "start" | "end" | "move",
+  ) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const el = trackRef.current;
+    if (!el || last <= 0) return;
+    const rect = el.getBoundingClientRect();
+    const width = Math.max(1, rect.width);
+    const startX = e.clientX;
+    const initial = { ...range };
+
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // Ignore if pointer capture is unsupported
+    }
+
+    const onMove = (ev: PointerEvent) => {
+      const dIdx = Math.round(((ev.clientX - startX) / width) * last);
+      if (mode === "start") {
+        const nextStart = Math.max(0, Math.min(initial.end - minSpan, initial.start + dIdx));
+        onRange({ start: nextStart, end: initial.end });
+      } else if (mode === "end") {
+        const nextEnd = Math.min(last, Math.max(initial.start + minSpan, initial.end + dIdx));
+        onRange({ start: initial.start, end: nextEnd });
+      } else {
+        const span = initial.end - initial.start;
+        let nextStart = initial.start + dIdx;
+        if (nextStart < 0) nextStart = 0;
+        if (nextStart + span > last) nextStart = last - span;
+        onRange({ start: nextStart, end: nextStart + span });
+      }
+    };
+
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
   };
 
-  const applyDrag = (clientX: number) => {
-    if (!drag.current) return;
-    const idx = toIndex(clientX);
-    if (drag.current === "start") {
-      onRange({ start: Math.min(idx, range.end - minSpan), end: range.end });
-      return;
-    }
-    if (drag.current === "end") {
-      onRange({ start: range.start, end: Math.max(idx, range.start + minSpan) });
-      return;
-    }
-    const delta = idx - toIndex(origin.current.x);
-    const span = origin.current.end - origin.current.start;
-    const start = Math.max(0, Math.min(last - span, origin.current.start + delta));
-    onRange({ start, end: start + span });
+  const handleTrackClick = (e: React.PointerEvent<HTMLDivElement>) => {
+    const el = trackRef.current;
+    if (!el || last <= 0) return;
+    const rect = el.getBoundingClientRect();
+    const clickIdx = Math.round(
+      Math.max(0, Math.min(1, (e.clientX - rect.left) / Math.max(1, rect.width))) * last,
+    );
+    const currentSpan = range.end - range.start;
+    const targetSpan = currentSpan >= last ? Math.max(minSpan, Math.round(last * 0.35)) : currentSpan;
+    let nextStart = clickIdx - Math.floor(targetSpan / 2);
+    if (nextStart < 0) nextStart = 0;
+    if (nextStart + targetSpan > last) nextStart = last - targetSpan;
+    onRange({ start: nextStart, end: nextStart + targetSpan });
   };
 
-  const shiftWindow = (step: number) => {
-    const span = range.end - range.start;
-    const start = Math.max(0, Math.min(last - span, range.start + step));
-    onRange({ start, end: start + span });
+  const stepZoom = (delta: number) => {
+    if (last <= 0) return;
+    const currentSpan = range.end - range.start;
+    const nextSpan = Math.max(minSpan, Math.min(last, currentSpan + delta));
+    const center = Math.round((range.start + range.end) / 2);
+    let nextStart = center - Math.floor(nextSpan / 2);
+    if (nextStart < 0) nextStart = 0;
+    if (nextStart + nextSpan > last) nextStart = last - nextSpan;
+    onRange({ start: nextStart, end: nextStart + nextSpan });
   };
 
   const spark = values
     .map((value, index) => {
-      const x = last === 0 ? 0 : (index / last) * 100;
-      const y = 100 - ((value - minVal) / spanVal) * 86 - 7;
-      return `${index === 0 ? "M" : "L"} ${x} ${y}`;
+      const x = last === 0 ? 0 : (index / last) * 1000;
+      const y = 26 - ((value - minVal) / spanVal) * 20;
+      return `${index === 0 ? "M" : "L"} ${x.toFixed(1)} ${y.toFixed(1)}`;
     })
     .join(" ");
 
-  const btnClass = compact
-    ? "inline-flex h-6 w-6 items-center justify-center rounded-md border border-slate-200 bg-white text-slate-600 hover:bg-slate-100"
-    : "inline-flex h-7 w-7 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-600 hover:bg-slate-100";
-
   return (
-    <div
-      className={
-        compact
-          ? "w-full rounded-lg border border-slate-200 bg-slate-50/80 px-2 py-1.5"
-          : "w-full rounded-xl border border-slate-200 bg-slate-50/80 px-2.5 py-2 sm:px-3"
-      }
-    >
-      <div className={`flex flex-wrap items-center justify-between gap-2 ${compact ? "mb-1" : "mb-1.5"}`}>
-        {compact ? (
-          <p className="text-[10px] font-semibold text-slate-600">
-            {startLabel || "Bắt đầu"} → {endLabel || "Kết thúc"}
-          </p>
-        ) : (
-          <p className="hidden sm:block text-[11px] font-semibold tracking-wide text-slate-500">
-            KÉO THANH ĐỂ CHỌN KHOẢNG THỜI GIAN
-          </p>
-        )}
-        <div className="flex w-full sm:w-auto items-center justify-between sm:justify-end gap-1">
-          <div className="flex items-center gap-1">
-            <button type="button" aria-label="Lùi khoảng xem" onClick={() => shiftWindow(-Math.max(minSpan, 1))} className={btnClass}>
-              ‹
-            </button>
-            {compact ? null : (
-              <span className="min-w-[8rem] sm:min-w-[9.5rem] text-center text-[11.5px] sm:text-[12px] font-semibold text-slate-800">
-                {startLabel} → {endLabel}
-              </span>
-            )}
-            <button type="button" aria-label="Tới khoảng xem" onClick={() => shiftWindow(Math.max(minSpan, 1))} className={btnClass}>
-              ›
-            </button>
-          </div>
-          <button
-            type="button"
-            onClick={() => onRange({ start: 0, end: last })}
-            className={
-              compact
-                ? "ml-1 h-6 rounded-md border border-slate-200 bg-white px-1.5 text-[10px] font-semibold text-slate-600 hover:bg-slate-100"
-                : "ml-1 h-7 rounded-lg border border-slate-200 bg-white px-2 text-[11px] font-semibold text-slate-600 hover:bg-slate-100"
-            }
-          >
-            Toàn bộ
-          </button>
-        </div>
-      </div>
-
+    <div className="w-full px-1 sm:px-4">
       <div
         ref={trackRef}
-        className={
-          compact
-            ? "relative h-8 w-full touch-none select-none overflow-hidden rounded-md bg-white ring-1 ring-slate-200"
-            : "relative h-10 sm:h-14 w-full touch-none select-none overflow-hidden rounded-lg bg-white ring-1 ring-slate-200"
-        }
-        onPointerDown={(event) => {
-          const box = event.currentTarget.getBoundingClientRect();
-          const x = event.clientX - box.left;
-          const leftX = left * box.width;
-          const rightX = right * box.width;
-          const edge = compact ? 10 : 16;
-          if (Math.abs(x - leftX) <= edge) drag.current = "start";
-          else if (Math.abs(x - rightX) <= edge) drag.current = "end";
-          else if (x > leftX && x < rightX) drag.current = "move";
-          else drag.current = x < leftX ? "start" : "end";
-          origin.current = { x: event.clientX, start: range.start, end: range.end };
-          event.currentTarget.setPointerCapture(event.pointerId);
-          applyDrag(event.clientX);
-        }}
-        onPointerMove={(event) => applyDrag(event.clientX)}
-        onPointerUp={() => {
-          drag.current = null;
-        }}
-        onPointerCancel={() => {
-          drag.current = null;
-        }}
+        onPointerDown={handleTrackClick}
+        className={`relative ${
+          compact ? "h-7" : "h-8"
+        } w-full cursor-pointer touch-none select-none rounded-[3px] border border-slate-300 bg-slate-50/80`}
       >
         {spark ? (
-          <svg viewBox="0 0 100 100" preserveAspectRatio="none" className="absolute inset-0 h-full w-full">
-            <path d={`${spark} L 100 100 L 0 100 Z`} fill="#dbeafe" />
-            <path d={spark} fill="none" stroke="#60a5fa" strokeWidth="1.4" vectorEffect="non-scaling-stroke" />
+          <svg
+            viewBox="0 0 1000 28"
+            preserveAspectRatio="none"
+            className="pointer-events-none absolute inset-0 h-full w-full"
+          >
+            <path d={spark} fill="none" stroke="#64748b" strokeWidth="1.5" opacity="0.75" />
           </svg>
         ) : null}
 
-        <div className="pointer-events-none absolute inset-y-0 bg-slate-200/55" style={{ left: 0, width: `${left * 100}%` }} />
         <div
-          className="pointer-events-none absolute inset-y-0 bg-slate-200/55"
-          style={{ left: `${right * 100}%`, right: 0 }}
+          className="pointer-events-none absolute inset-y-0 left-0 bg-slate-200/45"
+          style={{ width: `${left * 100}%` }}
         />
         <div
-          className="absolute inset-y-0 border-y-2 border-emerald-500 bg-emerald-500/15"
-          style={{ left: `${left * 100}%`, width: `${Math.max((right - left) * 100, 2)}%` }}
+          className="pointer-events-none absolute inset-y-0 right-0 bg-slate-200/45"
+          style={{ width: `${(1 - right) * 100}%` }}
+        />
+
+        {/* Cửa sổ đang zoom */}
+        <div
+          onPointerDown={(e) => beginDrag(e, "move")}
+          style={{
+            left: `${left * 100}%`,
+            width: `${Math.max((right - left) * 100, 2)}%`,
+          }}
+          className="absolute inset-y-0 cursor-grab touch-none border-x border-sky-500 bg-sky-500/25 active:cursor-grabbing"
+          title="Kéo để di chuyển vị trí zoom"
+        />
+
+        {/* Tay nắm trái */}
+        <div
+          onPointerDown={(e) => beginDrag(e, "start")}
+          style={{ left: `calc(${left * 100}% - 12px)` }}
+          className="group absolute -top-0.5 -bottom-0.5 z-10 flex w-6 cursor-ew-resize touch-none items-center justify-center"
+          title="Kéo để chỉnh điểm bắt đầu"
         >
-          <span className={`absolute top-0 bottom-0 left-0 cursor-ew-resize rounded-l-md bg-emerald-600 ${compact ? "w-1.5" : "w-3"}`} />
-          <span className={`absolute top-0 bottom-0 right-0 cursor-ew-resize rounded-r-md bg-emerald-600 ${compact ? "w-1.5" : "w-3"}`} />
-          {compact ? null : (
-            <span className="pointer-events-none absolute inset-0 flex items-center justify-center text-[10px] font-semibold text-emerald-900/80">
-              Kéo
-            </span>
-          )}
+          <div className="flex h-7 w-3 items-center justify-center rounded-[2px] border border-sky-600 bg-white shadow-xs group-hover:bg-sky-50">
+            <span className="h-3.5 w-0.5 bg-sky-600" />
+          </div>
+        </div>
+
+        {/* Tay nắm phải */}
+        <div
+          onPointerDown={(e) => beginDrag(e, "end")}
+          style={{ left: `calc(${right * 100}% - 12px)` }}
+          className="group absolute -top-0.5 -bottom-0.5 z-10 flex w-6 cursor-ew-resize touch-none items-center justify-center"
+          title="Kéo để chỉnh điểm kết thúc"
+        >
+          <div className="flex h-7 w-3 items-center justify-center rounded-[2px] border border-sky-600 bg-white shadow-xs group-hover:bg-sky-50">
+            <span className="h-3.5 w-0.5 bg-sky-600" />
+          </div>
+        </div>
+      </div>
+
+      <div className="mt-1.5 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500">
+        <span>
+          Đang xem: <strong className="font-mono text-slate-700">{startLabel}</strong> →{" "}
+          <strong className="font-mono text-slate-700">{endLabel}</strong>
+        </span>
+        <div className="flex items-center gap-1">
+          <button
+            type="button"
+            onClick={() => stepZoom(-Math.max(2, Math.round(last * 0.2)))}
+            className="rounded border border-slate-200 bg-white px-2 py-0.5 font-bold text-slate-700 hover:border-sky-400 hover:text-sky-600"
+            title="Phóng to (+)"
+          >
+            +
+          </button>
+          <button
+            type="button"
+            onClick={() => stepZoom(Math.max(2, Math.round(last * 0.2)))}
+            className="rounded border border-slate-200 bg-white px-2 py-0.5 font-bold text-slate-700 hover:border-sky-400 hover:text-sky-600"
+            title="Thu nhỏ (-)"
+          >
+            −
+          </button>
+          <button
+            type="button"
+            onClick={() => onRange({ start: 0, end: last })}
+            className={`rounded border px-2 py-0.5 font-semibold ${
+              isZoomed
+                ? "border-sky-500 bg-sky-50 text-sky-700 hover:bg-sky-100"
+                : "border-slate-200 bg-slate-50 text-slate-400"
+            }`}
+          >
+            100%
+          </button>
         </div>
       </div>
     </div>

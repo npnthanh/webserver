@@ -65,14 +65,16 @@ export function GatewayConsole() {
   const [configError, setConfigError] = useState("");
   const [savingConfig, setSavingConfig] = useState(false);
 
-  async function load() {
-    setState((current) => ({ ...current, loading: true, error: "" }));
+  async function load(options?: { silent?: boolean }) {
+    if (!options?.silent) setState((current) => ({ ...current, loading: true, error: "" }));
     try {
       const response = await fetch(`/api/gateway/console`, { cache: "no-store" });
       const payload = (await response.json()) as GatewayConsoleData & { error?: string };
       if (!response.ok) throw new Error(payload.error || "Không thể tải dữ liệu gateway.");
       setState({ data: payload, error: "", loading: false });
     } catch (error) {
+      // Lần tự làm mới nền bị lỗi mạng tạm thời: giữ nguyên dữ liệu đang hiển thị.
+      if (options?.silent) return;
       setState({
         data: null,
         loading: false,
@@ -83,6 +85,11 @@ export function GatewayConsole() {
 
   useEffect(() => {
     void load();
+    // Tự làm mới trạng thái trực tuyến/ngoại tuyến (gateway gửi mặc định 30 giây/lần).
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void load({ silent: true });
+    }, 30_000);
+    return () => window.clearInterval(timer);
   }, []);
 
   useEffect(() => {

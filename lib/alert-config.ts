@@ -90,8 +90,8 @@ export const DEFAULT_USER_ALERT_RULES: Record<string, UserAlertRule[]> = {
       name: "Điện năng tác dụng nhận vượt ngưỡng",
       parameterKey: "EPaed",
       minValue: "",
-      maxValue: "100000",
-      unit: "Wh",
+      maxValue: "10000",
+      unit: "kWh",
       severity: "warning",
       enabled: true,
       description: "Cảnh báo khi chỉ số điện năng tác dụng nhận (EPaed) vượt ngưỡng cài đặt",
@@ -102,8 +102,8 @@ export const DEFAULT_USER_ALERT_RULES: Record<string, UserAlertRule[]> = {
       name: "Điện năng phản kháng nhận vượt ngưỡng",
       parameterKey: "EQred",
       minValue: "",
-      maxValue: "50000",
-      unit: "VARh",
+      maxValue: "5000",
+      unit: "kVARh",
       severity: "info",
       enabled: true,
       description: "Theo dõi điện năng phản kháng nhận (EQred) để kiểm soát bù công suất phản kháng",
@@ -442,9 +442,13 @@ function mapTagToCategory(tag: string): UserAlertCategoryTab {
   };
 }
 
-export function normalizeAlertConfig(raw: unknown): AlertConfig {
+export function normalizeAlertConfig(raw: unknown, fallbackAdminRaw?: unknown): AlertConfig {
   const source =
     raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+  const adminSource =
+    fallbackAdminRaw && typeof fallbackAdminRaw === "object" && !Array.isArray(fallbackAdminRaw)
+      ? (fallbackAdminRaw as Record<string, unknown>)
+      : {};
   const map = source.severityByCategory;
   const severityByCategory = { ...DEFAULT_SEVERITY_BY_CATEGORY };
   if (map && typeof map === "object" && !Array.isArray(map)) {
@@ -479,11 +483,13 @@ export function normalizeAlertConfig(raw: unknown): AlertConfig {
   }
 
   const rulesByGroup = cloneDefaultRulesByGroup();
-  if (
+  const hasUserRules =
     source.rulesByGroup &&
     typeof source.rulesByGroup === "object" &&
-    !Array.isArray(source.rulesByGroup)
-  ) {
+    !Array.isArray(source.rulesByGroup) &&
+    Object.keys(source.rulesByGroup as Record<string, unknown>).length > 0;
+
+  if (hasUserRules) {
     for (const [groupId, rawList] of Object.entries(source.rulesByGroup as Record<string, unknown>)) {
       if (!Array.isArray(rawList) || rawList.length === 0) continue;
       const parsed: UserAlertRule[] = [];
@@ -503,6 +509,39 @@ export function normalizeAlertConfig(raw: unknown): AlertConfig {
           severity,
           enabled: typeof r.enabled === "boolean" ? r.enabled : true,
           meterPointId: typeof r.meterPointId === "string" ? r.meterPointId : undefined,
+          description: typeof r.description === "string" ? r.description : undefined,
+        });
+      }
+      if (parsed.length > 0) {
+        rulesByGroup[groupId] = parsed;
+      }
+    }
+  } else if (
+    adminSource.alarmsByCategory &&
+    typeof adminSource.alarmsByCategory === "object" &&
+    !Array.isArray(adminSource.alarmsByCategory)
+  ) {
+    for (const [groupId, rawList] of Object.entries(adminSource.alarmsByCategory as Record<string, unknown>)) {
+      if (!Array.isArray(rawList) || rawList.length === 0) continue;
+      const parsed: UserAlertRule[] = [];
+      for (const rawRule of rawList) {
+        if (!rawRule || typeof rawRule !== "object") continue;
+        const r = rawRule as Record<string, unknown>;
+        parsed.push({
+          id: typeof r.id === "string" && r.id ? r.id : `rule-${groupId}-${parsed.length + 1}`,
+          groupId,
+          name: typeof r.name === "string" ? r.name : "",
+          parameterKey: typeof r.parameterKey === "string" ? r.parameterKey : "",
+          minValue: typeof r.minValue === "string" ? r.minValue : "",
+          maxValue:
+            typeof r.threshold === "string"
+              ? r.threshold
+              : typeof r.maxValue === "string"
+                ? r.maxValue
+                : "",
+          unit: typeof r.unit === "string" ? r.unit : "",
+          severity: "warning",
+          enabled: true,
           description: typeof r.description === "string" ? r.description : undefined,
         });
       }
@@ -595,6 +634,9 @@ export function resolveConfiguredSeverity(
   config: AlertConfig,
   parameterKey?: string,
 ): AlertSeverityLevel {
+  if (parameterKey === "Kết nối trở lại" || fallback === "info") {
+    return "info";
+  }
   if (parameterKey) {
     for (const rules of Object.values(config.rulesByGroup ?? {})) {
       const matched = rules.find((r) => r.parameterKey === parameterKey && r.enabled);

@@ -24,7 +24,8 @@ type RegisterRow = DeviceRegister;
 
 const protocols = ["Modbus TCP", "Modbus RTU", "M-Bus", "BACnet", "MQTT"];
 const dataTypes = ["UINT16", "UINT32", "INT32", "FLOAT32", "FLOAT64"];
-const deviceCategories = Array.from(new Set(Object.values(METER_MODEL_BY_CODE)));
+const builtinCategories = Array.from(new Set(Object.values(METER_MODEL_BY_CODE)));
+const CUSTOM_CATEGORY = "__custom__";
 
 function defaultPm2230Registers(): RegisterRow[] {
   const coreKeys = ["EPaed", "Papt", "Qrpt", "Sapt", "VLNavg", "VLLavg", "Iavg", "PFt", "F", "THDVln", "THDCa"];
@@ -56,6 +57,8 @@ export function AddCustomDeviceForm() {
   const [model, setModel] = useState("");
   const [deviceType, setDeviceType] = useState("");
   const [category, setCategory] = useState("");
+  const [customCategory, setCustomCategory] = useState(false);
+  const [knownCategories, setKnownCategories] = useState<string[]>(builtinCategories);
   const [serial, setSerial] = useState("");
   const [error, setError] = useState("");
   const [protocol, setProtocol] = useState(protocols[0]);
@@ -73,6 +76,10 @@ export function AddCustomDeviceForm() {
     let active = true;
     void hydrateDevices().then((devices) => {
       if (!active) return;
+      const fromCatalog = devices
+        .map((item) => item.category?.trim() ?? "")
+        .filter((item): item is string => Boolean(item));
+      setKnownCategories(Array.from(new Set([...builtinCategories, ...fromCatalog])));
       if (!editingId) {
         setIsEdit(false);
         return;
@@ -215,9 +222,15 @@ export function AddCustomDeviceForm() {
         <div className="grid gap-4 sm:grid-cols-2">
           <Field label="1. Category (Loại đồng hồ hỗ trợ)">
             <CustomSelect
-              value={category}
+              value={customCategory ? CUSTOM_CATEGORY : category}
               onChange={(e) => {
                 const nextCat = e.target.value;
+                if (nextCat === CUSTOM_CATEGORY) {
+                  setCustomCategory(true);
+                  setCategory("");
+                  return;
+                }
+                setCustomCategory(false);
                 setCategory(nextCat);
                 if (nextCat === "PM2230") {
                   if (!brand.trim()) setBrand("Schneider Electric");
@@ -232,15 +245,29 @@ export function AddCustomDeviceForm() {
               required
             >
               <option value="">Chọn loại đồng hồ</option>
-              {deviceCategories.map((item) => (
+              {knownCategories.map((item) => (
                 <option key={item} value={item}>
                   {item}
                 </option>
               ))}
-              {category && !deviceCategories.includes(category) ? (
+              {category && !customCategory && !knownCategories.includes(category) ? (
                 <option value={category}>{category}</option>
               ) : null}
+              <option value={CUSTOM_CATEGORY}>+ Loại khác (nhập tay)…</option>
             </CustomSelect>
+            {customCategory ? (
+              <input
+                value={category}
+                onChange={(e) => setCategory(e.target.value)}
+                className="input mt-2"
+                placeholder="VD: PM2120, MFM384…"
+                autoFocus
+                required
+              />
+            ) : null}
+            <p className="mt-1.5 text-[11px] text-slate-400">
+              Dữ liệu gateway được ghép theo Serial (MID). Category dùng để phân loại và hiển thị.
+            </p>
           </Field>
           <Field label="2. Serial">
             <input

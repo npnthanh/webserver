@@ -19,6 +19,7 @@ import { hydrateClientMeters, orderMetersByTree, type ClientMeter } from "@/lib/
 import { hydrateDevices, type CatalogDevice } from "@/lib/devices";
 import { hydrateAlertEvents } from "@/lib/alert-events";
 import { hydrateMeterReadings } from "@/lib/meter-readings";
+import { formatAppNumber } from "@/lib/number-format";
 
 type Energy = string;
 type DeviceKind = "meter" | "inverter" | "thermo" | "water" | "wind" | "steam" | "air";
@@ -563,9 +564,9 @@ function DeviceRows({
 
 function formatValue(value: number, unit: string) {
   const digits = unit === "kWh" || unit === "kW" || unit === "m³" ? 1 : 1;
-  return value.toLocaleString("en-US", {
-    minimumFractionDigits: digits,
-    maximumFractionDigits: digits,
+  return formatAppNumber(value, {
+    minDecimals: digits,
+    maxDecimals: digits,
   });
 }
 

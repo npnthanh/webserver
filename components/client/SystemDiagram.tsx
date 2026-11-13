@@ -37,10 +37,11 @@ import { DiagramActionsContext } from "./diagram/context";
 import {
   buildLiveMetrics,
   DIAGRAM_ONLINE_MS,
+  formatMetricReading,
   normalizeMetricKeys,
   parameterGroups,
 } from "./diagram/metrics";
-import { MeterNode, NodeGlyph } from "./diagram/nodes";
+import { MeterNode, NodeGlyph, SourceNode } from "./diagram/nodes";
 import type {
   DiagramEdge,
   DiagramNode,
@@ -49,6 +50,7 @@ import type {
   MeterFlowNode,
   MeterIcon,
   MeterNodeData,
+  SourceNodeData,
 } from "./diagram/types";
 
 const ICON_OPTIONS: { id: MeterIcon; label: string }[] = [
@@ -64,13 +66,16 @@ const ICON_OPTIONS: { id: MeterIcon; label: string }[] = [
 
 const nodeTypes: NodeTypes = {
   meter: MeterNode,
+  source: SourceNode,
 };
 
-const edgeStyle = { stroke: "#cbd5e1", strokeWidth: 2 };
+const edgeStyle = { stroke: "#059669", strokeWidth: 2.5 };
 
-const NODE_W = 248;
-const H_GAP = 48;
-const V_GAP = 120;
+const SOURCE_NODE_ID = "__grid_source__";
+const SOURCE_W = 440;
+const NODE_W = 264;
+const H_GAP = 56;
+const V_GAP = 320;
 
 function waitForViewportPaint() {
   return new Promise<void>((resolve) => {
@@ -197,12 +202,88 @@ function nodeDataForMeter(
   };
 }
 
+function buildSourceNodeData(
+  projectName: string,
+  energy: EnergyKind,
+  meters: ClientMeter[],
+  displays: Record<string, DiagramNodeDisplay>,
+  liveById: Record<string, ProjectGatewaySample>,
+): SourceNodeData {
+  let normalCount = 0;
+  let warningCount = 0;
+  let offlineCount = 0;
+  let totalPowerKw = 0;
+  let hasPower = false;
+  let sampleValues: Record<string, number> | undefined;
+
+  const byParent = new Map<string | null, ClientMeter[]>();
+  for (const meter of meters) {
+    const key = meter.parentId && meters.some((m) => m.id === meter.parentId) ? meter.parentId : null;
+    if (!byParent.has(key)) byParent.set(key, []);
+    byParent.get(key)!.push(meter);
+  }
+  const roots = byParent.get(null) ?? meters;
+
+  for (const meter of meters) {
+    const sample = liveById[meter.id];
+    const live = buildLiveMetrics(normalizeMetricKeys(displays[meter.id]?.metricKeys), sample?.values, {
+      hasDevice: Boolean(meter.deviceId),
+      online: isSampleOnline(sample?.at),
+      code: meter.code,
+    });
+    if (live.status === "normal") normalCount += 1;
+    else if (live.status === "warning") warningCount += 1;
+    else offlineCount += 1;
+
+    if (!sampleValues && sample?.values) {
+      sampleValues = sample.values;
+    }
+  }
+
+  for (const root of roots) {
+    const vals = liveById[root.id]?.values;
+    if (vals && typeof vals.Papt === "number" && Number.isFinite(vals.Papt)) {
+      totalPowerKw += vals.Papt;
+      hasPower = true;
+    }
+  }
+
+  const totalPowerText = hasPower
+    ? formatMetricReading("Papt", { Papt: totalPowerKw })
+    : sampleValues
+      ? formatMetricReading("Papt", sampleValues)
+      : "—";
+  const voltageText = sampleValues
+    ? sampleValues.VLLavg != null
+      ? formatMetricReading("VLLavg", sampleValues)
+      : formatMetricReading("Van", sampleValues)
+    : "380 V";
+  const freqText = sampleValues ? formatMetricReading("F", sampleValues) : "50,0 Hz";
+
+  return {
+    title: `Trạm biến áp & Tủ tổng ${projectName}`,
+    subtitle:
+      energy === "Điện"
+        ? "Sơ đồ đơn tuyến hệ thống phân phối & đo đếm điện năng"
+        : `Hệ thống cấp & đo đếm ${energy.toLowerCase()}`,
+    energy,
+    totalPowerText,
+    voltageText,
+    freqText,
+    normalCount,
+    warningCount,
+    offlineCount,
+  };
+}
+
 function buildFlowFromMeters(
   meters: ClientMeter[],
   displays: Record<string, DiagramNodeDisplay>,
   liveById: Record<string, ProjectGatewaySample>,
+  projectName = "Dự án",
+  energy: EnergyKind = "Điện",
 ): {
-  nodes: MeterFlowNode[];
+  nodes: DiagramNode[];
   edges: DiagramEdge[];
 } {
   const byParent = new Map<string | null, ClientMeter[]>();
@@ -218,15 +299,16 @@ function buildFlowFromMeters(
     return kids.reduce((sum, child) => sum + subtreeWidth(child.id), 0) + (kids.length - 1) * H_GAP;
   }
 
-  const nodes: MeterFlowNode[] = [];
+  const nodes: DiagramNode[] = [];
   const edges: DiagramEdge[] = [];
 
   function place(meter: ClientMeter, centerX: number, y: number) {
+    const nodeData = nodeDataForMeter(meter, displays[meter.id], liveById[meter.id]);
     nodes.push({
       id: meter.id,
       type: "meter",
       position: { x: centerX - NODE_W / 2, y },
-      data: nodeDataForMeter(meter, displays[meter.id], liveById[meter.id]),
+      data: nodeData,
     });
 
     const kids = byParent.get(meter.id) ?? [];
@@ -238,6 +320,7 @@ function buildFlowFromMeters(
     for (const child of kids) {
       const w = subtreeWidth(child.id);
       const childCenter = cursor + w / 2;
+      const childOnline = isSampleOnline(liveById[child.id]?.at);
       place(child, childCenter, y + V_GAP);
       edges.push({
         id: `e-${meter.id}-${child.id}`,
@@ -245,8 +328,11 @@ function buildFlowFromMeters(
         sourceHandle: "child",
         target: child.id,
         targetHandle: "parent",
-        type: "smoothstep",
-        style: edgeStyle,
+        type: "step",
+        animated: childOnline,
+        style: childOnline
+          ? edgeStyle
+          : { stroke: "#94a3b8", strokeWidth: 2, strokeDasharray: "4 3" },
       });
       cursor += w + H_GAP;
     }
@@ -254,10 +340,38 @@ function buildFlowFromMeters(
 
   const roots = byParent.get(null) ?? [];
   if (roots.length) {
-    let cursor = 80;
+    const totalRootsW =
+      roots.reduce((sum, r) => sum + subtreeWidth(r.id), 0) + (roots.length - 1) * H_GAP;
+    const busCenterX = 80 + Math.max(totalRootsW, SOURCE_W) / 2;
+
+    nodes.push({
+      id: SOURCE_NODE_ID,
+      type: "source",
+      position: { x: busCenterX - SOURCE_W / 2, y: 16 },
+      data: buildSourceNodeData(projectName, energy, meters, displays, liveById),
+      draggable: true,
+      selectable: false,
+    });
+
+    let cursor = busCenterX - totalRootsW / 2;
+    const rootY = energy === "Điện" ? 276 : 168;
     for (const root of roots) {
       const w = subtreeWidth(root.id);
-      place(root, cursor + w / 2, 24);
+      const rootCenter = cursor + w / 2;
+      const rootOnline = isSampleOnline(liveById[root.id]?.at);
+      place(root, rootCenter, rootY);
+      edges.push({
+        id: `e-bus-${root.id}`,
+        source: SOURCE_NODE_ID,
+        sourceHandle: "bus-out",
+        target: root.id,
+        targetHandle: "parent",
+        type: "step",
+        animated: rootOnline,
+        style: rootOnline
+          ? edgeStyle
+          : { stroke: "#94a3b8", strokeWidth: 2, strokeDasharray: "4 3" },
+      });
       cursor += w + H_GAP;
     }
   }
@@ -380,15 +494,36 @@ function SystemDiagramInner() {
   useEffect(() => {
     if (!diagramStateReady) return;
     const filtered = meters.filter((meter) => meter.utility === energy);
-    const built = buildFlowFromMeters(filtered, displaysRef.current, liveByIdRef.current);
+    const built = buildFlowFromMeters(
+      filtered,
+      displaysRef.current,
+      liveByIdRef.current,
+      projectName,
+      energy,
+    );
     const savedState = loadDiagramState(projectId, energy);
     const savedPositions = savedState?.positions ?? {};
+    const hasSavedSource = Boolean(savedPositions[SOURCE_NODE_ID]);
 
-    const restoredNodes: DiagramNode[] = built.nodes.map((node) => ({
-      ...node,
-      position: savedPositions[node.id] ? { ...savedPositions[node.id] } : node.position,
-      selected: node.id === selectedId,
-    }));
+    const restoredNodes: DiagramNode[] = built.nodes.map((node) => {
+      const savedPos = savedPositions[node.id];
+      if (!savedPos) {
+        return {
+          ...node,
+          selected: node.id === selectedId,
+        };
+      }
+      // Nếu vị trí lưu từ bản cũ chưa có Thanh cái tổng ở trên (y < 180), tự động dịch xuống để không đè lên Trạm biến áp
+      const adjustedY =
+        !hasSavedSource && node.type === "meter" && savedPos.y < 180
+          ? savedPos.y + 252
+          : savedPos.y;
+      return {
+        ...node,
+        position: { x: savedPos.x, y: adjustedY },
+        selected: node.id === selectedId,
+      };
+    });
 
     setNodes(restoredNodes);
     setEdges(built.edges);
@@ -401,23 +536,30 @@ function SystemDiagramInner() {
       setSelectedId(filtered[0].id);
     }
 
-    if (savedState?.viewport) {
+    if (savedState?.viewport && hasSavedSource) {
       const vp = savedState.viewport;
       const frame = requestAnimationFrame(() => {
         setViewport({ x: vp.x, y: vp.y, zoom: vp.zoom });
       });
       return () => cancelAnimationFrame(frame);
     }
-    const frame = requestAnimationFrame(() => fitView({ padding: 0.28, duration: 200 }));
+    const frame = requestAnimationFrame(() => fitView({ padding: 0.22, duration: 200 }));
     return () => cancelAnimationFrame(frame);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [meters, energy, setNodes, setEdges, fitView, setViewport, diagramVersion, diagramStateReady]);
+  }, [meters, energy, projectName, setNodes, setEdges, fitView, setViewport, diagramVersion, diagramStateReady]);
 
   // Cập nhật giá trị realtime / lựa chọn thông số mà không reset vị trí / viewport
   useEffect(() => {
     if (!diagramStateReady) return;
+    const filtered = meters.filter((meter) => meter.utility === energy);
     setNodes((current) =>
       current.map((item) => {
+        if (item.type === "source") {
+          return {
+            ...item,
+            data: buildSourceNodeData(projectName, energy, filtered, displays, liveById),
+          };
+        }
         if (item.type !== "meter") return item;
         const meter = meters.find((row) => row.id === item.id);
         if (!meter) return item;
@@ -433,7 +575,19 @@ function SystemDiagramInner() {
         };
       }),
     );
-  }, [liveById, displays, meters, selectedId, diagramStateReady, setNodes]);
+    setEdges((current) =>
+      current.map((edge) => {
+        const targetOnline = isSampleOnline(liveById[edge.target]?.at);
+        return {
+          ...edge,
+          animated: targetOnline,
+          style: targetOnline
+            ? edgeStyle
+            : { stroke: "#94a3b8", strokeWidth: 2, strokeDasharray: "4 3" },
+        };
+      }),
+    );
+  }, [liveById, displays, meters, energy, projectName, selectedId, diagramStateReady, setNodes, setEdges]);
 
   useEffect(() => {
     setNodes((current) =>
@@ -548,7 +702,7 @@ function SystemDiagramInner() {
     clearDiagramState(projectId, energy);
     saveDiagramDisplays(projectId, energy, displays);
     const filtered = meters.filter((meter) => meter.utility === energy);
-    const built = buildFlowFromMeters(filtered, displays, liveById);
+    const built = buildFlowFromMeters(filtered, displays, liveById, projectName, energy);
     setNodes(
       built.nodes.map((node) => ({
         ...node,
@@ -556,11 +710,11 @@ function SystemDiagramInner() {
       })),
     );
     setEdges(built.edges);
-    fitView({ padding: 0.28, duration: 250 });
+    fitView({ padding: 0.22, duration: 250 });
     setSavedNotice(true);
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(() => setSavedNotice(false), 2000);
-  }, [projectId, energy, meters, displays, liveById, selectedId, setNodes, setEdges, fitView]);
+  }, [projectId, projectName, energy, meters, displays, liveById, selectedId, setNodes, setEdges, fitView]);
 
   const configHref = `/du-an/${projectId}/cau-hinh`;
 
@@ -807,12 +961,20 @@ function SystemDiagramInner() {
 
             {/* Right Panel: Display Customization */}
             {settingsOpen && selectedData && selectedMeter ? (
-              <NodeSettingsPanel
-                data={selectedData}
-                onClose={() => setSettingsOpen(false)}
-                onChange={updateSelectedDisplay}
-                onRefresh={refreshLive}
-              />
+              <>
+                <button
+                  type="button"
+                  aria-label="Đóng tùy chỉnh điểm đo"
+                  className="fixed inset-0 z-30 bg-slate-900/35 md:hidden"
+                  onClick={() => setSettingsOpen(false)}
+                />
+                <NodeSettingsPanel
+                  data={selectedData}
+                  onClose={() => setSettingsOpen(false)}
+                  onChange={updateSelectedDisplay}
+                  onRefresh={refreshLive}
+                />
+              </>
             ) : null}
           </div>
         </section>
@@ -846,7 +1008,7 @@ function NodeSettingsPanel({
   };
 
   return (
-    <aside className="flex w-[320px] shrink-0 flex-col border-l border-slate-200 bg-white font-sans shadow-lg">
+    <aside className="fixed inset-y-0 right-0 z-40 flex w-[min(320px,88vw)] shrink-0 flex-col border-l border-slate-200 bg-white font-sans shadow-2xl md:relative md:z-0 md:w-[320px] md:shadow-lg">
       <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3.5">
         <div>
           <h2 className="text-xs font-bold uppercase tracking-wide text-slate-800">Tùy chỉnh điểm đo</h2>

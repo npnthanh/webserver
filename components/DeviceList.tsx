@@ -187,12 +187,13 @@ export function DeviceList() {
 
         {view === "list" ? (
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[820px] text-left text-xs">
+            <table className="w-full min-w-[960px] text-left text-xs">
               <thead>
                 <tr className="border-b border-slate-100 bg-slate-50/60 text-[11px] font-semibold tracking-wider text-slate-400 uppercase">
                   <th className="px-5 py-3">Tên Model & Chủng loại</th>
                   <th className="px-5 py-3">Thương hiệu</th>
                   <th className="px-5 py-3">Phân loại</th>
+                  <th className="px-5 py-3">Dự án đang gắn</th>
                   <th className="px-5 py-3">Giao thức</th>
                   <th className="px-5 py-3">Hàm dữ liệu</th>
                   <th className="px-5 py-3 text-right">Thao tác</th>
@@ -201,13 +202,14 @@ export function DeviceList() {
               <tbody className="divide-y divide-slate-100">
                 {rows.length === 0 ? (
                   <tr>
-                    <td colSpan={6} className="px-5 py-12 text-center text-slate-400">
+                    <td colSpan={7} className="px-5 py-12 text-center text-slate-400">
                       Không tìm thấy loại đồng hồ nào phù hợp.
                     </td>
                   </tr>
                 ) : (
                   rows.map((device) => {
                     const Icon = getKindIcon(device.kind);
+                    const linked = device.projects ?? [];
                     return (
                       <tr
                         key={device.id}
@@ -242,6 +244,25 @@ export function DeviceList() {
                             {device.type}
                           </span>
                         </td>
+                        <td className="px-5 py-3.5">
+                          {linked.length > 0 ? (
+                            <div className="flex flex-col gap-1">
+                              {linked.map((link) => (
+                                <Link
+                                  key={link.meterId}
+                                  href={`/chinh-sua-du-an/${encodeURIComponent(link.projectId)}`}
+                                  className="text-[11px] font-semibold text-emerald-700 hover:underline"
+                                  title={`Điểm đo: ${link.meterName}`}
+                                >
+                                  {link.projectName}
+                                  <span className="font-normal text-slate-500"> · {link.meterName}</span>
+                                </Link>
+                              ))}
+                            </div>
+                          ) : (
+                            <span className="text-slate-400">Chưa gắn dự án</span>
+                          )}
+                        </td>
                         <td className="px-5 py-3.5 text-slate-600 font-mono text-[11px]">
                           {device.protocol || "—"}
                         </td>
@@ -267,8 +288,13 @@ export function DeviceList() {
                             <button
                               type="button"
                               onClick={() => setDeviceToDelete(device)}
-                              className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-400 hover:bg-rose-50 hover:text-rose-600 hover:border-rose-200 transition-colors"
-                              title="Xóa loại đồng hồ"
+                              disabled={linked.length > 0}
+                              className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-400 hover:bg-rose-50 hover:text-rose-600 hover:border-rose-200 transition-colors disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-white disabled:hover:text-slate-400 disabled:hover:border-slate-200"
+                              title={
+                                linked.length > 0
+                                  ? "Đồng hồ đang gắn trong dự án. Gỡ khỏi điểm đo của dự án trước khi xóa."
+                                  : "Xóa loại đồng hồ"
+                              }
                             >
                               <TrashIcon className="h-3.5 w-3.5" />
                             </button>
@@ -305,6 +331,11 @@ export function DeviceList() {
                       <p className="text-[11px] text-slate-400">{device.brand}</p>
                       <p className="mt-1 text-xs text-slate-600 font-mono">
                         {device.protocol || "Chưa chọn giao thức"}
+                      </p>
+                      <p className="mt-1 truncate text-[11px] text-slate-500">
+                        {(device.projects?.length ?? 0) > 0
+                          ? `Dự án: ${device.projects!.map((link) => link.projectName).join(", ")}`
+                          : "Chưa gắn dự án"}
                       </p>
                       <div className="mt-2.5 flex items-center justify-between gap-2 border-t border-slate-100 pt-2 text-[11px]">
                         <span className="rounded-full bg-slate-100 px-2 py-0.5 font-medium text-slate-600">

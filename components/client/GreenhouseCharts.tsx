@@ -1,721 +1,1337 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import { useAuth } from "@/components/auth/useAuth";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { CustomSelect } from "@/components/ui/CustomSelect";
+import { hydrateFactorGroups } from "@/lib/emission-factors";
+import { exportToExcel } from "@/lib/excel-export";
+import {
+  GHG_SCOPES,
+  computeManualTons,
+  computeMeterSourceTons,
+  getSourceMonthActivity,
+  getSourceYearActivity,
+  hydrateGhgSources,
+  loadGhgSources,
+  saveGhgSources,
+  type GhgEmissionSource,
+  type ScopeId,
+} from "@/lib/ghg-sources";
+import {
+  hydrateMeterReadings,
+  loadMeterReadings,
+  type MeterReading,
+} from "@/lib/meter-readings";
+import { loadProjectGatewayDailyRange } from "@/lib/gateway-series";
+import { registerToKwh } from "@/lib/meter-parameters";
+import {
+  formatAppNumber,
+  formatAppNumberInput,
+  formatLiveNumberInput,
+  parseAppNumber,
+  parseMonthlyExcelOrCsvFile,
+} from "@/lib/number-format";
 import {
   DEFAULT_TIME_FILTER,
   TimeFilterBar,
   getTimeFilterLabel,
+  getTimeFilterPeriods,
+  periodIndexForInstant,
+  timeFilterSpan,
+  type TimeFilterMode,
   type TimeFilterValue,
-} from "@/components/client/TimeFilterBar";
-import { canEditCustomerConfig } from "@/lib/customer-accounts";
-import {
-  GHG_SCOPES,
-  computeManualTons,
-  hydrateGhgSources,
-  loadGhgSources,
-  saveGhgSources,
-  scopeColor,
-  scopeLabel,
-  type GhgEmissionSource,
-  type ScopeId,
-} from "@/lib/ghg-sources";
+} from "./TimeFilterBar";
 
-function fmt(n: number, digits = 1) {
-  return n.toLocaleString("en-US", {
-    minimumFractionDigits: digits,
-    maximumFractionDigits: digits,
-  });
+function formatNumber(n: number, maxDecimals = 6): string {
+  return formatAppNumber(n, { maxDecimals });
 }
 
-type GreenhouseSelection =
+type Selection =
   | { kind: "all" }
   | { kind: "scope"; scope: ScopeId }
   | { kind: "source"; sourceId: string };
 
-export function GreenhouseCharts({ projectId }: { projectId: string }) {
-  const { session } = useAuth();
-  const canEdit = useMemo(
-    () => canEditCustomerConfig(session, projectId),
-    [session, projectId],
+type ComputedRow = GhgEmissionSource & {
+  tons: number;
+  share: number;
+  activityValue?: number;
+};
+
+const SCOPE_COLORS: Record<ScopeId, { bar: string; badgeBg: string; badgeText: string; dot: string }> = {
+  1: { bar: "#10b981", badgeBg: "#ecfdf5", badgeText: "#047857", dot: "#10b981" },
+  2: { bar: "#3b82f6", badgeBg: "#eff6ff", badgeText: "#1d4ed8", dot: "#3b82f6" },
+  3: { bar: "#f59e0b", badgeBg: "#fffbeb", badgeText: "#b45309", dot: "#f59e0b" },
+};
+
+const SOURCE_PALETTE = [
+  "#10b981",
+  "#3b82f6",
+  "#f59e0b",
+  "#8b5cf6",
+  "#ec4899",
+  "#14b8a6",
+  "#f97316",
+  "#06b6d4",
+];
+
+const ENTRY_YEARS = [2023, 2024, 2025, 2026, 2027, 2028, 2029, 2030];
+
+export function GreenhouseCharts({ projectId = "default" }: { projectId?: string }) {
+  const [rawSources, setRawSources] = useState<GhgEmissionSource[]>(() => loadGhgSources(projectId));
+  const [meterReadings, setMeterReadings] = useState<MeterReading[]>(() =>
+    loadMeterReadings(projectId),
   );
-  const [timeFilter, setTimeFilter] = useState<TimeFilterValue>({
-    ...DEFAULT_TIME_FILTER,
-    mode: "year",
+  const [meterKwhByPoint, setMeterKwhByPoint] = useState<Record<string, number>>({});
+  const [selection, setSelection] = useState<Selection>({ kind: "all" });
+  const [expandedScopes, setExpandedScopes] = useState<Record<ScopeId, boolean>>({
+    1: true,
+    2: true,
+    3: true,
   });
-  const [sources, setSources] = useState<GhgEmissionSource[]>([]);
-  const [selection, setSelection] = useState<GreenhouseSelection>({ kind: "all" });
-  const [sourcesOpen, setSourcesOpen] = useState(false);
-  const [editingSourceId, setEditingSourceId] = useState<string | null>(null);
-  const [draftValue, setDraftValue] = useState("");
-  const [draftUnit, setDraftUnit] = useState("lít");
-  const [saveError, setSaveError] = useState("");
-  const [saving, setSaving] = useState(false);
+  const [search, setSearch] = useState("");
+  const [timeFilter, setTimeFilter] = useState<TimeFilterValue>(DEFAULT_TIME_FILTER);
+
+  // State cho modal Nhập số liệu 12 tháng
+  const [editingSource, setEditingSource] = useState<GhgEmissionSource | null>(null);
+  const [modalYear, setModalYear] = useState<number>(DEFAULT_TIME_FILTER.year);
+  const [draftMonthly, setDraftMonthly] = useState<Record<string, string>>({});
+  const [importNotice, setImportNotice] = useState<string>("");
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    let active = true;
-    void hydrateGhgSources(projectId).then((sources) => {
-      if (active) setSources(sources);
-    }).catch(() => {
-      if (active) setSources(loadGhgSources());
-    });
+    const syncSources = () => setRawSources(loadGhgSources(projectId));
+    const syncReadings = () => setMeterReadings(loadMeterReadings(projectId));
+    void hydrateFactorGroups();
+    void hydrateGhgSources(projectId).then(setRawSources);
+    void hydrateMeterReadings(projectId).then(setMeterReadings);
+    window.addEventListener("ems-ghg-sources-changed", syncSources);
+    window.addEventListener("ems-meter-readings-changed", syncReadings);
     return () => {
-      active = false;
+      window.removeEventListener("ems-ghg-sources-changed", syncSources);
+      window.removeEventListener("ems-meter-readings-changed", syncReadings);
     };
   }, [projectId]);
 
-  const editingSource = useMemo(
-    () => sources.find((item) => item.id === editingSourceId) ?? null,
-    [editingSourceId, sources],
+  // Kiểm tra nguồn đang chọn có phải nguồn lấy từ điểm đo không
+  const selectedRawSource = useMemo(
+    () =>
+      selection.kind === "source"
+        ? rawSources.find((s) => s.id === selection.sourceId)
+        : undefined,
+    [selection, rawSources],
   );
 
+  // Phần tổng quan và nguồn nhập số liệu / import excel chỉ hiển thị theo Tháng hoặc Năm.
+  // Chỉ khi vào chi tiết nguồn lấy từ điểm đo (method === "meter") mới cho phép chọn Ngày / Tùy chọn.
+  const canFilterByDay =
+    selection.kind === "source" && selectedRawSource?.method === "meter";
+
+  const allowedModes = useMemo<TimeFilterMode[]>(
+    () => (canFilterByDay ? ["day", "month", "year", "custom_date"] : ["month", "year"]),
+    [canFilterByDay],
+  );
+
+  const effectiveTimeFilter = useMemo<TimeFilterValue>(() => {
+    if (!canFilterByDay && (timeFilter.mode === "day" || timeFilter.mode === "custom_date")) {
+      return { ...timeFilter, mode: "month" };
+    }
+    return timeFilter;
+  }, [canFilterByDay, timeFilter]);
+
   useEffect(() => {
-    if (!editingSource) return;
-    setDraftValue(editingSource.manualValue == null ? "" : String(editingSource.manualValue));
-    setDraftUnit(editingSource.manualUnit ?? "lít");
-    setSaveError("");
-  }, [editingSource]);
+    if (!canFilterByDay && (timeFilter.mode === "day" || timeFilter.mode === "custom_date")) {
+      setTimeFilter((prev) => ({ ...prev, mode: "month" }));
+    }
+  }, [canFilterByDay, timeFilter.mode]);
 
-  const rows = useMemo(() => {
-    const scaled = sources.map((source) => {
-      const rawTons =
-        source.method === "manual"
-          ? (computeManualTons(source) ?? source.tons ?? 0)
-          : (source.tons ?? 0);
-      const tons = Number(rawTons < 1 ? rawTons.toFixed(2) : rawTons.toFixed(1));
+  useEffect(() => {
+    let active = true;
+    const span = timeFilterSpan(effectiveTimeFilter);
+    const load = () => {
+      void loadProjectGatewayDailyRange(projectId, span.from, span.to).then((summary) => {
+        if (!active) return;
+        const map: Record<string, number> = {};
+        for (const row of summary.days) {
+          const firstKwh = registerToKwh(Number(row.firstWh));
+          const lastKwh = registerToKwh(Number(row.lastWh));
+          if (!Number.isFinite(firstKwh) || !Number.isFinite(lastKwh)) continue;
+          const consumed = Math.max(0, lastKwh - firstKwh);
+          map[row.meterPointId] = (map[row.meterPointId] ?? 0) + consumed;
+        }
+        setMeterKwhByPoint(map);
+      });
+    };
+    load();
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") load();
+    }, 15_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [projectId, effectiveTimeFilter]);
+
+  const activeYearAndMonth = useMemo(() => {
+    if (effectiveTimeFilter.mode === "month") {
+      const [y, m] = effectiveTimeFilter.month.split("-").map(Number);
       return {
-        ...source,
-        tons,
+        year: Number.isFinite(y) && y > 0 ? y : effectiveTimeFilter.year,
+        month: Number.isFinite(m) && m >= 1 && m <= 12 ? m : 1,
       };
+    }
+    return {
+      year: effectiveTimeFilter.year,
+      month: Number(effectiveTimeFilter.month.split("-")[1]) || 1,
+    };
+  }, [effectiveTimeFilter]);
+
+  const computedRows = useMemo<ComputedRow[]>(() => {
+    const withTons = rawSources.map((source) => {
+      let rawTons = 0;
+      let activityValue: number | undefined = undefined;
+
+      if (source.method === "meter") {
+        rawTons = computeMeterSourceTons(source, meterKwhByPoint) ?? 0;
+      } else {
+        // Nguồn nhập số liệu hoặc import file: tính theo Tháng hoặc Năm từ bảng 12 tháng
+        if (effectiveTimeFilter.mode === "year") {
+          let sumTons = 0;
+          let sumAct = 0;
+          for (let m = 1; m <= 12; m += 1) {
+            const mAct = getSourceMonthActivity(source, activeYearAndMonth.year, m);
+            sumAct += mAct;
+            sumTons += computeManualTons(source, mAct) ?? 0;
+          }
+          activityValue = Number(sumAct.toFixed(6));
+          rawTons = Number(sumTons.toFixed(6));
+        } else {
+          const mAct = getSourceMonthActivity(
+            source,
+            activeYearAndMonth.year,
+            activeYearAndMonth.month,
+          );
+          activityValue = Number(mAct.toFixed(6));
+          rawTons = computeManualTons(source, mAct) ?? 0;
+        }
+      }
+
+      const tons = Number(rawTons.toFixed(6));
+      return { ...source, tons, activityValue };
     });
-    const totalTons = scaled.reduce((s, r) => s + r.tons, 0) || 1;
-    return scaled
-      .map((row) => ({
-        ...row,
-        share: Number(((row.tons / totalTons) * 100).toFixed(1)),
-      }))
-      .sort((a, b) => b.tons - a.tons);
-  }, [sources]);
+    const totalTons = withTons.reduce((sum, r) => sum + r.tons, 0) || 1;
+    return withTons.map((row) => ({
+      ...row,
+      share: Number(((row.tons / totalTons) * 100).toFixed(1)),
+    }));
+  }, [rawSources, meterKwhByPoint, effectiveTimeFilter.mode, activeYearAndMonth]);
 
-  function openEntry(sourceId: string) {
-    setEditingSourceId(sourceId);
-  }
-
-  function closeEntry() {
-    setEditingSourceId(null);
-    setSaveError("");
-    setSaving(false);
-  }
-
-  function saveManualEntry() {
-    if (!editingSource) return;
-    if (!canEdit) {
-      setSaveError("Tài khoản của bạn chỉ có quyền xem, không thể chỉnh sửa số liệu.");
-      return;
+  const selectedRows = useMemo<ComputedRow[]>(() => {
+    if (selection.kind === "all") return computedRows;
+    if (selection.kind === "scope") {
+      return computedRows.filter((r) => r.scope === selection.scope);
     }
-    if (editingSource.method !== "manual") {
-      closeEntry();
-      return;
-    }
-    const parsed = draftValue.trim() ? Number(draftValue.replace(",", ".")) : undefined;
-    if (draftValue.trim() && !Number.isFinite(parsed)) {
-      setSaveError("Giá trị nhập không hợp lệ.");
-      return;
-    }
-    setSaving(true);
-    setSaveError("");
-    const nextSources = sources.map((item) => {
-      if (item.id !== editingSource.id) return item;
-      const next = {
-        ...item,
-        manualValue: parsed,
-        manualUnit: draftUnit.trim() || undefined,
-      };
-      return {
-        ...next,
-        tons: computeManualTons(next),
-      };
-    });
-    setSources(nextSources);
-    try {
-      saveGhgSources(nextSources, projectId);
-      closeEntry();
-    } catch (error) {
-      setSaveError(error instanceof Error ? error.message : "Không lưu được số liệu.");
-      setSaving(false);
-    }
-  }
+    return computedRows.filter((r) => r.id === selection.sourceId);
+  }, [computedRows, selection]);
 
-  const selectedRows = useMemo(() => {
-    if (selection.kind === "scope") return rows.filter((row) => row.scope === selection.scope);
-    if (selection.kind === "source") return rows.filter((row) => row.id === selection.sourceId);
-    return rows;
-  }, [rows, selection]);
+  const barData = useMemo(() => {
+    const meterSources = selectedRows.filter((r) => r.method === "meter");
+    const manualSources = selectedRows.filter((r) => r.method !== "meter");
 
-  const total = Number(selectedRows.reduce((s, r) => s + r.tons, 0).toFixed(1));
-  const visibleRows = useMemo(
+    // Nếu chỉ đang xem các nguồn nhập số liệu / import excel và bộ lọc đang ở chế độ Tháng,
+    // hiển thị biểu đồ cột 12 tháng của năm đó để dễ theo dõi biến động các tháng trong năm.
+    const force12MonthsForManual =
+      meterSources.length === 0 &&
+      manualSources.length > 0 &&
+      effectiveTimeFilter.mode === "month";
+
+    const periods = force12MonthsForManual
+      ? Array.from({ length: 12 }, (_, i) => ({ key: i + 1, label: `T${i + 1}` }))
+      : getTimeFilterPeriods(effectiveTimeFilter);
+
+    const len = periods.length || 1;
+    const buckets = Array<number>(len).fill(0);
+
+    if (meterSources.length > 0) {
+      for (const src of meterSources) {
+        const factor = Number.isFinite(src.factorValue) ? src.factorValue : 0;
+        const mul = (src.multipliers ?? []).reduce(
+          (acc, m) => acc * (Number.isFinite(m.value) ? m.value : 1),
+          1,
+        );
+        for (const reading of meterReadings) {
+          if (src.meterPointId && reading.meterPointId !== src.meterPointId) continue;
+          if (!src.meterPointId && reading.utility !== "Điện") continue;
+          const idx = periodIndexForInstant(effectiveTimeFilter, reading.recordedAt, len);
+          if (idx >= 0 && idx < len) {
+            buckets[idx] += (reading.value * factor * mul) / 1000;
+          }
+        }
+      }
+    }
+
+    if (manualSources.length > 0) {
+      if (effectiveTimeFilter.mode === "year" || force12MonthsForManual) {
+        // Phân bổ đúng giá trị của từng tháng (T1..T12)
+        for (let m = 1; m <= Math.min(12, len); m += 1) {
+          let monthTons = 0;
+          for (const src of manualSources) {
+            const act = getSourceMonthActivity(src, activeYearAndMonth.year, m);
+            monthTons += computeManualTons(src, act) ?? 0;
+          }
+          buckets[m - 1] += monthTons;
+        }
+      }
+    }
+
+    return periods.map((p, idx) => ({
+      label: p.label,
+      value: Number(buckets[idx].toFixed(6)),
+    }));
+  }, [selectedRows, effectiveTimeFilter, meterReadings, activeYearAndMonth.year]);
+
+  const totalSelectedTons = useMemo(
+    () => Number(selectedRows.reduce((s, r) => s + r.tons, 0).toFixed(6)),
+    [selectedRows],
+  );
+
+  const selectedWithLocalShare = useMemo(
     () =>
       selectedRows.map((row) => ({
         ...row,
-        share: total > 0 ? Number(((row.tons / total) * 100).toFixed(1)) : 0,
+        localShare:
+          totalSelectedTons > 0
+            ? Number(((row.tons / totalSelectedTons) * 100).toFixed(1))
+            : 0,
       })),
-    [selectedRows, total],
+    [selectedRows, totalSelectedTons],
   );
-  const scopeShares = useMemo(() => {
-    return GHG_SCOPES.map((scope) => {
-      const tons = visibleRows
-        .filter((row) => row.scope === scope.id)
-        .reduce((s, r) => s + r.tons, 0);
-      const share = total > 0 ? Number(((tons / total) * 100).toFixed(1)) : 0;
-      return { ...scope, tons, share };
-    }).filter((item) => item.tons > 0 || visibleRows.some((s) => s.scope === item.id));
-  }, [total, visibleRows]);
 
-  const selectionLabel =
-    selection.kind === "scope"
-      ? scopeLabel(selection.scope)
-      : selection.kind === "source"
-      ? visibleRows[0]?.name ?? "Nguồn phát thải"
-      : "Tất cả nguồn phát thải";
+  const scopeTotals = useMemo(() => {
+    const total = computedRows.reduce((s, r) => s + r.tons, 0);
+    return GHG_SCOPES.map((sc) => {
+      const rows = computedRows.filter((r) => r.scope === sc.id);
+      const tons = Number(rows.reduce((s, r) => s + r.tons, 0).toFixed(6));
+      const share = total > 0 ? Number(((tons / total) * 100).toFixed(1)) : 0;
+      return { ...sc, tons, share, count: rows.length };
+    });
+  }, [computedRows]);
+
+  const grandTotalTons = useMemo(
+    () => Number(computedRows.reduce((s, r) => s + r.tons, 0).toFixed(6)),
+    [computedRows],
+  );
+
+  const filteredTree = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return GHG_SCOPES.map((sc) => {
+      const items = computedRows.filter(
+        (r) =>
+          r.scope === sc.id &&
+          (!q || r.name.toLowerCase().includes(q) || sc.label.toLowerCase().includes(q)),
+      );
+      return { ...sc, items };
+    });
+  }, [computedRows, search]);
+
+  const pieSlices = useMemo(() => {
+    if (selection.kind === "all") {
+      return scopeTotals.map((sc) => ({
+        id: `scope-${sc.id}`,
+        label: sc.label,
+        tons: sc.tons,
+        share: sc.share,
+        color: SCOPE_COLORS[sc.id].bar,
+      }));
+    }
+    return selectedWithLocalShare.map((row, idx) => ({
+      id: row.id,
+      label: row.name,
+      tons: row.tons,
+      share: row.localShare,
+      color: SOURCE_PALETTE[idx % SOURCE_PALETTE.length],
+    }));
+  }, [selection, scopeTotals, selectedWithLocalShare]);
+
+  const headerTitle = useMemo(() => {
+    if (selection.kind === "all") return "Tổng quan phát thải khí nhà kính";
+    if (selection.kind === "scope") {
+      const sc = GHG_SCOPES.find((s) => s.id === selection.scope);
+      return sc ? `${sc.label} — ${sc.desc}` : "Phạm vi phát thải";
+    }
+    const row = computedRows.find((r) => r.id === selection.sourceId);
+    return row ? row.name : "Nguồn phát thải";
+  }, [selection, computedRows]);
+
+  const headerSubtitle = useMemo(() => {
+    if (selection.kind === "all") {
+      return `Tổng hợp tất cả ${computedRows.length} nguồn phát thải thuộc 3 phạm vi (Scope 1, 2, 3)`;
+    }
+    if (selection.kind === "scope") {
+      return `${selectedRows.length} nguồn phát thải trong Phạm vi ${selection.scope}`;
+    }
+    const row = computedRows.find((r) => r.id === selection.sourceId);
+    if (!row) return "";
+    return `Phạm vi ${row.scope} · Phương thức: ${
+      row.method === "meter"
+        ? "Từ điểm đo"
+        : row.method === "manual"
+          ? "Nhập số liệu"
+          : "Import Excel / File"
+    }`;
+  }, [selection, computedRows, selectedRows.length]);
+
+  function toggleScopeExpand(scope: ScopeId) {
+    setExpandedScopes((prev) => ({ ...prev, [scope]: !prev[scope] }));
+  }
+
+  function openManualEdit(source: GhgEmissionSource) {
+    const initialYear = activeYearAndMonth.year;
+    setEditingSource(source);
+    setModalYear(initialYear);
+    setImportNotice("");
+
+    // Khởi tạo dữ liệu nháp từ manualMonthly hiện có (hoặc tương thích manualValue cũ)
+    const draft: Record<string, string> = {};
+    if (source.manualMonthly && Object.keys(source.manualMonthly).length > 0) {
+      for (const [k, v] of Object.entries(source.manualMonthly)) {
+        if (Number.isFinite(v) && v > 0) {
+          draft[k] = formatAppNumber(v, { maxDecimals: 6 });
+        }
+      }
+    } else if (source.manualValue != null && source.manualValue > 0) {
+      const fallbackKey =
+        source.appliedAt && /^\d{4}-\d{2}/.test(source.appliedAt)
+          ? source.appliedAt.slice(0, 7)
+          : `${initialYear}-${String(activeYearAndMonth.month).padStart(2, "0")}`;
+      draft[fallbackKey] = formatAppNumber(source.manualValue, { maxDecimals: 6 });
+    }
+    setDraftMonthly(draft);
+  }
+
+  function updateMonthDraft(year: number, month: number, rawInput: string) {
+    const key = `${year}-${String(month).padStart(2, "0")}`;
+    setDraftMonthly((prev) => ({
+      ...prev,
+      [key]: formatLiveNumberInput(rawInput),
+    }));
+  }
+
+  function blurMonthDraft(year: number, month: number) {
+    const key = `${year}-${String(month).padStart(2, "0")}`;
+    setDraftMonthly((prev) => {
+      const current = prev[key] ?? "";
+      if (!current.trim()) return prev;
+      return {
+        ...prev,
+        [key]: formatAppNumberInput(current, 6),
+      };
+    });
+  }
+
+  function handlePasteIntoMonth(startMonth: number, e: React.ClipboardEvent<HTMLInputElement>) {
+    const text = e.clipboardData.getData("text/plain");
+    if (!text || (!text.includes("\n") && !text.includes("\t"))) return;
+    e.preventDefault();
+    const lines = text
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+    if (lines.length === 0) return;
+
+    setDraftMonthly((prev) => {
+      const next = { ...prev };
+      let mCursor = startMonth;
+      for (const line of lines) {
+        if (mCursor > 12) break;
+        const cells = line.split(/\t|;/).map((c) => c.trim());
+        for (const cell of cells) {
+          if (!/\d/.test(cell)) continue;
+          const num = parseAppNumber(cell, Number.NaN);
+          if (Number.isFinite(num) && num >= 0) {
+            const key = `${modalYear}-${String(mCursor).padStart(2, "0")}`;
+            next[key] = num > 0 ? formatAppNumber(num, { maxDecimals: 6 }) : "";
+            mCursor += 1;
+            break;
+          }
+        }
+      }
+      return next;
+    });
+    setImportNotice("Đã dán và tự động chuẩn hóa định dạng số liệu từ Clipboard.");
+  }
+
+  async function handleImportExcelFile(file: File) {
+    try {
+      const monthMap = await parseMonthlyExcelOrCsvFile(file);
+      const count = Object.keys(monthMap).length;
+      if (count === 0) {
+        setImportNotice("Không tìm thấy dữ liệu số hợp lệ trong file đã chọn.");
+        return;
+      }
+      setDraftMonthly((prev) => {
+        const next = { ...prev };
+        for (let m = 1; m <= 12; m += 1) {
+          const val = monthMap[m];
+          if (val !== undefined && Number.isFinite(val)) {
+            const key = `${modalYear}-${String(m).padStart(2, "0")}`;
+            next[key] = val > 0 ? formatAppNumber(val, { maxDecimals: 6 }) : "";
+          }
+        }
+        return next;
+      });
+      setImportNotice(
+        `Đã nhập ${count} tháng cho năm ${modalYear} từ file "${file.name}" và chuẩn hóa định dạng số.`,
+      );
+    } catch {
+      setImportNotice("Không thể đọc file. Vui lòng sử dụng file .xlsx hoặc .csv hợp lệ.");
+    }
+  }
+
+  function handleDownloadTemplate() {
+    if (!editingSource) return;
+    const fixedUnit = editingSource.manualUnit || "lít";
+    const rows = Array.from({ length: 12 }, (_, idx) => {
+      const m = idx + 1;
+      const key = `${modalYear}-${String(m).padStart(2, "0")}`;
+      const rawStr = draftMonthly[key] ?? "";
+      const val = rawStr.trim() ? parseAppNumber(rawStr, 0) : 0;
+      return [`Tháng ${m}`, val > 0 ? formatAppNumber(val, { maxDecimals: 6 }) : "0", fixedUnit];
+    });
+    exportToExcel({
+      filename: `Mau-so-lieu-12-thang-${modalYear}.xlsx`,
+      sheetName: `Nam_${modalYear}`,
+      title: `BẢNG SỐ LIỆU HOẠT ĐỘNG 12 THÁNG - NĂM ${modalYear}`,
+      subtitle: `${editingSource.name} (Đơn vị cố định: ${fixedUnit})`,
+      columns: [
+        { header: "Tháng", width: 16 },
+        { header: "Số liệu hoạt động", width: 24 },
+        { header: "Đơn vị cố định", width: 18 },
+      ],
+      rows,
+    });
+  }
+
+  function saveManualEdit() {
+    if (!editingSource) return;
+
+    const nextMonthly: Record<string, number> = {};
+    for (const [k, raw] of Object.entries(draftMonthly)) {
+      if (!/^\d{4}-\d{2}$/.test(k)) continue;
+      const trimmed = raw.trim();
+      if (!trimmed) continue;
+      const num = parseAppNumber(trimmed, Number.NaN);
+      if (Number.isFinite(num) && num >= 0) {
+        nextMonthly[k] = num;
+      }
+    }
+
+    // Tính tổng năm hiện tại để đồng bộ vào trường manualValue / tons dự phòng
+    let modalYearSum = 0;
+    for (let m = 1; m <= 12; m += 1) {
+      const k = `${modalYear}-${String(m).padStart(2, "0")}`;
+      modalYearSum += nextMonthly[k] ?? 0;
+    }
+    const activeMonthKey = `${activeYearAndMonth.year}-${String(activeYearAndMonth.month).padStart(2, "0")}`;
+    const representativeVal = nextMonthly[activeMonthKey] ?? modalYearSum;
+
+    const next = rawSources.map((src) => {
+      if (src.id !== editingSource.id) return src;
+      const updated: GhgEmissionSource = {
+        ...src,
+        manualMonthly: nextMonthly,
+        manualValue: Number(representativeVal.toFixed(6)),
+      };
+      return {
+        ...updated,
+        tons: computeManualTons(updated, representativeVal) ?? src.tons,
+      };
+    });
+    setRawSources(next);
+    saveGhgSources(next, projectId);
+    setEditingSource(null);
+  }
 
   return (
-    <div className="relative flex h-full min-h-0 overflow-hidden bg-[#f4f6f9]">
-      {sourcesOpen ? (
-        <button
-          type="button"
-          aria-label="Đóng danh sách nguồn phát thải"
-          className="fixed inset-0 z-30 bg-slate-900/40 md:hidden"
-          onClick={() => setSourcesOpen(false)}
-        />
-      ) : null}
-
-      <aside
-        className={`${
-          sourcesOpen ? "fixed inset-y-0 left-0 z-40 flex" : "hidden"
-        } w-[min(280px,85vw)] shrink-0 flex-col border-r border-slate-200 bg-white shadow-2xl md:relative md:z-0 md:flex md:w-[250px] md:shadow-none`}
-      >
-        <div className="flex items-center justify-between border-b border-slate-100 px-4 py-4">
-          <div>
-            <p className="text-[11px] font-bold tracking-[0.08em] text-slate-500">PHẠM VI & NGUỒN PHÁT THẢI</p>
-            <p className="mt-1 text-xs text-slate-400">{rows.length} nguồn đang cấu hình</p>
+    <div className="mx-auto max-w-[1600px] p-4 sm:p-6">
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-[310px_minmax(0,1fr)]">
+        {/* Cột trái: Cây phân cấp phát thải */}
+        <aside className="self-start rounded-2xl border border-slate-200/80 bg-white p-4 shadow-xs lg:sticky lg:top-6">
+          <div className="mb-3 flex items-center justify-between">
+            <h2 className="text-xs font-bold tracking-wider text-slate-500 uppercase">
+              Danh mục nguồn phát thải
+            </h2>
+            <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-semibold text-emerald-700">
+              {computedRows.length} nguồn
+            </span>
           </div>
-          <button
-            type="button"
-            onClick={() => setSourcesOpen(false)}
-            className="flex h-7 w-7 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 md:hidden"
-            aria-label="Đóng"
-          >
-            ✕
-          </button>
-        </div>
 
-        <div className="min-h-0 flex-1 overflow-y-auto p-3">
-          <button
-            type="button"
-            onClick={() => {
-              setSelection({ kind: "all" });
-              setSourcesOpen(false);
-            }}
-            className={`mb-3 flex w-full items-center justify-between rounded-lg border px-3 py-2.5 text-left transition-colors ${
-              selection.kind === "all"
-                ? "border-emerald-200 bg-emerald-50 text-emerald-800"
-                : "border-slate-200 text-slate-600 hover:border-emerald-200 hover:bg-emerald-50/50"
-            }`}
-          >
-            <span className="text-[13px] font-semibold">Tất cả nguồn phát thải</span>
-            <span className="text-[11px] font-semibold text-slate-400">{rows.length}</span>
-          </button>
-
-          <div className="space-y-4">
-            {GHG_SCOPES.map((scope) => {
-              const scopeRows = rows.filter((row) => row.scope === scope.id);
-              const scopeActive = selection.kind === "scope" && selection.scope === scope.id;
-              return (
-                <section key={scope.id}>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setSelection({ kind: "scope", scope: scope.id });
-                      setSourcesOpen(false);
-                    }}
-                    className={`flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left transition-colors ${
-                      scopeActive ? "bg-slate-100" : "hover:bg-slate-50"
-                    }`}
-                  >
-                    <span className="inline-flex items-center gap-2 text-[12px] font-bold text-slate-700">
-                      <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: scope.color }} />
-                      {scope.label}
-                    </span>
-                    <span className="text-[11px] text-slate-400">{scopeRows.length}</span>
-                  </button>
-
-                  {scopeRows.length ? (
-                    <div className="mt-1 space-y-1 border-l border-slate-200 pl-3">
-                      {scopeRows.map((row) => {
-                        const sourceActive = selection.kind === "source" && selection.sourceId === row.id;
-                        return (
-                          <button
-                            key={row.id}
-                            type="button"
-                            onClick={() => {
-                              setSelection({ kind: "source", sourceId: row.id });
-                              setSourcesOpen(false);
-                            }}
-                            className={`flex w-full items-start justify-between gap-2 rounded-md px-2 py-2 text-left transition-colors ${
-                              sourceActive
-                                ? "bg-emerald-50 text-emerald-800"
-                                : "text-slate-600 hover:bg-slate-50"
-                            }`}
-                          >
-                            <span className="min-w-0">
-                              <span className="block truncate text-[12px] font-medium">{row.name}</span>
-                              <span className="mt-0.5 block text-[10px] text-slate-400">{scope.label}</span>
-                            </span>
-                            <span className="shrink-0 pt-0.5 text-[10px] font-semibold text-slate-400">
-                              {fmt(row.tons)}
-                            </span>
-                          </button>
-                        );
-                      })}
-                    </div>
-                  ) : (
-                    <p className="px-4 py-1 text-[11px] text-slate-400">Chưa có nguồn</p>
-                  )}
-                </section>
-              );
-            })}
+          {/* Ô tìm kiếm */}
+          <div className="relative mb-3">
+            <SearchIcon className="pointer-events-none absolute top-1/2 left-3 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
+            <input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Tìm nguồn phát thải..."
+              className="h-9 w-full rounded-xl border border-slate-200 bg-slate-50/70 pr-3 pl-8 text-xs text-slate-700 outline-none placeholder:text-slate-400 focus:border-emerald-500 focus:bg-white"
+            />
           </div>
-        </div>
 
-        <div className="border-t border-slate-100 px-4 py-3 text-[11px] text-slate-400">
-          Chọn phạm vi hoặc nguồn để xem chi tiết
-        </div>
-      </aside>
-
-      <div className="min-w-0 flex-1 overflow-y-auto p-3 sm:p-4 lg:p-5">
-        {/* Thanh lọc nhanh Phạm vi & Nguồn trên Mobile */}
-        <div className="mb-3 flex items-center gap-1.5 overflow-x-auto pb-1 scrollbar-none md:hidden">
-          <button
-            type="button"
-            onClick={() => setSourcesOpen(true)}
-            className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 text-xs font-semibold text-slate-700 shadow-xs"
-          >
-            <span>Nguồn ({rows.length})</span>
-          </button>
+          {/* Nút Tổng quan */}
           <button
             type="button"
             onClick={() => setSelection({ kind: "all" })}
-            className={`inline-flex h-8 shrink-0 items-center rounded-lg px-2.5 text-xs font-semibold transition-colors ${
+            className={`mb-2 flex w-full items-center justify-between rounded-xl px-3 py-2.5 text-left text-xs font-semibold transition-all ${
               selection.kind === "all"
                 ? "bg-emerald-600 text-white shadow-xs"
-                : "border border-slate-200 bg-white text-slate-600"
+                : "bg-slate-50 text-slate-700 hover:bg-slate-100"
             }`}
           >
-            Tất cả
+            <span className="flex items-center gap-2">
+              <GlobeIcon className="h-4 w-4" />
+              <span>Tổng hợp toàn nhà máy</span>
+            </span>
+            <span
+              className={`rounded-md px-1.5 py-0.5 font-mono text-[11px] ${
+                selection.kind === "all"
+                  ? "bg-white/20 text-white"
+                  : "bg-white text-slate-600"
+              }`}
+            >
+              {formatNumber(grandTotalTons)} t
+            </span>
           </button>
-          {GHG_SCOPES.map((scope) => {
-            const active = selection.kind === "scope" && selection.scope === scope.id;
-            return (
-              <button
-                key={scope.id}
-                type="button"
-                onClick={() => setSelection({ kind: "scope", scope: scope.id })}
-                className={`inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg px-2.5 text-xs font-semibold transition-colors ${
-                  active
-                    ? "bg-emerald-600 text-white shadow-xs"
-                    : "border border-slate-200 bg-white text-slate-600"
-                }`}
-              >
-                <span className="h-2 w-2 rounded-full" style={{ backgroundColor: active ? "#fff" : scope.color }} />
-                {scope.label}
-              </button>
-            );
-          })}
-        </div>
 
-        <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <h2 className="text-lg font-bold tracking-tight text-slate-800 sm:text-[22px]">
-              Tổng quan phát thải khí nhà kính
-            </h2>
-            <p className="mt-0.5 text-xs text-slate-500">
-              Theo dõi phát thải CO₂e theo phạm vi Scope 1, 2, 3 · Kỳ: <strong className="text-slate-800">{getTimeFilterLabel(timeFilter)}</strong>
-              <span className="ml-2 text-slate-400">· {selectionLabel}</span>
-            </p>
+          {/* Cây Scope 1, 2, 3 */}
+          <div className="space-y-1.5">
+            {filteredTree.map((sc) => {
+              const scopeActive =
+                selection.kind === "scope" && selection.scope === sc.id;
+              const isOpen = expandedScopes[sc.id];
+              const scTotal = scopeTotals.find((s) => s.id === sc.id)?.tons ?? 0;
+              const colors = SCOPE_COLORS[sc.id];
+
+              return (
+                <div
+                  key={sc.id}
+                  className="overflow-hidden rounded-xl border border-slate-100 bg-slate-50/50"
+                >
+                  <div
+                    className={`flex items-center justify-between px-2.5 py-2 transition-colors ${
+                      scopeActive
+                        ? "bg-emerald-50 text-emerald-900"
+                        : "hover:bg-slate-100/80"
+                    }`}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => setSelection({ kind: "scope", scope: sc.id })}
+                      className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                    >
+                      <span
+                        className="h-2.5 w-2.5 shrink-0 rounded-full"
+                        style={{ backgroundColor: colors.dot }}
+                      />
+                      <span className="truncate text-xs font-bold text-slate-800">
+                        {sc.label}
+                      </span>
+                      <span className="rounded bg-white px-1.5 py-0.5 font-mono text-[10px] font-semibold text-slate-500 ring-1 ring-slate-200/70">
+                        {formatNumber(scTotal)} t
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => toggleScopeExpand(sc.id)}
+                      aria-label={`Thu gọn / mở rộng ${sc.label}`}
+                      className="ml-1 flex h-6 w-6 items-center justify-center rounded-md text-slate-400 hover:bg-white hover:text-slate-600"
+                    >
+                      <ChevronDownIcon
+                        className={`h-3.5 w-3.5 transition-transform ${
+                          isOpen ? "rotate-0" : "-rotate-90"
+                        }`}
+                      />
+                    </button>
+                  </div>
+
+                  {isOpen && (
+                    <ul className="space-y-0.5 border-t border-slate-100 bg-white p-1.5">
+                      {sc.items.map((item) => {
+                        const active =
+                          selection.kind === "source" && selection.sourceId === item.id;
+                        return (
+                          <li key={item.id}>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setSelection({ kind: "source", sourceId: item.id })
+                              }
+                              className={`flex w-full items-center justify-between gap-2 rounded-lg px-2.5 py-2 text-left text-xs transition-colors ${
+                                active
+                                  ? "bg-emerald-50 font-semibold text-emerald-800 ring-1 ring-emerald-200"
+                                  : "text-slate-600 hover:bg-slate-50 hover:text-slate-900"
+                              }`}
+                            >
+                              <span className="min-w-0 flex-1 truncate">{item.name}</span>
+                              <span className="shrink-0 font-mono text-[11px] text-slate-500">
+                                {formatNumber(item.tons)}
+                              </span>
+                            </button>
+                          </li>
+                        );
+                      })}
+                      {sc.items.length === 0 && (
+                        <li className="px-2.5 py-2 text-[11px] text-slate-400">
+                          Không có nguồn phù hợp
+                        </li>
+                      )}
+                    </ul>
+                  )}
+                </div>
+              );
+            })}
           </div>
-          <TimeFilterBar value={timeFilter} onChange={setTimeFilter} />
-        </div>
+        </aside>
 
-      <div className="grid gap-4 md:grid-cols-3">
-        <KpiCard
-          label="TỔNG LƯỢNG PHÁT THẢI"
-          value={`${fmt(total, total < 10 ? 2 : 1)}`}
-          hint="tấn CO₂e"
-        />
-        <KpiCard
-          label="CƯỜNG ĐỘ PHÁT THẢI"
-          value="—"
-          hint="tấn/sản phẩm"
-        />
-        <article className="rounded-lg border border-slate-200 bg-white px-5 py-4 shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
-          <p className="text-[11px] font-semibold tracking-[0.08em] text-slate-400">
-            MỤC TIÊU GIẢM THẢI · {timeFilter.year}
-          </p>
-          <p className="mt-2 text-[28px] font-bold leading-none text-slate-800">
-            — <span className="text-[15px] font-medium text-slate-500">chưa thiết lập</span>
-          </p>
-          <div className="mt-4 h-2.5 overflow-hidden rounded-full bg-slate-100">
-            <div className="h-full rounded-full bg-emerald-600 transition-all duration-500" style={{ width: "0%" }} />
+        {/* Khu vực chính */}
+        <div className="space-y-6">
+          {/* Header ngữ cảnh + Bộ lọc thời gian */}
+          <div className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-slate-200/80 bg-white px-5 py-4 shadow-xs">
+            <div>
+              <div className="flex items-center gap-2">
+                <h1 className="text-base font-bold text-slate-900">{headerTitle}</h1>
+                <span className="rounded-full bg-emerald-50 px-2.5 py-0.5 text-xs font-semibold text-emerald-700">
+                  {formatNumber(totalSelectedTons)} tấn CO₂e
+                </span>
+                <span className="rounded-full bg-slate-100 px-2.5 py-0.5 text-[11px] font-medium text-slate-600">
+                  {getTimeFilterLabel(effectiveTimeFilter)}
+                </span>
+              </div>
+              <p className="mt-0.5 text-xs text-slate-500">{headerSubtitle}</p>
+            </div>
+            <TimeFilterBar
+              value={effectiveTimeFilter}
+              onChange={setTimeFilter}
+              allowedModes={allowedModes}
+            />
           </div>
-        </article>
-      </div>
 
-      <div className="mt-4 grid gap-4 xl:grid-cols-2">
-        <article className="rounded-lg border border-slate-200 bg-white p-5 shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
-          <h3 className="text-[13px] font-bold tracking-[0.06em] text-slate-700">
-            PHÂN BỐ THEO PHẠM VI
-          </h3>
-          <ScopeDonut segments={scopeShares} />
-          <div className="mt-2 flex flex-wrap justify-center gap-5 text-[13px] text-slate-600">
-            {scopeShares.map((item) => (
-              <span key={item.id} className="inline-flex items-center gap-2">
-                <span
-                  className="h-3 w-3 rounded-[2px]"
-                  style={{ backgroundColor: item.color }}
-                />
-                {item.label} ({item.share}%)
-              </span>
-            ))}
-          </div>
-        </article>
+          {/* 3 thẻ KPI Phạm vi 1, 2, 3 khi xem Tổng quan */}
+          {selection.kind === "all" && (
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+              {scopeTotals.map((sc) => {
+                const colors = SCOPE_COLORS[sc.id];
+                return (
+                  <button
+                    key={sc.id}
+                    type="button"
+                    onClick={() => setSelection({ kind: "scope", scope: sc.id })}
+                    className="group rounded-2xl border border-slate-200/80 bg-white p-4 text-left shadow-xs transition-all hover:border-emerald-300 hover:shadow-sm"
+                  >
+                    <div className="flex items-center justify-between">
+                      <span
+                        className="inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-semibold"
+                        style={{
+                          backgroundColor: colors.badgeBg,
+                          color: colors.badgeText,
+                        }}
+                      >
+                        <span
+                          className="h-2 w-2 rounded-full"
+                          style={{ backgroundColor: colors.dot }}
+                        />
+                        {sc.label} ({sc.short})
+                      </span>
+                      <span className="text-xs font-semibold text-slate-400 group-hover:text-emerald-600">
+                        {sc.count} nguồn →
+                      </span>
+                    </div>
+                    <div className="mt-3 flex items-baseline justify-between">
+                      <div>
+                        <span className="font-mono text-2xl font-bold text-slate-900">
+                          {formatNumber(sc.tons)}
+                        </span>
+                        <span className="ml-1.5 text-xs text-slate-500">tấn CO₂e</span>
+                      </div>
+                      <span className="font-mono text-sm font-semibold text-slate-700">
+                        {formatNumber(sc.share, 1)}%
+                      </span>
+                    </div>
+                    <p className="mt-1 text-[11px] text-slate-400">{sc.desc}</p>
+                  </button>
+                );
+              })}
+            </div>
+          )}
 
-        <article className="rounded-lg border border-slate-200 bg-white p-5 shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
-          <h3 className="text-[13px] font-bold tracking-[0.06em] text-slate-700">
-            CHI TIẾT PHÁT THẢI (TẤN CO₂E)
-          </h3>
-          <p className="mt-1 text-[12px] text-slate-400">
-            Tổng hợp {visibleRows.length} nguồn phát thải ({fmt(total, total < 10 ? 2 : 1)} tấn CO₂e)
-          </p>
-          {visibleRows.length === 0 ? (
-            <p className="py-10 text-center text-sm text-slate-400">
-              Chưa có nguồn phát thải trong cấu hình
-            </p>
-          ) : (
-            <>
-              <div className="mt-3 overflow-x-auto">
-                <table className="w-full min-w-[520px] text-left text-[13px]">
+          {/* Hàng trên: Bảng chi tiết + Biểu đồ tròn */}
+          <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1.25fr)_minmax(0,1fr)]">
+            <section className="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-xs">
+              <div className="mb-4 flex items-center justify-between">
+                <div>
+                  <h2 className="text-xs font-bold tracking-wider text-slate-800 uppercase">
+                    Chi tiết phát thải (Tấn CO₂e)
+                  </h2>
+                  <p className="mt-0.5 text-[11px] text-slate-400">
+                    {selection.kind === "all"
+                      ? `Tổng hợp ${selectedWithLocalShare.length} nguồn phát thải (${formatNumber(totalSelectedTons)} tấn CO₂e)`
+                      : `Hiển thị ${selectedWithLocalShare.length} mục đã chọn`}
+                  </p>
+                </div>
+                {selection.kind !== "all" && (
+                  <button
+                    type="button"
+                    onClick={() => setSelection({ kind: "all" })}
+                    className="rounded-lg border border-slate-200 px-2.5 py-1 text-xs font-medium text-slate-600 hover:bg-slate-50"
+                  >
+                    Xem tất cả
+                  </button>
+                )}
+              </div>
+
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
                   <thead>
-                    <tr className="border-b border-slate-100 text-[11px] font-semibold tracking-wide text-slate-400">
-                      <th className="py-2 font-semibold">HẠNG MỤC</th>
-                      <th className="py-2 font-semibold">PHẠM VI</th>
-                      <th className="py-2 font-semibold">SỐ LIỆU</th>
-                      <th className="py-2 text-right font-semibold">GIÁ TRỊ (TẤN)</th>
-                      <th className="py-2 text-right font-semibold">TỶ TRỌNG</th>
-                      <th className="py-2 text-right font-semibold">THAO TÁC</th>
+                    <tr className="border-b border-slate-200 text-[11px] font-semibold text-slate-400 uppercase">
+                      <th className="pb-2.5">Hạng mục</th>
+                      <th className="pb-2.5">Phạm vi</th>
+                      <th className="pb-2.5">Số liệu</th>
+                      <th className="pb-2.5 text-right">Giá trị (Tấn)</th>
+                      <th className="pb-2.5 text-right">Tỷ trọng (%)</th>
                     </tr>
                   </thead>
-                  <tbody>
-                    {visibleRows.map((row) => (
-                      <tr key={row.id} className="border-b border-slate-50">
-                        <td className="py-2.5 font-medium text-slate-700">{row.name}</td>
-                        <td className="py-2.5">
-                          <ScopeBadge scope={row.scope} />
-                        </td>
-                        <td className="py-2.5 text-slate-600">
-                          {row.method === "manual" ? (
-                            row.manualValue == null ? (
-                              <button
-                                type="button"
-                                onClick={() => openEntry(row.id)}
-                                className="inline-flex items-center gap-1 rounded-md border border-amber-200 bg-amber-50 px-2 py-1 text-xs font-semibold text-amber-700 transition-colors hover:bg-amber-100"
-                              >
-                                + Nhập số liệu
-                              </button>
+                  <tbody className="divide-y divide-slate-100">
+                    {selectedWithLocalShare.map((row) => {
+                      const colors = SCOPE_COLORS[row.scope];
+                      const fixedUnit = row.manualUnit || "lít";
+                      return (
+                        <tr
+                          key={row.id}
+                          onClick={() =>
+                            setSelection({ kind: "source", sourceId: row.id })
+                          }
+                          className="cursor-pointer text-slate-700 transition-colors hover:bg-slate-50/80"
+                        >
+                          <td className="py-3 pr-2 font-medium text-slate-800">
+                            {row.name}
+                          </td>
+                          <td className="py-3 pr-2">
+                            <span
+                              className="inline-flex rounded-md px-2 py-0.5 text-[11px] font-semibold"
+                              style={{
+                                backgroundColor: colors.badgeBg,
+                                color: colors.badgeText,
+                              }}
+                            >
+                              Phạm vi {row.scope}
+                            </span>
+                          </td>
+                          <td
+                            className="py-3 pr-2"
+                            onClick={(e) => {
+                              if (row.method !== "meter") {
+                                e.stopPropagation();
+                                openManualEdit(row);
+                              }
+                            }}
+                          >
+                            {row.method === "meter" ? (
+                              <span className="text-[11px] text-slate-400">Từ điểm đo</span>
                             ) : (
                               <button
                                 type="button"
-                                onClick={() => openEntry(row.id)}
-                                className="inline-flex items-center gap-1 rounded-md bg-emerald-50 px-2 py-1 text-xs font-semibold text-emerald-700 transition-colors hover:bg-emerald-100"
+                                className="inline-flex items-center gap-1 rounded-md bg-emerald-50 px-2 py-0.5 text-[11px] font-semibold text-emerald-700 hover:bg-emerald-100"
+                                title="Nhấn để nhập bảng số liệu 12 tháng hoặc import từ Excel"
                               >
-                                {row.manualValue.toLocaleString("vi-VN")}
-                                {row.manualUnit ? ` ${row.manualUnit}` : ""}
+                                {row.activityValue != null && row.activityValue > 0 ? (
+                                  <>
+                                    {formatNumber(row.activityValue)} {fixedUnit}
+                                  </>
+                                ) : (
+                                  "+ Nhập số liệu"
+                                )}
                               </button>
-                            )
-                          ) : row.method === "meter" ? (
-                            <span className="text-slate-400">Từ điểm đo</span>
-                          ) : (
-                            <span className="text-slate-400">File</span>
-                          )}
-                        </td>
-                        <td className="py-2.5 text-right text-slate-700">{fmt(row.tons)}</td>
-                        <td className="py-2.5 text-right font-semibold text-slate-700">
-                          {row.share.toFixed(1)}%
-                        </td>
-                        <td className="py-2.5 text-right">
-                          <button
-                            type="button"
-                            onClick={() => openEntry(row.id)}
-                            className="inline-flex h-8 items-center justify-center gap-1.5 rounded-md px-2 text-xs font-medium text-slate-600 transition-colors hover:bg-emerald-50 hover:text-emerald-600"
-                            aria-label={
-                              row.method === "manual"
-                                ? `Nhập số liệu ${row.name}`
-                                : `Xem ${row.name}`
-                            }
-                            title={
-                              row.method === "manual"
-                                ? "Nhập số liệu thủ công"
-                                : "Xem nguồn phát thải"
-                            }
-                          >
-                            <PencilIcon className="h-4 w-4 shrink-0" />
-                            {row.method === "manual" ? (
-                              <span>{row.manualValue == null ? "Nhập" : "Sửa"}</span>
-                            ) : null}
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
+                            )}
+                          </td>
+                          <td className="py-3 text-right font-mono text-slate-800">
+                            {formatNumber(row.tons)}
+                          </td>
+                          <td className="py-3 text-right font-mono font-semibold text-slate-900">
+                            {formatNumber(row.localShare, 1)}%
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
 
-              <h4 className="mt-5 text-[12px] font-bold tracking-[0.06em] text-slate-500">
-                BIỂU ĐỒ TỶ TRỌNG PHÁT THẢI
-              </h4>
-              <ul className="mt-3 space-y-3">
-                {visibleRows.map((row) => (
-                  <li key={row.id}>
-                    <div className="mb-1 flex items-center justify-between text-[12px] text-slate-600">
-                      <span>
-                        {row.name} ({scopeLabel(row.scope)})
-                      </span>
-                      <span className="font-semibold">{row.share.toFixed(1)}%</span>
+              {/* Thanh tỷ trọng trực quan */}
+              <div className="mt-6 border-t border-slate-100 pt-5">
+                <h3 className="mb-4 text-xs font-bold tracking-wider text-slate-800 uppercase">
+                  Biểu đồ tỷ trọng phát thải
+                </h3>
+                <div className="space-y-3.5">
+                  {(selection.kind === "all"
+                    ? scopeTotals.map((sc) => ({
+                        id: `bar-scope-${sc.id}`,
+                        label: `${sc.label} (${sc.short}) — ${sc.desc}`,
+                        share: sc.share,
+                        color: SCOPE_COLORS[sc.id].bar,
+                      }))
+                    : selectedWithLocalShare.map((row, idx) => ({
+                        id: row.id,
+                        label: `${row.name} (Phạm vi ${row.scope})`,
+                        share: row.localShare,
+                        color: SOURCE_PALETTE[idx % SOURCE_PALETTE.length],
+                      }))
+                  ).map((bar) => (
+                    <div key={bar.id}>
+                      <div className="mb-1 flex justify-between text-xs text-slate-700">
+                        <span className="truncate pr-2">{bar.label}</span>
+                        <span className="font-semibold">{formatNumber(bar.share, 1)}%</span>
+                      </div>
+                      <div className="h-2.5 w-full overflow-hidden rounded-full bg-slate-100">
+                        <div
+                          className="h-full rounded-full transition-all"
+                          style={{
+                            width: `${Math.min(100, bar.share)}%`,
+                            backgroundColor: bar.color,
+                          }}
+                        />
+                      </div>
                     </div>
-                    <div className="h-2 overflow-hidden rounded-full bg-slate-100">
-                      <div
-                        className="h-full rounded-full"
-                        style={{
-                          width: `${row.share}%`,
-                          backgroundColor: scopeColor(row.scope),
-                        }}
-                      />
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            </>
-          )}
-        </article>
+                  ))}
+                </div>
+              </div>
+            </section>
+
+            {/* Biểu đồ tròn */}
+            <section className="flex flex-col rounded-2xl border border-slate-200/80 bg-white p-5 shadow-xs">
+              <div className="mb-2 flex items-center justify-between">
+                <h2 className="text-xs font-bold tracking-wider text-slate-800 uppercase">
+                  {selection.kind === "all"
+                    ? "Cơ cấu theo phạm vi (Scope 1, 2, 3)"
+                    : "Biểu đồ tròn phát thải"}
+                </h2>
+                <span className="text-[11px] text-slate-400">Đơn vị: %</span>
+              </div>
+              <div className="flex flex-1 flex-col items-center justify-center py-4">
+                <PieChart slices={pieSlices} total={totalSelectedTons} />
+              </div>
+            </section>
+          </div>
+
+          {/* Biểu đồ cột theo thời gian */}
+          <section className="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-xs">
+            <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h2 className="text-xs font-bold tracking-wider text-slate-800 uppercase">
+                  Biểu đồ cột theo thời gian
+                </h2>
+                <p className="mt-0.5 text-[11px] text-slate-400">
+                  Lượng phát thải (Tấn CO₂e) của mục đang chọn ·{" "}
+                  {getTimeFilterLabel(effectiveTimeFilter)}
+                </p>
+              </div>
+            </div>
+            <BarChart data={barData} />
+          </section>
+        </div>
       </div>
 
-      {editingSource ? (
-        <div className="fixed inset-0 z-40 flex items-end justify-center bg-slate-900/40 p-4 sm:items-center">
+      {/* Modal nhập bảng số liệu 12 tháng cho nguồn thủ công / import file */}
+      {editingSource && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/45 p-3 sm:p-4 backdrop-blur-[1px]"
+          onClick={() => setEditingSource(null)}
+        >
           <div
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="ghg-entry-title"
-            className="w-full max-w-md rounded-xl border border-slate-200 bg-white p-5 shadow-xl"
+            className="flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xl"
+            onClick={(e) => e.stopPropagation()}
           >
-            <h3 id="ghg-entry-title" className="text-[16px] font-bold text-slate-800">
-              {editingSource.method === "manual" ? "Nhập số liệu" : "Chi tiết nguồn"}
-            </h3>
-            <p className="mt-1 text-[13px] text-slate-500">
-              {editingSource.name} · {scopeLabel(editingSource.scope)}
-            </p>
-
-            {editingSource.method === "manual" ? (
-              <div className="mt-4 space-y-3">
-                <label className="block">
-                  <span className="mb-1.5 block text-[11px] font-semibold tracking-wide text-slate-500">
-                    KHỐI LƯỢNG / GIÁ TRỊ THỦ CÔNG
-                  </span>
-                  <div className="grid grid-cols-[minmax(0,1fr)_110px] gap-2">
-                    <input
-                      value={draftValue}
-                      onChange={(e) => setDraftValue(e.target.value)}
-                      disabled={!canEdit}
-                      inputMode="decimal"
-                      placeholder="VD: 1200"
-                      className="h-10 rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-emerald-500 disabled:bg-slate-50 disabled:text-slate-400"
-                    />
-                    <input
-                      value={draftUnit}
-                      onChange={(e) => setDraftUnit(e.target.value)}
-                      disabled={!canEdit}
-                      placeholder="Đơn vị"
-                      className="h-10 rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-emerald-500 disabled:bg-slate-50 disabled:text-slate-400"
-                    />
-                  </div>
-                </label>
-                <p className="text-[12px] text-slate-400">
-                  Hệ thống tính tấn CO₂e theo công thức đã cấu hình của nguồn này.
+            {/* Header Modal: Tiêu đề bên trái + Chọn năm ở góc trên bên phải */}
+            <div className="flex flex-wrap items-start justify-between gap-3 border-b border-slate-100 px-5 py-4">
+              <div>
+                <h3 className="text-base font-bold text-slate-900">Nhập số liệu</h3>
+                <p className="mt-0.5 text-xs text-slate-500">
+                  {editingSource.name} · Phạm vi {editingSource.scope}
                 </p>
-                {saveError ? <p className="text-[12px] text-rose-600">{saveError}</p> : null}
-                <div className="flex justify-end gap-2 pt-1">
-                  <button
-                    type="button"
-                    onClick={closeEntry}
-                    className="h-9 rounded-lg border border-slate-200 px-3 text-sm font-medium text-slate-600 hover:bg-slate-50"
-                  >
-                    Hủy
-                  </button>
-                  {canEdit ? (
-                    <button
-                      type="button"
-                      disabled={saving}
-                      onClick={saveManualEntry}
-                      className="h-9 rounded-lg bg-emerald-600 px-3 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-60"
-                    >
-                      {saving ? "Đang lưu..." : "Lưu số liệu"}
-                    </button>
-                  ) : null}
-                </div>
-              </div>
-            ) : (
-              <div className="mt-4 space-y-2 text-[13px] text-slate-600">
-                <p>
-                  Nguồn này lấy số liệu từ{" "}
-                  <strong className="font-semibold text-slate-800">
-                    {editingSource.method === "meter" ? "điểm đo" : "file tải lên"}
+                <div className="mt-1.5 inline-flex items-center gap-1.5 rounded-lg bg-slate-100 px-2.5 py-0.5 text-[11px] font-medium text-slate-600">
+                  <span>Đơn vị cố định (cấu hình Quản trị):</span>
+                  <strong className="font-semibold text-emerald-700">
+                    {editingSource.manualUnit || "lít"}
                   </strong>
-                  , không nhập thủ công trên trang này.
-                </p>
-                <div className="flex justify-end pt-2">
-                  <button
-                    type="button"
-                    onClick={closeEntry}
-                    className="h-9 rounded-lg bg-slate-900 px-3 text-sm font-medium text-white"
-                  >
-                    Đóng
-                  </button>
                 </div>
               </div>
-            )}
+
+              {/* Góc trên bên phải: Lựa chọn năm nhập số liệu */}
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-semibold text-slate-500">Năm số liệu:</span>
+                <div className="relative min-w-[116px]">
+                  <CustomSelect
+                    value={modalYear}
+                    onChange={(e) => {
+                      setModalYear(Number(e.target.value));
+                      setImportNotice("");
+                    }}
+                    className="h-9 w-full cursor-pointer appearance-none rounded-xl border border-emerald-200 bg-emerald-50/70 pr-8 pl-3 text-xs font-bold text-emerald-900 shadow-xs outline-none transition-colors hover:border-emerald-300 focus:border-emerald-500"
+                  >
+                    {ENTRY_YEARS.map((y) => (
+                      <option key={y} value={y}>
+                        Năm {y}
+                      </option>
+                    ))}
+                  </CustomSelect>
+                  <span className="pointer-events-none absolute top-1/2 right-2.5 -translate-y-1/2 text-xs text-emerald-700">
+                    ▾
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            {/* Thanh công cụ Import Excel / Tải file mẫu */}
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 bg-slate-50/70 px-5 py-2.5">
+              <span className="text-[11px] text-slate-500">
+                Định dạng chuẩn: dấu cách ngăn cách hàng nghìn, dấu phẩy thập phân (VD:{" "}
+                <strong className="font-mono text-slate-700">43 215,5</strong>)
+              </span>
+              <div className="flex flex-wrap items-center gap-2">
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".xlsx,.csv,.txt,.tsv"
+                  className="hidden"
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (file) void handleImportExcelFile(file);
+                    e.target.value = "";
+                  }}
+                />
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-emerald-200 bg-white px-2.5 text-xs font-semibold text-emerald-700 shadow-2xs hover:bg-emerald-50 transition-colors"
+                >
+                  <span>↑ Import từ Excel / CSV</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handleDownloadTemplate}
+                  className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-600 shadow-2xs hover:bg-slate-100 transition-colors"
+                >
+                  <span>↓ Tải file mẫu (.xlsx)</span>
+                </button>
+              </div>
+            </div>
+
+            {importNotice ? (
+              <div className="border-b border-emerald-100 bg-emerald-50/70 px-5 py-2 text-xs font-medium text-emerald-800">
+                {importNotice}
+              </div>
+            ) : null}
+
+            {/* Bảng nhập số liệu 12 tháng */}
+            <div className="flex-1 overflow-y-auto px-5 py-3">
+              <div className="overflow-hidden rounded-xl border border-slate-200">
+                <table className="w-full text-left text-xs">
+                  <thead className="border-b border-slate-200 bg-slate-50 text-[11px] font-semibold text-slate-500 uppercase">
+                    <tr>
+                      <th className="w-28 px-3.5 py-2.5">Tháng</th>
+                      <th className="px-3.5 py-2.5">Khối lượng / Số liệu</th>
+                      <th className="w-28 px-3.5 py-2.5 text-center">Đơn vị</th>
+                      <th className="w-40 px-3.5 py-2.5 text-right">Phát thải (Tấn CO₂e)</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {Array.from({ length: 12 }, (_, idx) => {
+                      const m = idx + 1;
+                      const key = `${modalYear}-${String(m).padStart(2, "0")}`;
+                      const rawStr = draftMonthly[key] ?? "";
+                      const parsedVal = rawStr.trim() ? parseAppNumber(rawStr, 0) : 0;
+                      const monthTons =
+                        parsedVal > 0 ? (computeManualTons(editingSource, parsedVal) ?? 0) : 0;
+                      const isCurrentActiveMonth =
+                        modalYear === activeYearAndMonth.year &&
+                        m === activeYearAndMonth.month;
+                      const fixedUnit = editingSource.manualUnit || "lít";
+
+                      return (
+                        <tr
+                          key={m}
+                          className={
+                            isCurrentActiveMonth
+                              ? "bg-emerald-50/35"
+                              : "hover:bg-slate-50/60"
+                          }
+                        >
+                          <td className="px-3.5 py-2 font-semibold text-slate-800">
+                            <span>Tháng {m}</span>
+                            {isCurrentActiveMonth ? (
+                              <span className="ml-1.5 inline-block h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                            ) : null}
+                          </td>
+                          <td className="px-3.5 py-1.5">
+                            <input
+                              value={rawStr}
+                              onChange={(e) => updateMonthDraft(modalYear, m, e.target.value)}
+                              onBlur={() => blurMonthDraft(modalYear, m)}
+                              onPaste={(e) => handlePasteIntoMonth(m, e)}
+                              inputMode="decimal"
+                              placeholder="0"
+                              className="h-8 w-full rounded-lg border border-slate-200 bg-white px-2.5 font-mono text-xs font-semibold text-slate-900 outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/15"
+                            />
+                          </td>
+                          <td className="px-3.5 py-2 text-center">
+                            <span className="inline-flex rounded-md bg-slate-100 px-2.5 py-1 font-medium text-slate-600">
+                              {fixedUnit}
+                            </span>
+                          </td>
+                          <td className="px-3.5 py-2 text-right font-mono font-semibold text-slate-800">
+                            {formatNumber(monthTons)}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                  <tfoot className="border-t border-slate-200 bg-slate-50 font-semibold text-slate-900">
+                    {(() => {
+                      let sumAct = 0;
+                      let sumTons = 0;
+                      for (let m = 1; m <= 12; m += 1) {
+                        const key = `${modalYear}-${String(m).padStart(2, "0")}`;
+                        const rawStr = draftMonthly[key] ?? "";
+                        const val = rawStr.trim() ? parseAppNumber(rawStr, 0) : 0;
+                        if (val > 0) {
+                          sumAct += val;
+                          sumTons += computeManualTons(editingSource, val) ?? 0;
+                        }
+                      }
+                      const fixedUnit = editingSource.manualUnit || "lít";
+                      return (
+                        <tr>
+                          <td className="px-3.5 py-2.5">Tổng năm {modalYear}</td>
+                          <td className="px-3.5 py-2.5 font-mono text-emerald-700">
+                            {formatNumber(sumAct)}
+                          </td>
+                          <td className="px-3.5 py-2.5 text-center text-slate-600">
+                            {fixedUnit}
+                          </td>
+                          <td className="px-3.5 py-2.5 text-right font-mono text-emerald-700">
+                            {formatNumber(sumTons)} tấn
+                          </td>
+                        </tr>
+                      );
+                    })()}
+                  </tfoot>
+                </table>
+              </div>
+            </div>
+
+            {/* Footer Modal */}
+            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 px-5 py-3.5">
+              <p className="text-[11px] text-slate-400">
+                Hệ thống tính tấn CO₂e theo công thức đã cấu hình của nguồn này.
+              </p>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setEditingSource(null)}
+                  className="h-9 rounded-xl border border-slate-200 px-3.5 text-xs font-semibold text-slate-600 hover:bg-slate-50"
+                >
+                  Hủy
+                </button>
+                <button
+                  type="button"
+                  onClick={saveManualEdit}
+                  className="h-9 rounded-xl bg-emerald-600 px-4 text-xs font-semibold text-white hover:bg-emerald-700"
+                >
+                  Lưu số liệu
+                </button>
+              </div>
+            </div>
           </div>
         </div>
-      ) : null}
-    </div>
+      )}
     </div>
   );
 }
 
-function ScopeBadge({ scope }: { scope: ScopeId }) {
-  const color = scopeColor(scope);
-  return (
-    <span
-      className="inline-flex rounded-full px-2 py-0.5 text-[11px] font-semibold"
-      style={{
-        backgroundColor: `${color}18`,
-        color,
-      }}
-    >
-      {scopeLabel(scope)}
-    </span>
-  );
-}
-
-function ScopeDonut({
-  segments,
+/* ---------- Biểu đồ tròn ---------- */
+function PieChart({
+  slices,
+  total,
 }: {
-  segments: { id: ScopeId; label: string; color: string; share: number; tons: number }[];
+  slices: { id: string; label: string; tons: number; share: number; color: string }[];
+  total: number;
 }) {
-  const r = 68;
-  const c = 2 * Math.PI * r;
+  const radius = 86;
+  const strokeWidth = 38;
+  const circumference = 2 * Math.PI * radius;
+
+  const segments = slices.reduce<
+    {
+      id: string;
+      label: string;
+      tons: number;
+      share: number;
+      color: string;
+      dash: number;
+      offset: number;
+    }[]
+  >((acc, slice) => {
+    const prevSum = acc.reduce((s, item) => s + item.share, 0);
+    const dash = (slice.share / 100) * circumference;
+    const offset = -((prevSum / 100) * circumference);
+    acc.push({ ...slice, dash, offset });
+    return acc;
+  }, []);
 
   return (
-    <div className="relative mx-auto mt-4 h-[220px] w-[220px]">
-      <svg viewBox="0 0 180 180" className="h-full w-full">
-        <circle cx="90" cy="90" r={r} fill="none" stroke="#e8eef4" strokeWidth="26" />
-        {segments.map((item, index) => {
-          const dash = (item.share / 100) * c;
-          const offset = segments
-            .slice(0, index)
-            .reduce((sum, segment) => sum + (segment.share / 100) * c, 0);
-          const el = (
+    <div className="flex flex-col items-center gap-4">
+      <div className="relative flex items-center justify-center">
+        <svg viewBox="0 0 240 240" className="h-52 w-52 -rotate-90">
+          <circle
+            cx="120"
+            cy="120"
+            r={radius}
+            fill="none"
+            stroke="#f1f5f9"
+            strokeWidth={strokeWidth}
+          />
+          {segments.map((seg) => (
             <circle
-              key={item.id}
-              cx="90"
-              cy="90"
-              r={r}
+              key={seg.id}
+              cx="120"
+              cy="120"
+              r={radius}
               fill="none"
-              stroke={item.color}
-              strokeWidth="26"
-              strokeDasharray={`${dash} ${Math.max(c - dash, 0)}`}
-              strokeDashoffset={-offset}
-              transform="rotate(-90 90 90)"
+              stroke={seg.color}
+              strokeWidth={strokeWidth}
+              strokeDasharray={`${seg.dash} ${circumference}`}
+              strokeDashoffset={seg.offset}
             />
-          );
-          return el;
-        })}
-      </svg>
-      <div className="absolute inset-0 flex flex-col items-center justify-center">
-        <p className="text-[28px] font-bold leading-none text-slate-800">100%</p>
-        <p className="mt-1 text-[11px] font-semibold tracking-[0.12em] text-slate-400">
-          TỔNG CỘNG
-        </p>
+          ))}
+        </svg>
+        <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center text-center">
+          <span className="font-mono text-xl font-bold text-slate-900">
+            {formatNumber(total)}
+          </span>
+          <span className="text-[11px] text-slate-400">tấn CO₂e</span>
+        </div>
+      </div>
+
+      {/* Chú giải */}
+      <div className="flex flex-wrap justify-center gap-x-4 gap-y-2 text-[11px] text-slate-600">
+        {slices.map((s) => (
+          <span key={s.id} className="inline-flex items-center gap-1.5">
+            <span
+              className="h-2.5 w-2.5 rounded-xs"
+              style={{ backgroundColor: s.color }}
+            />
+            <span className="max-w-[200px] truncate">{s.label}</span>
+            <strong className="font-mono text-slate-800">
+              {formatNumber(s.share, 1)}%
+            </strong>
+          </span>
+        ))}
       </div>
     </div>
   );
 }
 
-function KpiCard({
-  label,
-  value,
-  hint,
-  trend,
-}: {
-  label: string;
-  value: string;
-  hint: string;
-  trend?: number;
-}) {
-  const down = (trend ?? 0) < 0;
+/* ---------- Biểu đồ cột thời gian ---------- */
+function BarChart({ data }: { data: { label: string; value: number }[] }) {
+  const maxVal = Math.max(...data.map((d) => d.value), 0);
+  const niceMax = maxVal <= 0 ? 1 : maxVal * 1.15;
+  const ticks = [0, 0.25, 0.5, 0.75, 1].map((t) =>
+    Number((niceMax * t).toFixed(maxVal < 1 ? 4 : 1)),
+  );
+  const chartHeight = 200;
+
   return (
-    <article className="rounded-lg border border-slate-200 bg-white px-5 py-4 shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
-      <p className="text-[11px] font-semibold tracking-[0.08em] text-slate-400">{label}</p>
-      <p className="mt-2 text-[28px] font-bold leading-none text-slate-800">
-        {value}
-        <span className="ml-1.5 text-[13px] font-medium text-slate-400">{hint}</span>
-      </p>
-      {trend == null ? null : (
-        <p
-          className={`mt-3 inline-flex items-center gap-1 text-[12px] font-medium ${
-            down ? "text-emerald-600" : "text-red-500"
-          }`}
-        >
-          <TrendArrow down={down} />
-          {down ? "" : "+"}
-          {trend}% so với kỳ trước
-        </p>
-      )}
-    </article>
+    <div className="w-full overflow-x-auto">
+      <div className="min-w-[680px]">
+        <div className="relative flex" style={{ height: chartHeight }}>
+          {/* Trục Y */}
+          <div className="flex w-16 flex-col justify-between pr-2 text-right font-mono text-[10px] text-slate-400">
+            {[...ticks].reverse().map((t, i) => (
+              <span key={i}>{formatNumber(t, maxVal < 1 ? 4 : 1)}</span>
+            ))}
+          </div>
+
+          {/* Lưới + các cột */}
+          <div className="relative flex-1 border-b border-l border-slate-200">
+            {[0, 0.25, 0.5, 0.75].map((r, i) => (
+              <div
+                key={i}
+                className="pointer-events-none absolute right-0 left-0 border-t border-dashed border-slate-100"
+                style={{ top: `${r * 100}%` }}
+              />
+            ))}
+
+            <div className="relative z-10 flex h-full items-end justify-around gap-1 px-2">
+              {data.map((d, idx) => {
+                const heightPct = niceMax > 0 ? Math.min(100, (d.value / niceMax) * 100) : 0;
+                return (
+                  <div
+                    key={idx}
+                    className="group relative flex h-full flex-1 flex-col items-center justify-end"
+                  >
+                    <div className="pointer-events-none absolute -top-6 hidden rounded bg-slate-900 px-1.5 py-0.5 font-mono text-[10px] whitespace-nowrap text-white shadow group-hover:block">
+                      {formatNumber(d.value)} t
+                    </div>
+                    <div
+                      className="w-full max-w-[26px] rounded-t-md bg-emerald-500 transition-all group-hover:bg-emerald-600"
+                      style={{ height: `${heightPct}%` }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+
+        {/* Nhãn trục X */}
+        <div className="mt-2 flex pl-16">
+          <div className="flex flex-1 justify-around gap-1 px-2 text-[10px] text-slate-400">
+            {data.map((d, idx) => {
+              const show =
+                data.length <= 14 || idx % 2 === 0 || idx === data.length - 1;
+              return (
+                <span key={idx} className="flex-1 text-center">
+                  {show ? d.label : ""}
+                </span>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 
-function TrendArrow({ down }: { down: boolean }) {
+/* ---------- Icons ---------- */
+function SearchIcon({ className }: { className?: string }) {
   return (
-    <svg viewBox="0 0 12 12" className="h-3 w-3" fill="none" aria-hidden>
-      <path
-        d={down ? "M6 2.5v7M3.5 6.5 6 9.5 8.5 6.5" : "M6 9.5v-7M3.5 5.5 6 2.5 8.5 5.5"}
-        stroke="currentColor"
-        strokeWidth="1.6"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+      <circle cx="11" cy="11" r="8" />
+      <path d="m21 21-4.3-4.3" />
     </svg>
   );
 }
 
-function PencilIcon({ className }: { className?: string }) {
+function GlobeIcon({ className }: { className?: string }) {
   return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" aria-hidden>
-      <path
-        d="M4 17.5V20h2.5L18 8.5 15.5 6 4 17.5Z"
-        stroke="currentColor"
-        strokeWidth="1.8"
-        strokeLinejoin="round"
-      />
-      <path d="m14.5 7 2.5 2.5" stroke="currentColor" strokeWidth="1.8" />
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+      <circle cx="12" cy="12" r="10" />
+      <path d="M2 12h20" />
+      <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
+    </svg>
+  );
+}
+
+function ChevronDownIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+      <path d="m6 9 6 6 6-6" />
     </svg>
   );
 }

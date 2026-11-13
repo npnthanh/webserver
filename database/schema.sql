@@ -470,7 +470,7 @@ CREATE TABLE IF NOT EXISTS gateway_samples (
   crc_ok TINYINT(1) NOT NULL,
   values_json JSON NOT NULL,
   PRIMARY KEY (id),
-  UNIQUE KEY uq_gateway_sample (gateway_id, meter_id, packet_number),
+  UNIQUE KEY uq_gateway_sample_time (gateway_id, meter_id, received_at, packet_number),
   KEY idx_gateway_sample_meter (meter_model, meter_id, received_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 

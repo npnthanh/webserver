@@ -91,7 +91,8 @@ export function CustomSelect({
   } | null>(null);
 
   const hasExternalChevron = className.includes("appearance-none");
-  const isFullWidth = className.includes("input") || className.includes("w-full");
+  const isFullWidth =
+    className.includes("input") || className.includes("w-full") || hasExternalChevron;
   const isInlineBorderless = className.includes("border-0") && className.includes("bg-transparent");
 
   const updatePosition = useCallback(() => {

@@ -95,17 +95,25 @@ export function hydrateCustomerAccounts(projectId?: string) {
     query: { projectId },
   })
     .then((accounts) => {
+      const prevJson = JSON.stringify(customerAccountsCache);
       if (projectId) {
         const others = customerAccountsCache.filter((item) => item.projectId !== projectId);
         customerAccountsCache = [...others, ...accounts];
       } else {
         customerAccountsCache = accounts;
       }
-      emitDbChange("customer-accounts");
+      if (prevJson !== JSON.stringify(customerAccountsCache)) {
+        emitDbChange("customer-accounts");
+      }
       return projectId
         ? customerAccountsCache.filter((item) => item.projectId === projectId)
         : customerAccountsCache;
     })
+    .catch(() =>
+      projectId
+        ? customerAccountsCache.filter((item) => item.projectId === projectId)
+        : customerAccountsCache,
+    )
     .finally(() => {
       if (!projectId) customerAccountsHydration = null;
     });

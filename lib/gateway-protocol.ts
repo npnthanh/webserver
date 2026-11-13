@@ -22,20 +22,23 @@ export const METER_TYPE_BY_CODE: Record<number, "E" | "W" | "P" | "F"> = {
   4: "F",
 };
 
-/** Mã số firmware gửi trong MM. 0 = PM2230. */
+/** Mã số firmware gửi trong MM. 0 = PM2230, 1..N = các model mở rộng (Nước, Áp suất, Lưu lượng...). */
 export const METER_MODEL_BY_CODE: Record<number, string> = {
   0: "PM2230",
+  1: "WATER_METER",
+  2: "PRESSURE_METER",
+  3: "FLOW_METER",
 };
 
 export const DISPOSITION_LABEL: Record<string, string> = {
-  accepted: "Đã lưu",
+  accepted: "Đã lưu (CRC hợp lệ)",
   duplicate: "Bỏ qua: trùng meterModel + meterId + readingTime",
-  replay: "Bỏ qua: bản phát lại RE=1, không lưu số liệu",
+  replay: "Đã lưu bù dữ liệu mất mạng (RE=1)",
   clock_replay: "Bỏ qua: bản phát lại (RE=1) có readingTime vượt giờ server quá 20 giây",
   replay_time: "Bỏ qua: bản phát lại (RE=1) có readingTime không chuẩn (0 hoặc chưa đồng bộ)",
   replay_energy: "Bỏ qua: bản phát lại (RE=1) có EPaed không khớp mẫu realtime trước/sau",
   gateway_error: "Bỏ qua: Error khác 0 (chỉ áp dụng bản phát lại RE=1)",
-  checksum: "Bỏ qua: lỗi checksum",
+  checksum: "Bỏ qua: lỗi checksum CRC16/CRC32",
   hmac_invalid: "Bỏ qua: HMAC không khớp hoặc thiếu chữ ký",
   unknown_meter: "Bỏ qua: chưa có đồng hồ trùng serial và category",
 };
@@ -258,10 +261,22 @@ export function parseGatewayPacket(rawText: string): GatewayParse {
       ? (valuesFieldEarly as Record<string, unknown>)
       : null;
   const meterType = parseMeterType(meterTypeField);
-  const meterTypeCode = numericCode(meterTypeField);
-  const meterModelCode = numericCode(meterModelField);
+  const meterTypeCode =
+    numericCode(meterTypeField) ??
+    (meterType === "E" ? 1 : meterType === "W" ? 2 : meterType === "P" ? 3 : meterType === "F" ? 4 : null);
+  const rawModelCode = numericCode(meterModelField);
   const meterModel =
-    (meterModelCode != null ? METER_MODEL_BY_CODE[meterModelCode] : null) ?? idText(meterModelField);
+    (rawModelCode != null ? METER_MODEL_BY_CODE[rawModelCode] ?? `MODEL_${rawModelCode}` : null) ??
+    idText(meterModelField);
+  const meterModelCode =
+    rawModelCode ??
+    (meterModel
+      ? Number(
+          Object.entries(METER_MODEL_BY_CODE).find(
+            ([, label]) => label.toLowerCase() === meterModel.trim().toLowerCase(),
+          )?.[0] ?? 0,
+        )
+      : null);
   const meterId =
     idText(readField(source, ["meterId", "MID"])) ??
     (valuesRecord ? idText(readField(valuesRecord, ["MID", "meterId"])) : null);

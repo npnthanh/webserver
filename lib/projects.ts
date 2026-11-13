@@ -68,10 +68,14 @@ export function hydrateProjects() {
   if (projectsHydration) return projectsHydration;
   projectsHydration = dbFetch<Project[]>("projects")
     .then((projects) => {
+      const prevJson = JSON.stringify(projectsCache);
       projectsCache = projects;
-      emitDbChange("projects");
+      if (prevJson !== JSON.stringify(projects)) {
+        emitDbChange("projects");
+      }
       return projectsCache;
     })
+    .catch(() => projectsCache)
     .finally(() => {
       projectsHydration = null;
     });

@@ -3,21 +3,24 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { CustomSelect } from "@/components/ui/CustomSelect";
 import type { Project } from "@/lib/projects";
-import { hydrateAlertEvents, type AlertEvent } from "@/lib/alert-events";
+import { normalizeAlertConfig } from "@/lib/alert-config";
+import { alertValueText, hydrateAlertEvents, type AlertEvent } from "@/lib/alert-events";
 import { hydrateClientMeters } from "@/lib/client-meters";
-import { computeManualTons, hydrateGhgSources } from "@/lib/ghg-sources";
+import { computeSourceTons, hydrateGhgSources, type GhgEmissionSource } from "@/lib/ghg-sources";
 import { hydrateDevices } from "@/lib/devices";
 import {
-  civilWeekday,
-  industrialBand,
+  resolveElectricityRateAt,
   resolveTouPrices,
+  type SavedElectricityCostConfig,
   type TouPrices,
 } from "@/lib/industrial-electricity";
-import { registerToKwh } from "@/lib/meter-parameters";
+import { readMeterValue, registerToKwh } from "@/lib/meter-parameters";
+import { formatAppNumber } from "@/lib/number-format";
 import { hydrateProjectSettings } from "@/lib/project-settings";
 import {
   loadProjectGatewayDaily,
   loadProjectGatewayEnergySlots,
+  loadProjectGatewayLatest,
   type GatewayDailyPoint,
   type GatewayEnergySlot,
   type ProjectGatewaySample,
@@ -56,18 +59,18 @@ function monthRange(year: number, month: number) {
 }
 
 function formatKwh(value: number) {
-  if (!Number.isFinite(value)) return "0.0";
+  if (!Number.isFinite(value)) return "0,0";
   const digits = Math.abs(value) > 0 && Math.abs(value) < 10 ? 3 : 1;
-  return value.toLocaleString("en-US", { maximumFractionDigits: digits, minimumFractionDigits: digits });
+  return formatAppNumber(value, { maxDecimals: digits, minDecimals: digits });
 }
 
 function formatReading(value: number, digits: number) {
   if (!Number.isFinite(value)) return "0";
-  return value.toLocaleString("en-US", { maximumFractionDigits: digits, minimumFractionDigits: digits });
+  return formatAppNumber(value, { maxDecimals: digits, minDecimals: digits });
 }
 
 function formatVnd(value: number) {
-  return Math.round(value).toLocaleString("vi-VN");
+  return formatAppNumber(Math.round(value), { maxDecimals: 0 });
 }
 
 function slotStoredAt(day: string, hour: number, minute: number) {
@@ -75,12 +78,17 @@ function slotStoredAt(day: string, hour: number, minute: number) {
   return new Date(Date.UTC(y, m - 1, d, hour, minute) - 7 * 60 * 60 * 1000).toISOString().slice(0, 19);
 }
 
-function monthlyCostFromSlots(slots: GatewayEnergySlot[], prices: TouPrices) {
+function monthlyCostFromSlots(
+  slots: GatewayEnergySlot[],
+  prices: TouPrices,
+  costConfig?: SavedElectricityCostConfig,
+) {
   const byMeter = new Map<string, GatewayEnergySlot[]>();
   for (const slot of slots) {
-    const list = byMeter.get(slot.meterPointId) ?? [];
+    const key = `${slot.meterPointId}:${(slot as { meterId?: string }).meterId ?? ""}`;
+    const list = byMeter.get(key) ?? [];
     list.push(slot);
-    byMeter.set(slot.meterPointId, list);
+    byMeter.set(key, list);
   }
   let total = 0;
   for (const list of byMeter.values()) {
@@ -91,15 +99,35 @@ function monthlyCostFromSlots(slots: GatewayEnergySlot[], prices: TouPrices) {
     for (const slot of ordered) {
       const startKwh = registerToKwh(slot.firstWh);
       const endKwh = registerToKwh(slot.lastWh);
+      // Nếu công tơ bị thay mới hoặc reset chỉ số về nhỏ hơn trước đó, tính bắt đầu lại từ startKwh
+      if (previous != null && startKwh < previous) {
+        previous = startKwh;
+      }
       const within = Math.max(0, endKwh - startKwh);
       const gap = previous == null ? 0 : Math.max(0, startKwh - previous);
       const delta = within + gap;
-      previous = endKwh;
+      previous = endKwh >= startKwh ? endKwh : startKwh;
       if (delta <= 0) continue;
       const parts = vietnamFromStored(slotStoredAt(slot.day, slot.hour, slot.minute));
       if (!parts) continue;
-      const band = industrialBand(civilWeekday(parts.year, parts.month, parts.day), parts.hour, parts.minute);
-      total += delta * prices[band];
+      if (costConfig) {
+        const rate = resolveElectricityRateAt(costConfig, parts);
+        total += delta * rate.price;
+      } else {
+        const rate = resolveElectricityRateAt(
+          {
+            electricity: {
+              prices: {
+                normal: String(prices.normal),
+                off: String(prices.off),
+                peak: String(prices.peak),
+              },
+            },
+          },
+          parts,
+        );
+        total += delta * rate.price;
+      }
     }
   }
   return total;
@@ -142,12 +170,12 @@ export function ClientDashboard({ project }: { project: Project }) {
   const [monthSlots, setMonthSlots] = useState<GatewayEnergySlot[]>([]);
   const [latest, setLatest] = useState<ProjectGatewaySample | null>(null);
   const [touPrices, setTouPrices] = useState<TouPrices>(() => resolveTouPrices("kv-under-6").prices);
+  const [savedCostConfig, setSavedCostConfig] = useState<SavedElectricityCostConfig | undefined>(undefined);
+  const [rawGhgSources, setRawGhgSources] = useState<GhgEmissionSource[]>([]);
   const [deviceStatus, setDeviceStatus] = useState(EMPTY_STATUS);
   const [alerts, setAlerts] = useState<DashboardAlert[]>([]);
-  const [co2, setCo2] = useState(0);
-  const [ghgSourceCount, setGhgSourceCount] = useState(0);
-  const [topGhgText, setTopGhgText] = useState("");
   const [prevMonthKwh, setPrevMonthKwh] = useState<number | null>(null);
+  const [pollTick, setPollTick] = useState(0);
   const alignedMonth = useRef(false);
 
   useEffect(() => {
@@ -155,77 +183,140 @@ export function ClientDashboard({ project }: { project: Project }) {
   }, [project.id]);
 
   useEffect(() => {
+    const tick = () => {
+      if (document.visibilityState === "visible") {
+        setPollTick((value) => value + 1);
+      }
+    };
+    const timer = window.setInterval(tick, 15_000);
+    document.addEventListener("visibilitychange", tick);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", tick);
+    };
+  }, []);
+
+  useEffect(() => {
     let active = true;
     const reload = () => {
       void Promise.all([
-        hydrateAlertEvents(project.id),
+        hydrateAlertEvents(project.id, { force: true }),
         hydrateDevices(),
         hydrateClientMeters(project.id),
         hydrateGhgSources(project.id),
         hydrateProjectSettings(project.id),
-      ]).then(([alertEvents, devices, meters, sources, settings]) => {
+        loadProjectGatewayLatest(project.id).catch(() => [] as ProjectGatewaySample[]),
+      ]).then(([alertEvents, devices, meters, sources, settings, latestList]) => {
         if (!active) return;
-        const saved = settings.costConfig as {
-          electricity?: {
-            voltageLevel?: string;
-            prices?: Partial<Record<"normal" | "off" | "peak", string>>;
-          };
-        } | undefined;
+        const saved = settings.costConfig as SavedElectricityCostConfig | undefined;
+        setSavedCostConfig(saved);
         setTouPrices(resolveTouPrices(saved?.electricity?.voltageLevel, saved?.electricity?.prices).prices);
-        const deviceIds = new Set(meters.map((meter) => meter.deviceId).filter(Boolean));
-        const projectDevices = devices.filter((device) => deviceIds.has(device.id));
-        const sourceDevices = projectDevices.length ? projectDevices : devices;
-        const counts = sourceDevices.reduce(
-          (result, device) => {
-            if (device.status === "offline") result.offline += 1;
-            else if (device.status === "maintenance") result.warning += 1;
-            else result.normal += 1;
-            return result;
-          },
-          { normal: 0, warning: 0, offline: 0 },
+
+        const settingsRec = settings as Record<string, unknown>;
+        const projectCfg = (settingsRec.projectConfig ?? {}) as { onlineTimeout?: number };
+        const adminAlertCfg = (settingsRec.alertConfig ?? {}) as { commLossMinutes?: number };
+        const timeoutMinutes = Math.max(
+          1,
+          Number(projectCfg.onlineTimeout ?? adminAlertCfg.commLossMinutes ?? 10) || 10,
         );
+        const timeoutMs = timeoutMinutes * 60 * 1000;
+        const userAlertCfg = normalizeAlertConfig(settingsRec.alertsConfig, settingsRec.alertConfig);
+        const enabledRules = Object.values(userAlertCfg.rulesByGroup ?? {})
+          .flat()
+          .filter((r) => r.enabled && r.parameterKey);
+
+        const warningPointIds = new Set<string>();
+        const liveAlerts: DashboardAlert[] = [];
+
+        for (const sample of latestList) {
+          const meter = meters.find((m) => m.id === sample.meterPointId);
+          for (const rule of enabledRules) {
+            if (rule.meterPointId && rule.meterPointId !== sample.meterPointId) continue;
+            const actual = readMeterValue(sample.values, rule.parameterKey);
+            if (actual === null) continue;
+            const minNum = rule.minValue.trim() !== "" ? Number(rule.minValue) : null;
+            const maxNum = rule.maxValue.trim() !== "" ? Number(rule.maxValue) : null;
+            const belowMin = minNum !== null && Number.isFinite(minNum) && actual < minNum;
+            const aboveMax = maxNum !== null && Number.isFinite(maxNum) && actual > maxNum;
+            if (!belowMin && !aboveMax) continue;
+            warningPointIds.add(sample.meterPointId);
+            const alreadyInDb = alertEvents.some(
+              (ev) =>
+                ev.parameter === rule.parameterKey &&
+                (ev.meterPointId === sample.meterPointId || ev.pointName === meter?.name),
+            );
+            if (!alreadyInDb) {
+              liveAlerts.push({
+                id: `LIVE-${sample.meterPointId}-${rule.id}`,
+                time: formatStoredVietnam(sample.at) ?? sample.at,
+                point: meter?.name ?? sample.meterPointId,
+                param: rule.parameterKey,
+                value: `${actual}${rule.unit ? ` ${rule.unit}` : ""}`,
+              });
+            }
+          }
+        }
+
+        const counts = { normal: 0, warning: 0, offline: 0 };
+        if (meters.length > 0) {
+          const nowMs = Date.now();
+          for (const meter of meters) {
+            const sample = latestList.find((s) => s.meterPointId === meter.id);
+            const linkedDev = meter.deviceId ? devices.find((d) => d.id === meter.deviceId) : undefined;
+            const sampleMs = sample?.at
+              ? Date.parse(`${sample.at.replace(" ", "T")}Z`)
+              : Number.NaN;
+            const isTimedOut = Number.isFinite(sampleMs) ? nowMs - sampleMs > timeoutMs : linkedDev?.status === "offline";
+            if (isTimedOut || linkedDev?.status === "offline") {
+              counts.offline += 1;
+            } else if (warningPointIds.has(meter.id) || linkedDev?.status === "maintenance") {
+              counts.warning += 1;
+            } else {
+              counts.normal += 1;
+            }
+          }
+        } else {
+          const deviceIds = new Set(meters.map((meter) => meter.deviceId).filter(Boolean));
+          const projectDevices = devices.filter((device) => deviceIds.has(device.id));
+          const sourceDevices = projectDevices.length ? projectDevices : devices;
+          for (const device of sourceDevices) {
+            if (device.status === "offline") counts.offline += 1;
+            else if (device.status === "maintenance") counts.warning += 1;
+            else counts.normal += 1;
+          }
+        }
+
         setDeviceStatus([
           { label: "BÌNH THƯỜNG", value: counts.normal, color: "#43a047" },
           { label: "CẢNH BÁO", value: counts.warning, color: "#ef8d3a" },
           { label: "NGOẠI TUYẾN", value: counts.offline, color: "#9aa3af" },
         ]);
-        setAlerts(
-          alertEvents.slice(0, 12).map((event: AlertEvent) => ({
-            id: event.id ?? `${event.occurredAt}-${event.meterPointId}-${event.parameter}`,
-            time: formatStoredVietnam(event.occurredAt) ?? event.occurredAt,
-            point: event.pointName ?? event.meterPointId ?? "--",
-            param: event.parameter,
-            value: `${event.value}${event.unit ? ` ${event.unit}` : ""}`,
-          })),
-        );
-        const computedSources = sources.map((source) => {
-          const tons =
-            source.method === "manual"
-              ? (computeManualTons(source) ?? source.tons ?? 0)
-              : (source.tons ?? 0);
-          return { name: source.name, tons };
-        });
-        const totalTons = computedSources.reduce((sum, item) => sum + item.tons, 0);
-        setGhgSourceCount(computedSources.length);
-        setCo2(totalTons);
-        const top = [...computedSources].sort((a, b) => b.tons - a.tons)[0];
-        if (top && totalTons > 0) {
-          const share = Math.round((top.tons / totalTons) * 100);
-          setTopGhgText(`${top.name}: ${top.tons.toFixed(2)} tấn (${share}%)`);
-        } else {
-          setTopGhgText("");
-        }
+
+        const dbDashboardAlerts: DashboardAlert[] = alertEvents.map((event: AlertEvent) => ({
+          id: event.id ?? `${event.occurredAt}-${event.meterPointId}-${event.parameter}`,
+          time: formatStoredVietnam(event.occurredAt) ?? event.occurredAt,
+          point: event.pointName ?? event.meterPointId ?? "--",
+          param: event.parameter,
+          value: alertValueText(event),
+        }));
+
+        setAlerts([...liveAlerts, ...dbDashboardAlerts].slice(0, 12));
+        setRawGhgSources(sources);
       }).catch(() => undefined);
     };
     reload();
     window.addEventListener("ems-alert-events-changed", reload);
     window.addEventListener("ems-client-meters-changed", reload);
+    window.addEventListener("ems-ghg-sources-changed", reload);
+    window.addEventListener("ems-project-settings-changed", reload);
     return () => {
       active = false;
       window.removeEventListener("ems-alert-events-changed", reload);
       window.removeEventListener("ems-client-meters-changed", reload);
+      window.removeEventListener("ems-ghg-sources-changed", reload);
+      window.removeEventListener("ems-project-settings-changed", reload);
     };
-  }, [project.id]);
+  }, [project.id, pollTick]);
 
   useEffect(() => {
     let active = true;
@@ -248,7 +339,7 @@ export function ClientDashboard({ project }: { project: Project }) {
     return () => {
       active = false;
     };
-  }, [project.id, year, month]);
+  }, [project.id, year, month, pollTick]);
 
   useEffect(() => {
     if (alignedMonth.current || !latest) return;
@@ -263,6 +354,40 @@ export function ClientDashboard({ project }: { project: Project }) {
 
   const energySeries = useMemo(() => monthEnergySeries(dailyRows, year, month), [dailyRows, year, month]);
   const consumptionTotal = energySeries.reduce((sum, item) => sum + item.kwh, 0);
+  const kwhByPointId = useMemo(() => {
+    const map: Record<string, number> = {};
+    for (const row of dailyRows) {
+      const firstKwh = registerToKwh(Number(row.firstWh));
+      const lastKwh = registerToKwh(Number(row.lastWh));
+      if (!Number.isFinite(firstKwh) || !Number.isFinite(lastKwh)) continue;
+      const consumed = Math.max(0, lastKwh - firstKwh);
+      map[row.meterPointId] = (map[row.meterPointId] ?? 0) + consumed;
+    }
+    return map;
+  }, [dailyRows]);
+
+  const { co2, ghgSourceCount, topGhgText } = useMemo(() => {
+    const computedSources = rawGhgSources.map((source) => ({
+      name: source.name,
+      tons: computeSourceTons(source, kwhByPointId, consumptionTotal, {
+        mode: "month",
+        year,
+        month,
+      }),
+    }));
+    const totalTons = computedSources.reduce((sum, item) => sum + item.tons, 0);
+    const top = [...computedSources].sort((a, b) => b.tons - a.tons)[0];
+    const topText =
+      top && totalTons > 0
+        ? `${top.name}: ${formatAppNumber(top.tons, { maxDecimals: 4 })} tấn (${Math.round((top.tons / totalTons) * 100)}%)`
+        : "";
+    return {
+      co2: totalTons,
+      ghgSourceCount: computedSources.length,
+      topGhgText: topText,
+    };
+  }, [rawGhgSources, kwhByPointId, consumptionTotal, year, month]);
+
   const chartSeries = energySeries.map((item) => ({
     day: item.label,
     kwh: item.kwh,
@@ -271,7 +396,10 @@ export function ClientDashboard({ project }: { project: Project }) {
   const sampledValues = chartSeries.filter((item) => item.hasSample).map((item) => item.kwh);
   const energyMax = sampledValues.length ? Math.max(...sampledValues) : 0;
   const energyMin = sampledValues.length ? Math.min(...sampledValues) : 0;
-  const monthCost = useMemo(() => monthlyCostFromSlots(monthSlots, touPrices), [monthSlots, touPrices]);
+  const monthCost = useMemo(
+    () => monthlyCostFromSlots(monthSlots, touPrices, savedCostConfig),
+    [monthSlots, touPrices, savedCostConfig],
+  );
   const monthCostThousands = monthCost / 1000;
 
   const energyMom = useMemo(() => {
@@ -283,17 +411,17 @@ export function ClientDashboard({ project }: { project: Project }) {
 
   const energyCaption =
     energyMom != null
-      ? `${energyMom.delta >= 0 ? "Tăng" : "Giảm"} ${formatKwh(Math.abs(energyMom.delta))} kWh (${Math.abs(energyMom.pct).toFixed(1)}%) so với tháng trước (${formatKwh(energyMom.prev)} kWh)`
+      ? `${energyMom.delta >= 0 ? "Tăng" : "Giảm"} ${formatKwh(Math.abs(energyMom.delta))} kWh (${formatAppNumber(Math.abs(energyMom.pct), { maxDecimals: 1 })}%) so với tháng trước (${formatKwh(energyMom.prev)} kWh)`
       : sampledValues.length > 0
         ? `Tháng ${pad2(month)}/${year}: ${sampledValues.length} ngày có số liệu · Tổng ${formatKwh(consumptionTotal)} kWh`
-        : `Tháng ${pad2(month)}/${year}: 0.0 kWh`;
+        : `Tháng ${pad2(month)}/${year}: 0,0 kWh`;
 
   const co2Caption =
     co2 > 0
-      ? topGhgText || `${ghgSourceCount} nguồn phát thải · Tổng ${co2.toFixed(2)} tấn CO₂e`
+      ? topGhgText || `${ghgSourceCount} nguồn phát thải · Tổng ${formatAppNumber(co2, { maxDecimals: 4 })} tấn CO₂e`
       : ghgSourceCount > 0
-        ? `${ghgSourceCount} nguồn phát thải · Tổng 0.00 tấn CO₂e`
-        : "0 nguồn phát thải · 0.00 tấn CO₂e";
+        ? `${ghgSourceCount} nguồn phát thải · Tổng 0,00 tấn CO₂e`
+        : "0 nguồn phát thải · 0,00 tấn CO₂e";
 
   return (
     <div className="mx-auto h-full max-w-[1480px] overflow-y-auto px-3 py-3.5 sm:px-5 sm:py-5 lg:px-6">
@@ -313,7 +441,7 @@ export function ClientDashboard({ project }: { project: Project }) {
         />
       </div>
 
-      <div className="grid gap-3.5 sm:gap-4 xl:grid-cols-3">
+      <div className="grid grid-cols-1 gap-3.5 sm:gap-4 xl:grid-cols-3">
         <DashboardCard title="ĐIỆN NĂNG TIÊU THỤ" className="xl:col-span-2">
           <div className="mb-3 flex flex-wrap gap-x-4 sm:gap-x-6 gap-y-1 text-xs sm:text-sm">
             <p>
@@ -343,7 +471,7 @@ export function ClientDashboard({ project }: { project: Project }) {
         <DashboardCard title="PHÁT THẢI CO2">
           <DonutChart
             color="#1e6b45"
-            value={co2.toFixed(2)}
+            value={formatAppNumber(co2, { minDecimals: 2, maxDecimals: 4 })}
             unit="tấn CO2 tđ"
             progress={co2 > 0 ? 0.82 : 0}
             caption={co2Caption}
@@ -351,12 +479,12 @@ export function ClientDashboard({ project }: { project: Project }) {
         </DashboardCard>
       </div>
 
-      <div className="mt-3.5 sm:mt-4 grid gap-3.5 sm:gap-4 sm:grid-cols-2 xl:grid-cols-4">
+      <div className="mt-3.5 sm:mt-4 grid grid-cols-1 gap-3.5 sm:gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <DashboardCard title="CHI PHÍ">
           <DonutChart
             color="#1e5f8a"
-            value={monthCostThousands.toLocaleString("vi-VN", {
-              maximumFractionDigits: monthCostThousands > 0 && monthCostThousands < 10 ? 2 : 0,
+            value={formatAppNumber(monthCostThousands, {
+              maxDecimals: monthCostThousands > 0 && monthCostThousands < 10 ? 2 : 0,
             })}
             unit="nghìn VNĐ"
             progress={monthCost > 0 ? 0.82 : 0}
@@ -368,7 +496,7 @@ export function ClientDashboard({ project }: { project: Project }) {
           <DeviceStatusChart items={deviceStatus} />
         </DashboardCard>
 
-        <DashboardCard title="NHẬT KÝ CẢNH BÁO" className="lg:col-span-2">
+        <DashboardCard title="NHẬT KÝ CẢNH BÁO" className="sm:col-span-2">
           <AlertLogTable rows={alerts} />
         </DashboardCard>
       </div>
@@ -482,7 +610,7 @@ function DashboardCard({
 }) {
   return (
     <section
-      className={`rounded-lg border border-slate-200 bg-white p-4 shadow-[0_1px_2px_rgba(16,24,40,0.04)] ${className}`}
+      className={`min-w-0 overflow-hidden rounded-lg border border-slate-200 bg-white p-3.5 sm:p-4 shadow-[0_1px_2px_rgba(16,24,40,0.04)] ${className}`}
     >
       <div className="mb-2 flex items-start justify-between">
         <h2 className="text-[12px] font-semibold tracking-[0.08em] text-slate-400">
@@ -525,7 +653,7 @@ function LatestReading({ sample }: { sample: ProjectGatewaySample }) {
 function EnergyChart({ data }: { data: { day: string; kwh: number; hasSample?: boolean }[] }) {
   if (!data.length) {
     return (
-      <div className="flex h-[250px] items-center justify-center text-sm text-slate-400">
+      <div className="flex h-[220px] sm:h-[250px] items-center justify-center text-sm text-slate-400">
         Chưa có dữ liệu
       </div>
     );
@@ -533,21 +661,22 @@ function EnergyChart({ data }: { data: { day: string; kwh: number; hasSample?: b
   const max = Math.max(...data.map((item) => item.kwh), 0.001);
 
   return (
-    <div className="flex h-[250px] items-end gap-[2px] overflow-x-auto pb-1">
-      {data.map((item) => {
+    <div className="flex h-[220px] sm:h-[250px] w-full min-w-0 items-end gap-[2px] pb-1">
+      {data.map((item, idx) => {
         const heightPct = item.kwh > 0 ? Math.max((item.kwh / max) * 100, 4) : 0;
+        const showMobileLabel = idx % 2 === 0 || idx === data.length - 1;
         return (
-          <div key={item.day} className="flex min-w-[10px] flex-1 flex-col items-center">
-            <div className="flex h-[210px] w-full items-end justify-center">
+          <div key={item.day} className="flex min-w-0 flex-1 flex-col items-center">
+            <div className="flex h-[185px] sm:h-[210px] w-full items-end justify-center">
               {heightPct > 0 ? (
                 <div
-                  className="w-[7px] rounded-t-sm bg-emerald-600 transition-all hover:bg-emerald-500"
+                  className="w-[5px] sm:w-[7px] rounded-t-sm bg-emerald-600 transition-all hover:bg-emerald-500"
                   style={{ height: `${heightPct}%` }}
                   title={`Ngày ${item.day}: ${formatKwh(item.kwh)} kWh`}
                 />
               ) : (
                 <div
-                  className={`h-[2px] w-[7px] rounded-sm ${item.hasSample ? "bg-emerald-300" : "bg-slate-200"}`}
+                  className={`h-[2px] w-[5px] sm:w-[7px] rounded-sm ${item.hasSample ? "bg-emerald-300" : "bg-slate-200"}`}
                   title={
                     item.hasSample
                       ? `Ngày ${item.day}: có bản tin, sản lượng 0 kWh`
@@ -556,7 +685,13 @@ function EnergyChart({ data }: { data: { day: string; kwh: number; hasSample?: b
                 />
               )}
             </div>
-            <span className="mt-1 text-[9px] leading-none text-slate-400">{item.day}</span>
+            <span
+              className={`mt-1 text-[9px] leading-none text-slate-400 ${
+                showMobileLabel ? "" : "invisible sm:visible"
+              }`}
+            >
+              {item.day}
+            </span>
           </div>
         );
       })}
@@ -575,10 +710,10 @@ function DeviceStatusChart({
   const total = items.reduce((sum, item) => sum + item.value, 0);
 
   return (
-    <div className="flex h-[280px] flex-col gap-2 pt-2">
+    <div className="flex h-[250px] sm:h-[280px] w-full min-w-0 flex-col gap-2 pt-2">
       <p className="text-[12px] text-slate-500">Tổng thiết bị dự án: {total}</p>
-      <div className="flex min-h-0 flex-1 gap-2">
-        <div className="flex h-[210px] flex-col justify-between py-0.5 text-[11px] text-slate-400">
+      <div className="flex min-h-0 min-w-0 flex-1 gap-2">
+        <div className="flex h-[185px] sm:h-[210px] shrink-0 flex-col justify-between py-0.5 text-[11px] text-slate-400">
           {ticks.map((tick) => (
             <span key={tick} className="leading-none">
               {tick}
@@ -586,7 +721,7 @@ function DeviceStatusChart({
           ))}
         </div>
         <div className="relative min-w-0 flex-1">
-          <div className="absolute inset-x-0 top-0 h-[210px]">
+          <div className="absolute inset-x-0 top-0 h-[185px] sm:h-[210px]">
             {ticks.map((tick, i) => (
               <div
                 key={`${tick}-${i}`}
@@ -595,12 +730,12 @@ function DeviceStatusChart({
               />
             ))}
           </div>
-          <div className="relative flex h-[210px] items-end justify-around px-4">
+          <div className="relative flex h-[185px] sm:h-[210px] items-end justify-around px-1 sm:px-4">
             {items.map((item) => (
-              <div key={item.label} className="flex h-full w-[28%] flex-col items-center justify-end">
+              <div key={item.label} className="flex h-full w-[30%] flex-col items-center justify-end">
                 <span className="mb-1 text-sm font-semibold text-slate-700">{item.value}</span>
                 <div
-                  className="w-full max-w-[42px] rounded-t-md"
+                  className="w-full max-w-[36px] sm:max-w-[42px] rounded-t-md"
                   style={{
                     height: `${item.value > 0 ? Math.max((item.value / yMax) * 100, 6) : 0}%`,
                     backgroundColor: item.color,
@@ -609,11 +744,11 @@ function DeviceStatusChart({
               </div>
             ))}
           </div>
-          <div className="mt-2 flex justify-around px-4">
+          <div className="mt-2 flex justify-around px-1 sm:px-4">
             {items.map((item) => (
               <p
                 key={item.label}
-                className="w-[28%] text-center text-[10px] font-medium tracking-wide text-slate-400"
+                className="w-[32%] text-center text-[10px] font-medium tracking-tight sm:tracking-wide text-slate-500"
               >
                 {item.label}
               </p>

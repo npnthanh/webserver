@@ -13,9 +13,10 @@ import {
 } from "@/components/client/TimeFilterBar";
 import { CustomSelect } from "@/components/ui/CustomSelect";
 import { normalizeAlertConfig, resolveConfiguredSeverity } from "@/lib/alert-config";
-import { alertCategory, hydrateAlertEvents, type AlertEvent } from "@/lib/alert-events";
+import { alertCategory, alertValueText, hydrateAlertEvents, isConnectivityEvent, type AlertEvent } from "@/lib/alert-events";
 import { hydrateClientMeters, type ClientMeter } from "@/lib/client-meters";
 import { exportToExcel, type ExcelCellValue } from "@/lib/excel-export";
+import { formatAppNumber } from "@/lib/number-format";
 import {
   loadProjectGatewayEnergySlots,
   loadProjectGatewayLatest,
@@ -220,15 +221,15 @@ function defaultSelectedFieldsByReport(): Record<ReportTypeId, string[]> {
 
 function formatNum(value: number, digits = 2) {
   if (!Number.isFinite(value)) return "0";
-  return value.toLocaleString("vi-VN", {
-    minimumFractionDigits: digits,
-    maximumFractionDigits: digits,
+  return formatAppNumber(value, {
+    minDecimals: digits,
+    maxDecimals: digits,
   });
 }
 
 function formatVnd(value: number) {
   if (!Number.isFinite(value)) return "0";
-  return Math.round(value).toLocaleString("vi-VN");
+  return formatAppNumber(Math.round(value), { maxDecimals: 0 });
 }
 
 export function ClientReports({
@@ -921,7 +922,7 @@ export function ClientReports({
               raw: ev.parameter,
             },
             value: {
-              display: `${ev.value}${unit ? ` ${unit}` : ""}`,
+              display: isConnectivityEvent(ev) ? alertValueText(ev) : `${ev.value}${unit ? ` ${unit}` : ""}`,
               raw: ev.value,
             },
             threshold: {
@@ -1160,7 +1161,7 @@ export function ClientReports({
                   <div style="flex:1;background:#f1f5f9;height:14px;border-radius:4px;overflow:hidden">
                     <div style="width:${pct}%;background:#059669;height:100%"></div>
                   </div>
-                  <div style="width:110px;text-align:right;font-family:monospace;font-weight:600;color:#0f172a">${b.value.toLocaleString("vi-VN")} ${b.unit}</div>
+                  <div style="width:110px;text-align:right;font-family:monospace;font-weight:600;color:#0f172a">${formatAppNumber(b.value, { maxDecimals: 4 })} ${b.unit}</div>
                 </div>`;
               })
               .join("")}
@@ -1452,7 +1453,7 @@ export function ClientReports({
                 <Chevron />
               </button>
               {pickerOpen ? (
-                <div className="absolute right-0 top-14 z-20 w-72 rounded-xl border border-slate-200 bg-white p-2 shadow-lg">
+                <div className="absolute left-0 sm:left-auto sm:right-0 top-14 z-20 w-[min(18rem,calc(100vw-2rem))] rounded-xl border border-slate-200 bg-white p-2 shadow-lg">
                   <div className="mb-1.5 flex items-center justify-between border-b border-slate-100 px-2 pb-1.5 text-[11px]">
                     <button
                       type="button"
@@ -1678,7 +1679,7 @@ export function ClientReports({
               <YesNoSelect value={detail} onChange={setDetail} />
             </SettingRow>
             <SettingRow index={5} label="Định dạng xuất mặc định:">
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <CustomSelect
                   value={format}
                   onChange={(e) => setFormat(e.target.value as Format)}
@@ -1804,7 +1805,7 @@ export function ClientReports({
                           />
                         </div>
                         <span className="w-20 sm:w-28 shrink-0 text-right font-mono text-[11px] sm:text-xs font-semibold text-slate-800">
-                          {bar.value.toLocaleString("vi-VN")} {bar.unit}
+                          {formatAppNumber(bar.value, { maxDecimals: 4 })} {bar.unit}
                         </span>
                       </div>
                     );

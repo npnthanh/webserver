@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { useAuth } from "@/components/auth/useAuth";
 import { logout } from "@/lib/auth";
@@ -30,10 +30,17 @@ export function ClientShell({
   const { session } = useAuth();
   const [resolved, setResolved] = useState(project);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const mobileNavRef = useRef<HTMLElement>(null);
   const base = `/du-an/${project.id}`;
 
   useEffect(() => {
     setMobileMenuOpen(false);
+    const navEl = mobileNavRef.current;
+    if (!navEl) return;
+    const activeEl = navEl.querySelector<HTMLElement>('[data-active="true"]');
+    if (activeEl) {
+      activeEl.scrollIntoView({ behavior: "smooth", inline: "center", block: "nearest" });
+    }
   }, [pathname]);
 
   useEffect(() => {
@@ -156,43 +163,51 @@ export function ClientShell({
       </header>
 
       {/* Mobile Navigation Strip + Quick Grid Menu */}
-      <div className="relative flex sm:hidden items-center border-b border-slate-200/80 bg-white shrink-0">
-        <nav
-          className="flex flex-1 overflow-x-auto px-2 py-1.5 gap-1 scrollbar-none"
-          aria-label="Điều hướng dự án mobile"
-        >
-          {navItems.map((item) => {
-            const href = `${base}${item.href}`;
-            const active =
-              item.href === ""
-                ? pathname === base
-                : pathname === href || pathname.startsWith(`${href}/`);
-            const Icon = item.icon;
+      <div className="relative z-40 flex sm:hidden items-center border-b border-slate-200/80 bg-white shrink-0">
+        <div className="relative min-w-0 flex-1">
+          <nav
+            ref={mobileNavRef}
+            className="flex overflow-x-auto px-2 py-1.5 pr-6 gap-1 scrollbar-none"
+            aria-label="Điều hướng dự án mobile"
+          >
+            {navItems.map((item) => {
+              const href = `${base}${item.href}`;
+              const active =
+                item.href === ""
+                  ? pathname === base
+                  : pathname === href || pathname.startsWith(`${href}/`);
+              const Icon = item.icon;
 
-            return (
-              <Link
-                key={item.href || "home"}
-                href={href}
-                className={`flex shrink-0 items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium whitespace-nowrap transition-colors ${
-                  active
-                    ? "bg-emerald-600 text-white font-semibold shadow-xs"
-                    : "text-slate-600 hover:bg-slate-100 hover:text-slate-900"
-                }`}
-              >
-                <Icon className={`h-3.5 w-3.5 shrink-0 ${active ? "text-white" : "text-slate-400"}`} />
-                <span>{item.label}</span>
-              </Link>
-            );
-          })}
-        </nav>
+              return (
+                <Link
+                  key={item.href || "home"}
+                  href={href}
+                  data-active={active ? "true" : "false"}
+                  className={`flex shrink-0 items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium whitespace-nowrap transition-colors ${
+                    active
+                      ? "bg-emerald-600 text-white font-semibold shadow-xs"
+                      : "text-slate-600 hover:bg-slate-100 hover:text-slate-900"
+                  }`}
+                >
+                  <Icon className={`h-3.5 w-3.5 shrink-0 ${active ? "text-white" : "text-slate-400"}`} />
+                  <span>{item.label}</span>
+                </Link>
+              );
+            })}
+          </nav>
+          <div
+            aria-hidden
+            className="pointer-events-none absolute inset-y-0 right-0 w-6 bg-gradient-to-l from-white to-transparent"
+          />
+        </div>
 
-        <div className="flex shrink-0 items-center border-l border-slate-200/80 bg-white px-2 py-1.5">
+        <div className="relative z-10 flex shrink-0 items-center border-l border-slate-200/80 bg-white px-2 py-1.5">
           <button
             type="button"
             onClick={() => setMobileMenuOpen((v) => !v)}
             aria-expanded={mobileMenuOpen}
             aria-label="Mở danh mục nhanh"
-            className={`inline-flex h-7 items-center gap-1 rounded-lg border px-2 text-[11px] font-semibold transition-colors ${
+            className={`inline-flex h-7 items-center gap-1 rounded-lg border px-2.5 text-[11px] font-semibold transition-colors ${
               mobileMenuOpen
                 ? "border-emerald-600 bg-emerald-50 text-emerald-700"
                 : "border-slate-200 bg-slate-50 text-slate-700"

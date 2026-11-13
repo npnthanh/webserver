@@ -1,7 +1,10 @@
 import type { PoolConnection } from "mysql2/promise";
 import { NextRequest } from "next/server";
 import { normalizeAccountRole } from "@/lib/accounts";
-import { getProjectsListTelemetry } from "@/lib/gateway-store";
+import { normalizeAlertConfig } from "@/lib/alert-config";
+import { alertCategory } from "@/lib/alert-events";
+import { getProjectGatewayLatest, getProjectsListTelemetry } from "@/lib/gateway-store";
+import { METER_PARAMETERS, readMeterValue } from "@/lib/meter-parameters";
 import { isAdminRole } from "@/lib/permissions";
 import { ensureAccountProjectsSchema, ensureCustomerAccountsSchema, getServerSession, requirePermission } from "@/lib/server-auth";
 import { emsDb, jsonField, queryRows } from "@/lib/server-db";
@@ -25,6 +28,9 @@ const RESOURCE_NAMES = new Set([
   "project-telemetry",
 ]);
 
+/** Lỗi nghiệp vụ: thông điệp được trả nguyên văn cho người dùng với HTTP 400. */
+class UserFacingError extends Error {}
+
 function badRequest(message: string) {
   return Response.json({ error: message }, { status: 400 });
 }
@@ -34,6 +40,9 @@ function forbidden(message = "Không có quyền thực hiện thao tác này.")
 }
 
 function serverError(error: unknown) {
+  if (error instanceof UserFacingError) {
+    return Response.json({ error: error.message }, { status: 400 });
+  }
   const sqlMessage =
     typeof error === "object" && error && "sqlMessage" in error
       ? String((error as { sqlMessage?: string }).sqlMessage ?? "")
@@ -70,20 +79,327 @@ let deviceColumnsReady: Promise<void> | null = null;
 let ghgColumnsReady: Promise<void> | null = null;
 let projectSettingsReady: Promise<void> | null = null;
 let diagramDisplaysReady: Promise<void> | null = null;
+const lastAlertEvalAt = new Map<string, number>();
+
+const GAP_SCAN_LIMIT = 500;
+
+/** Xóa các cặp sự kiện OFF/ONL của điểm đo không còn ứng với khoảng gián đoạn thực tế nào. */
+async function reconcileConnectivityEvents(
+  projectId: string,
+  pointId: string,
+  shortPoint: string,
+  validGapKeys: Set<string>,
+) {
+  const rows = await queryRows<Row>(
+    `SELECT id FROM alert_events
+      WHERE project_id = ? AND meter_point_id = ?
+        AND (id LIKE ? OR id LIKE ?)
+        AND occurred_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 13 DAY)`,
+    [projectId, pointId, `OFF-${shortPoint}-%`, `ONL-${shortPoint}-%`],
+  ).catch(() => [] as Row[]);
+  const stale = rows
+    .map((row) => asString(row.id))
+    .filter((id) => {
+      const key = id.slice(id.lastIndexOf("-") + 1);
+      return key && !validGapKeys.has(key);
+    });
+  if (stale.length === 0) return;
+  await emsDb
+    .query(`DELETE FROM alert_events WHERE id IN (${stale.map(() => "?").join(",")})`, stale)
+    .catch(() => undefined);
+}
+
+let alertCategoryFixReady: Promise<void> | null = null;
+
+/** Sửa một lần các cảnh báo ngưỡng (VD: Van) từng bị lưu nhầm category "connectivity". */
+function fixMisclassifiedAlertCategories() {
+  alertCategoryFixReady ??= (async () => {
+    const rows = await queryRows<Row>(
+      `SELECT DISTINCT parameter_name AS parameter FROM alert_events
+        WHERE category = 'connectivity' AND parameter_name NOT IN ('Mất kết nối', 'Kết nối trở lại')`,
+    );
+    for (const row of rows) {
+      const parameter = asString(row.parameter);
+      await emsDb.execute(
+        `UPDATE alert_events SET category = ?
+          WHERE category = 'connectivity' AND parameter_name = ?`,
+        [alertCategory(parameter).slice(0, 40), parameter],
+      );
+    }
+  })().catch((error) => {
+    alertCategoryFixReady = null;
+    console.error("fixMisclassifiedAlertCategories failed", error);
+  });
+  return alertCategoryFixReady;
+}
+
+async function evaluateProjectAlerts(targetProjectId?: string) {
+  try {
+    await ensureProjectSettingsTable();
+    await fixMisclassifiedAlertCategories();
+    let projectIds: string[] = [];
+    if (targetProjectId) {
+      projectIds = [targetProjectId];
+    } else {
+      const projRows = await queryRows<Row>("SELECT id FROM projects LIMIT 20").catch(() => [] as Row[]);
+      projectIds = projRows.map((r) => asString(r.id)).filter(Boolean);
+    }
+
+    const nowMs = Date.now();
+    for (const pid of projectIds) {
+      const lastEval = lastAlertEvalAt.get(pid) ?? 0;
+      if (nowMs - lastEval < 4000) continue;
+      lastAlertEvalAt.set(pid, nowMs);
+
+      const [settingsRows, meterRows, latestSamples] = await Promise.all([
+        queryRows<Row>(
+          "SELECT payload FROM project_settings WHERE project_id = ? ORDER BY updated_at DESC LIMIT 1",
+          [pid],
+        ).catch(() => [] as Row[]),
+        queryRows<Row>(
+          `SELECT mp.id, mp.name, mp.code, mp.utility,
+                  COALESCE(NULLIF(TRIM(mp.serial_number), ''), TRIM(d.serial_number)) AS serialNumber,
+                  d.id AS deviceId, d.status AS deviceStatus
+             FROM meter_points mp
+             LEFT JOIN devices d ON d.id = mp.device_id
+            WHERE mp.project_id = ?`,
+          [pid],
+        ).catch(() => [] as Row[]),
+        getProjectGatewayLatest(pid).catch(() => []),
+      ]);
+
+      const payload = jsonField<Record<string, unknown>>(settingsRows[0]?.payload, {});
+      const projectConfig = (payload.projectConfig ?? {}) as Record<string, unknown>;
+      const adminAlertConfig = (payload.alertConfig ?? {}) as Record<string, unknown>;
+      const timeoutMinutes = Math.max(
+        1,
+        Number(projectConfig.onlineTimeout ?? adminAlertConfig.commLossMinutes ?? 10) || 10,
+      );
+      const timeoutSeconds = Math.round(timeoutMinutes * 60);
+
+      const alertCfg = normalizeAlertConfig(payload.alertsConfig, payload.alertConfig);
+      const allRules = Object.values(alertCfg.rulesByGroup ?? {})
+        .flat()
+        .filter((r) => r.enabled && r.parameterKey);
+
+      // 1. Đánh giá ngưỡng thông số đo từ mẫu mới nhất của các điểm đo thuộc dự án
+      for (const sample of latestSamples) {
+        const meter = meterRows.find((m) => asString(m.id) === sample.meterPointId);
+        const pointName = asString(meter?.name) || sample.meterPointId;
+        const hourKey = sample.at.replace(/\D/g, "").slice(0, 10) || "0000000000";
+        const shortPoint = sample.meterPointId.replace(/[^a-zA-Z0-9]/g, "").slice(-14) || "pt";
+
+        for (const rule of allRules) {
+          if (rule.meterPointId && rule.meterPointId !== sample.meterPointId) continue;
+          const actual = readMeterValue(sample.values, rule.parameterKey);
+          if (actual === null || !Number.isFinite(actual)) continue;
+
+          const minNum = rule.minValue.trim() !== "" ? Number(rule.minValue) : null;
+          const maxNum = rule.maxValue.trim() !== "" ? Number(rule.maxValue) : null;
+          const belowMin = minNum !== null && Number.isFinite(minNum) && actual < minNum;
+          const aboveMax = maxNum !== null && Number.isFinite(maxNum) && actual > maxNum;
+          if (!belowMin && !aboveMax) continue;
+
+          const shortParam = rule.parameterKey.replace(/[^a-zA-Z0-9_]/g, "").slice(0, 16) || "param";
+          const eventId = `THR-${shortPoint}-${shortParam}-${hourKey}`.slice(0, 64);
+          const thresholdVal = belowMin ? minNum : maxNum;
+          const paramMeta = METER_PARAMETERS.find((p) => p.key === rule.parameterKey);
+          const unit = (rule.unit || paramMeta?.unit || "").slice(0, 40);
+          const category = alertCategory(
+            rule.parameterKey,
+            rule.groupId === "imbalance"
+              ? "unbalance"
+              : rule.groupId === "harmonics"
+                ? "harmonics"
+                : undefined,
+          ).slice(0, 40);
+          const boundText = belowMin ? `< Min ${minNum}` : `> Max ${maxNum}`;
+          const message = `${rule.name || paramMeta?.name || rule.parameterKey}: giá trị đo ${actual}${unit ? ` ${unit}` : ""} vượt ngưỡng cài đặt (${boundText}${unit ? ` ${unit}` : ""}) tại ${pointName}`.slice(
+            0,
+            500,
+          );
+
+          await emsDb
+            .execute(
+              `INSERT INTO alert_events
+                 (id, project_id, meter_point_id, occurred_at, parameter_name, value, unit, severity, status, category, message, threshold_value)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+               ON DUPLICATE KEY UPDATE
+                 occurred_at = VALUES(occurred_at),
+                 value = VALUES(value),
+                 unit = VALUES(unit),
+                 severity = VALUES(severity),
+                 category = VALUES(category),
+                 message = VALUES(message),
+                 threshold_value = VALUES(threshold_value)`,
+              [
+                eventId,
+                pid,
+                sample.meterPointId,
+                sample.at,
+                rule.parameterKey,
+                actual,
+                unit,
+                rule.severity || "warning",
+                category,
+                message,
+                thresholdVal,
+              ],
+            )
+            .catch(() => undefined);
+        }
+      }
+
+      // 2. Đánh giá cảnh báo Mất kết nối (quá timeout cài đặt) & Kết nối trở lại cho từng node
+      for (const meter of meterRows) {
+        const pointId = asString(meter.id);
+        const pointName = asString(meter.name) || pointId;
+        const rawSerial = asString(meter.serialNumber).replace(/^SN:\s*/i, "").trim();
+        if (!rawSerial) continue;
+        const shortPoint = pointId.replace(/[^a-zA-Z0-9]/g, "").slice(-14) || "pt";
+
+        // 2a. Rà soát các khoảng gián đoạn lịch sử trong 14 ngày gần nhất vượt quá timeoutSeconds
+        const gapRows = await queryRows<Row>(
+          `SELECT DATE_FORMAT(DATE_ADD(prev_at, INTERVAL ? SECOND), '%Y-%m-%d %H:%i:%s') AS offlineAt,
+                  DATE_FORMAT(received_at, '%Y-%m-%d %H:%i:%s') AS onlineAt,
+                  TIMESTAMPDIFF(SECOND, prev_at, received_at) AS gapSec,
+                  DATE_FORMAT(prev_at, '%Y%m%d%H%i%s') AS stampKey
+             FROM (
+               SELECT received_at,
+                      LAG(received_at) OVER (ORDER BY received_at ASC, id ASC) AS prev_at
+                 FROM gateway_samples
+                WHERE meter_id = ?
+                  AND received_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 14 DAY)
+             ) seq
+            WHERE prev_at IS NOT NULL
+              AND TIMESTAMPDIFF(SECOND, prev_at, received_at) > ?
+            ORDER BY received_at DESC
+            LIMIT ${GAP_SCAN_LIMIT}`,
+          [timeoutSeconds, rawSerial, timeoutSeconds],
+        ).catch(() => null);
+
+        const validGapKeys = new Set<string>();
+        for (const gap of gapRows ?? []) {
+          const stampKey = asString(gap.stampKey);
+          const offlineAt = asString(gap.offlineAt);
+          const onlineAt = asString(gap.onlineAt);
+          if (!stampKey || !offlineAt || !onlineAt) continue;
+          validGapKeys.add(stampKey);
+
+          const gapMinutes = Math.max(1, Math.round((asNumber(gap.gapSec) / 60) * 10) / 10);
+          const offId = `OFF-${shortPoint}-${stampKey}`.slice(0, 64);
+          const onlId = `ONL-${shortPoint}-${stampKey}`.slice(0, 64);
+          const offMsg = `Node ${pointName} (SN: ${rawSerial}) mất kết nối quá timeout cài đặt ${timeoutMinutes} phút (không có dữ liệu từ Gateway trong ${gapMinutes} phút)`.slice(
+            0,
+            500,
+          );
+          const onlMsg = `Node ${pointName} (SN: ${rawSerial}) đã kết nối trở lại sau ${gapMinutes} phút mất kết nối`.slice(
+            0,
+            500,
+          );
+
+          await emsDb
+            .execute(
+              `INSERT INTO alert_events
+                 (id, project_id, meter_point_id, occurred_at, parameter_name, value, unit, severity, status, category, message, threshold_value)
+               VALUES (?, ?, ?, ?, 'Mất kết nối', ?, 'phút', 'critical', 'resolved', 'connectivity', ?, ?)
+               ON DUPLICATE KEY UPDATE
+                 value = VALUES(value),
+                 status = IF(status = 'acknowledged', 'acknowledged', 'resolved'),
+                 message = VALUES(message),
+                 threshold_value = VALUES(threshold_value)`,
+              [offId, pid, pointId, offlineAt, gapMinutes, offMsg, timeoutMinutes],
+            )
+            .catch(() => undefined);
+
+          await emsDb
+            .execute(
+              `INSERT INTO alert_events
+                 (id, project_id, meter_point_id, occurred_at, parameter_name, value, unit, severity, status, category, message, threshold_value)
+               VALUES (?, ?, ?, ?, 'Kết nối trở lại', ?, 'phút', 'info', 'resolved', 'connectivity', ?, ?)
+               ON DUPLICATE KEY UPDATE
+                 value = VALUES(value),
+                 message = VALUES(message),
+                 threshold_value = VALUES(threshold_value)`,
+              [onlId, pid, pointId, onlineAt, gapMinutes, onlMsg, timeoutMinutes],
+            )
+            .catch(() => undefined);
+        }
+
+        // 2b. Kiểm tra trạng thái hiện tại so với bản tin cuối cùng từ Gateway
+        const latestRows = await queryRows<Row>(
+          `SELECT DATE_FORMAT(received_at, '%Y-%m-%d %H:%i:%s') AS lastAt,
+                  DATE_FORMAT(DATE_ADD(received_at, INTERVAL ? SECOND), '%Y-%m-%d %H:%i:%s') AS offlineAt,
+                  TIMESTAMPDIFF(SECOND, received_at, UTC_TIMESTAMP()) AS idleSec,
+                  DATE_FORMAT(received_at, '%Y%m%d%H%i%s') AS stampKey
+             FROM gateway_samples
+            WHERE meter_id = ?
+            ORDER BY received_at DESC, id DESC
+            LIMIT 1`,
+          [timeoutSeconds, rawSerial],
+        ).catch(() => [] as Row[]);
+
+        const latestRow = latestRows[0];
+        if (!latestRow) continue;
+        const idleSec = asNumber(latestRow.idleSec);
+        const stampKey = asString(latestRow.stampKey);
+        const offlineAt = asString(latestRow.offlineAt);
+
+        // 2c. Dọn cảnh báo kết nối "ma": dữ liệu của khoảng gián đoạn đã được gateway gửi bù (RE=1)
+        //     hoặc đồng bộ từ server upstream, nên khoảng mất kết nối đó thực tế không còn tồn tại.
+        if (gapRows && gapRows.length < GAP_SCAN_LIMIT) {
+          if (idleSec > timeoutSeconds && stampKey) validGapKeys.add(stampKey);
+          await reconcileConnectivityEvents(pid, pointId, shortPoint, validGapKeys);
+        }
+        const deviceId = asString(meter.deviceId);
+        const deviceStatus = asString(meter.deviceStatus);
+
+        if (idleSec > timeoutSeconds && stampKey && offlineAt) {
+          const idleMinutes = Math.max(1, Math.round((idleSec / 60) * 10) / 10);
+          const offId = `OFF-${shortPoint}-${stampKey}`.slice(0, 64);
+          const offMsg = `Node ${pointName} (SN: ${rawSerial}) đang mất kết nối quá timeout cài đặt ${timeoutMinutes} phút (${idleMinutes} phút chưa có dữ liệu từ Gateway)`.slice(
+            0,
+            500,
+          );
+          await emsDb
+            .execute(
+              `INSERT INTO alert_events
+                 (id, project_id, meter_point_id, occurred_at, parameter_name, value, unit, severity, status, category, message, threshold_value)
+               VALUES (?, ?, ?, ?, 'Mất kết nối', ?, 'phút', 'critical', 'active', 'connectivity', ?, ?)
+               ON DUPLICATE KEY UPDATE
+                 value = VALUES(value),
+                 status = IF(status = 'acknowledged', 'acknowledged', 'active'),
+                 message = VALUES(message),
+                 threshold_value = VALUES(threshold_value)`,
+              [offId, pid, pointId, offlineAt, idleMinutes, offMsg, timeoutMinutes],
+            )
+            .catch(() => undefined);
+
+          if (deviceId && deviceStatus !== "offline") {
+            await emsDb
+              .execute("UPDATE devices SET status = 'offline' WHERE id = ?", [deviceId])
+              .catch(() => undefined);
+          }
+        } else if (idleSec >= 0 && idleSec <= timeoutSeconds) {
+          if (deviceId && deviceStatus === "offline") {
+            await emsDb
+              .execute("UPDATE devices SET status = 'online' WHERE id = ?", [deviceId])
+              .catch(() => undefined);
+          }
+        }
+      }
+    }
+  } catch (error) {
+    console.error("evaluateProjectAlerts failed", error);
+  }
+}
 
 function ensureDiagramDisplaysColumn() {
   if (!diagramDisplaysReady) {
     diagramDisplaysReady = emsDb
-      .query(
-        `ALTER TABLE diagram_states
-           ADD COLUMN IF NOT EXISTS displays JSON NULL AFTER viewport`,
-      )
+      .query("ALTER TABLE diagram_states ADD COLUMN displays JSON NULL AFTER viewport")
       .then(() => undefined)
-      .catch((error) => {
-        diagramDisplaysReady = null;
-        console.error("diagram_states.displays migrate failed", error);
-        return undefined;
-      });
+      .catch(() => undefined);
   }
   return diagramDisplaysReady;
 }
@@ -91,7 +407,8 @@ function ensureDiagramDisplaysColumn() {
 function ensureDeviceColumns() {
   deviceColumnsReady ??= emsDb
     .execute("ALTER TABLE devices MODIFY COLUMN image MEDIUMTEXT NULL")
-    .then(() => undefined);
+    .then(() => undefined)
+    .catch(() => undefined);
   return deviceColumnsReady;
 }
 
@@ -118,34 +435,58 @@ async function migrateProjectSettings() {
   await emsDb
     .query(
       `ALTER TABLE project_settings
-         ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`,
+         ADD COLUMN updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`,
     )
     .catch(() => undefined);
   await emsDb.query("ALTER TABLE project_settings ADD PRIMARY KEY (project_id)").catch(() => undefined);
+  await emsDb
+    .query(
+      `UPDATE project_settings
+          SET payload = JSON_SET(
+                payload,
+                '$.costConfig.electricity.prices.normal', '1.833',
+                '$.costConfig.electricity.prices.off', '1.190',
+                '$.costConfig.electricity.prices.peak', '3.398'
+              )
+        WHERE JSON_UNQUOTE(JSON_EXTRACT(payload, '$.costConfig.electricity.prices.normal')) = '1'
+          AND JSON_UNQUOTE(JSON_EXTRACT(payload, '$.costConfig.electricity.prices.off')) = '1'
+          AND JSON_UNQUOTE(JSON_EXTRACT(payload, '$.costConfig.electricity.prices.peak')) = '1'`,
+    )
+    .catch(() => undefined);
 }
 
 function ensureGhgColumns() {
-  ghgColumnsReady ??= Promise.all([
-    emsDb.execute(
-      "ALTER TABLE ghg_emission_sources ADD COLUMN IF NOT EXISTS multipliers_json JSON NULL",
-    ),
-    emsDb.execute(
-      "ALTER TABLE ghg_emission_sources ADD COLUMN IF NOT EXISTS manual_value DECIMAL(18,6) NULL",
-    ),
-    emsDb.execute(
-      "ALTER TABLE ghg_emission_sources ADD COLUMN IF NOT EXISTS manual_unit VARCHAR(40) NULL",
-    ),
-    emsDb
-      .execute("ALTER TABLE ghg_emission_sources DROP FOREIGN KEY fk_ghg_sources_factor")
-      .catch(() => undefined),
-    emsDb
-      .execute("ALTER TABLE ghg_emission_sources MODIFY COLUMN factor_group_id VARCHAR(100) NULL")
-      .catch(() => undefined),
-    emsDb
-      .execute("ALTER TABLE ghg_emission_sources MODIFY COLUMN gas_key VARCHAR(10) NULL")
-      .catch(() => undefined),
-  ]).then(() => undefined);
+  if (!ghgColumnsReady) {
+    ghgColumnsReady = (async () => {
+      const queries = [
+        "ALTER TABLE ghg_emission_sources ADD COLUMN multipliers_json JSON NULL",
+        "ALTER TABLE ghg_emission_sources ADD COLUMN manual_value DECIMAL(18,6) NULL",
+        "ALTER TABLE ghg_emission_sources ADD COLUMN manual_unit VARCHAR(40) NULL",
+        "ALTER TABLE ghg_emission_sources ADD COLUMN manual_monthly_json JSON NULL",
+        "ALTER TABLE ghg_emission_sources DROP FOREIGN KEY fk_ghg_sources_factor",
+        "ALTER TABLE ghg_emission_sources MODIFY COLUMN factor_group_id VARCHAR(100) NULL",
+        "ALTER TABLE ghg_emission_sources MODIFY COLUMN gas_key VARCHAR(10) NULL",
+      ];
+      for (const sql of queries) {
+        await emsDb.execute(sql).catch(() => undefined);
+      }
+    })();
+  }
   return ghgColumnsReady;
+}
+
+function asManualMonthly(value: unknown): Record<string, number> | undefined {
+  const raw = jsonField<Record<string, unknown> | null>(value, null);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const out: Record<string, number> = {};
+  for (const [k, v] of Object.entries(raw)) {
+    if (!/^\d{4}-\d{2}$/.test(k)) continue;
+    const num = Number(v);
+    if (Number.isFinite(num) && num >= 0) {
+      out[k] = num;
+    }
+  }
+  return out;
 }
 
 function asMultipliers(value: unknown) {
@@ -278,6 +619,36 @@ async function getProjects(projectId?: string, allowedProjectIds?: string[]) {
   }));
 }
 
+type DeviceProjectLink = { projectId: string; projectName: string; meterId: string; meterName: string };
+
+/** Điểm đo gắn với đồng hồ qua device_id hoặc trùng số serial (gateway ghép theo serial). */
+async function deviceProjectLinks() {
+  const rows = await queryRows<Row>(
+    `SELECT d.id AS deviceId, p.id AS projectId, p.name AS projectName, mp.id AS meterId, mp.name AS meterName
+       FROM devices d
+       JOIN meter_points mp
+         ON mp.device_id = d.id
+         OR (TRIM(COALESCE(mp.serial_number, '')) <> '' AND TRIM(mp.serial_number) = TRIM(d.serial_number))
+       JOIN projects p ON p.id = mp.project_id
+      ORDER BY p.name, mp.name`,
+  );
+  const map = new Map<string, DeviceProjectLink[]>();
+  for (const row of rows) {
+    const key = asString(row.deviceId);
+    const list = map.get(key) ?? [];
+    if (!list.some((item) => item.meterId === asString(row.meterId))) {
+      list.push({
+        projectId: asString(row.projectId),
+        projectName: asString(row.projectName),
+        meterId: asString(row.meterId),
+        meterName: asString(row.meterName),
+      });
+    }
+    map.set(key, list);
+  }
+  return map;
+}
+
 async function getResource(resource: string, request: NextRequest) {
   const projectId = request.nextUrl.searchParams.get("projectId") || undefined;
   if (resource === "accounts") {
@@ -309,10 +680,12 @@ async function getResource(resource: string, request: NextRequest) {
               protocol, notes, image, extra_fields AS extraFields, registers
          FROM devices ORDER BY id`,
     );
+    const links = await deviceProjectLinks();
     return rows.map((row) => ({
       ...row,
       extraFields: jsonField(row.extraFields, undefined),
       registers: jsonField(row.registers, undefined),
+      projects: links.get(asString(row.id)) ?? [],
     }));
   }
   if (resource === "meter-types") {
@@ -320,12 +693,39 @@ async function getResource(resource: string, request: NextRequest) {
   }
   if (resource === "client-meters") {
     if (!projectId) throw new Error("projectId is required");
-    return queryRows<Row>(
-      `SELECT id, name, code, device_type AS type, parent_id AS parentId,
-              utility, device_id AS deviceId, serial_number AS serialNumber
-         FROM meter_points WHERE project_id = ? ORDER BY id`,
-      [projectId],
-    );
+    const [rows, historyRows] = await Promise.all([
+      queryRows<Row>(
+        `SELECT id, name, code, device_type AS type, parent_id AS parentId,
+                utility, device_id AS deviceId, serial_number AS serialNumber
+           FROM meter_points WHERE project_id = ? ORDER BY id`,
+        [projectId],
+      ),
+      queryRows<Row>(
+        `SELECT meter_point_id AS meterPointId, category, serial_number AS serialNumber,
+                DATE_FORMAT(DATE_ADD(valid_from, INTERVAL 7 HOUR), '%Y-%m-%d %H:%i') AS validFrom,
+                DATE_FORMAT(DATE_ADD(valid_to, INTERVAL 7 HOUR), '%Y-%m-%d %H:%i') AS validTo
+           FROM meter_point_history
+          WHERE project_id = ?
+          ORDER BY valid_from ASC, id ASC`,
+        [projectId],
+      ).catch(() => [] as Row[]),
+    ]);
+    const historyByPoint = new Map<string, Row[]>();
+    for (const h of historyRows) {
+      const pid = String(h.meterPointId);
+      const list = historyByPoint.get(pid) ?? [];
+      list.push({
+        serialNumber: String(h.serialNumber),
+        category: h.category ? String(h.category) : undefined,
+        validFrom: h.validFrom ? String(h.validFrom) : undefined,
+        validTo: h.validTo ? String(h.validTo) : undefined,
+      });
+      historyByPoint.set(pid, list);
+    }
+    return rows.map((r) => ({
+      ...r,
+      serialHistory: historyByPoint.get(String(r.id)) ?? [],
+    }));
   }
   if (resource === "emission-factors") {
     const groups = await queryRows<Row>(
@@ -350,19 +750,40 @@ async function getResource(resource: string, request: NextRequest) {
   }
   if (resource === "ghg-sources") {
     await ensureGhgColumns();
-    const rows = await queryRows<Row>(
-      `SELECT id, project_id AS projectId, scope_id AS scope, name,
-              meter_point_id AS meterPointId,
-              input_method AS method, factor_group_id AS factorGroupId,
-              gas_key AS gasKey, factor_value AS factorValue, formula,
-              multipliers_json AS multipliers,
-              manual_value AS manualValue, manual_unit AS manualUnit,
-              DATE_FORMAT(applied_at, '%Y-%m-%d') AS appliedAt,
-              tons_co2e AS tons
-         FROM ghg_emission_sources ${projectId ? "WHERE project_id = ?" : ""}
-        ORDER BY scope, id`,
-      projectId ? [projectId] : [],
-    );
+    const [rows, gasRows] = await Promise.all([
+      queryRows<Row>(
+        `SELECT id, project_id AS projectId, scope_id AS scope, name,
+                meter_point_id AS meterPointId,
+                input_method AS method, factor_group_id AS factorGroupId,
+                gas_key AS gasKey, factor_value AS factorValue, formula,
+                multipliers_json AS multipliers,
+                manual_value AS manualValue, manual_unit AS manualUnit,
+                manual_monthly_json AS manualMonthly,
+                DATE_FORMAT(applied_at, '%Y-%m-%d') AS appliedAt,
+                tons_co2e AS tons
+           FROM ghg_emission_sources ${projectId ? "WHERE project_id = ?" : ""}
+          ORDER BY scope, id`,
+        projectId ? [projectId] : [],
+      ),
+      queryRows<Row>(
+        `SELECT group_id AS groupId, gas_key AS gasKey, gas_label AS gasLabel,
+                factor_value AS value, unit
+           FROM emission_factor_gases ORDER BY group_id, gas_key`,
+      ).catch(() => [] as Row[]),
+    ]);
+    const gasesByGroup = new Map<string, { key: string; label: string; value: number; unit: string }[]>();
+    for (const gas of gasRows) {
+      const gid = asString(gas.groupId);
+      if (!gid) continue;
+      const list = gasesByGroup.get(gid) ?? [];
+      list.push({
+        key: asString(gas.gasKey),
+        label: asString(gas.gasLabel),
+        value: asNumber(gas.value),
+        unit: asString(gas.unit),
+      });
+      gasesByGroup.set(gid, list);
+    }
     return rows.map((row) => ({
       ...row,
       scope: asNumber(row.scope),
@@ -371,13 +792,16 @@ async function getResource(resource: string, request: NextRequest) {
           ? `${row.factorGroupId}:${row.gasKey}`
           : "none:none",
       factorValue: asNumber(row.factorValue),
+      gases: row.factorGroupId ? (gasesByGroup.get(asString(row.factorGroupId)) ?? undefined) : undefined,
       multipliers: asMultipliers(row.multipliers),
       manualValue: row.manualValue == null ? undefined : asNumber(row.manualValue),
       manualUnit: asString(row.manualUnit) || undefined,
+      manualMonthly: asManualMonthly(row.manualMonthly),
       tons: row.tons == null ? undefined : asNumber(row.tons),
     }));
   }
   if (resource === "alert-events") {
+    await evaluateProjectAlerts(projectId);
     const rows = await queryRows<Row>(
       `SELECT a.id, a.project_id AS projectId, a.meter_point_id AS meterPointId,
               DATE_FORMAT(a.occurred_at, '%Y-%m-%d %H:%i:%s') AS occurredAt,
@@ -688,17 +1112,82 @@ async function saveResource(resource: string, body: Row) {
     const projectId = asString(body.projectId);
     const meters = Array.isArray(body.meters) ? body.meters as Row[] : [];
     if (!projectId) throw new Error("projectId is required");
+    await emsDb
+      .query(
+        `CREATE TABLE IF NOT EXISTS meter_point_history (
+           id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+           project_id VARCHAR(64) NOT NULL,
+           meter_point_id VARCHAR(100) NOT NULL,
+           category VARCHAR(100) NULL,
+           serial_number VARCHAR(100) NOT NULL,
+           valid_from DATETIME NOT NULL DEFAULT '2020-01-01 00:00:00',
+           valid_to DATETIME NULL,
+           PRIMARY KEY (id),
+           KEY idx_mph_point (project_id, meter_point_id, valid_from)
+         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+      )
+      .catch(() => undefined);
+
+    const existingPoints = await queryRows<Row>(
+      `SELECT mp.id, COALESCE(NULLIF(TRIM(mp.serial_number), ''), d.serial_number) AS serialNumber, d.category
+         FROM meter_points mp
+         LEFT JOIN devices d ON d.id = mp.device_id
+        WHERE mp.project_id = ?`,
+      [projectId],
+    ).catch(() => [] as Row[]);
+    const allDevices = await queryRows<Row>(
+      `SELECT id, serial_number AS sn, category FROM devices`,
+    ).catch(() => [] as Row[]);
+    const deviceById = new Map(allDevices.map((d) => [String(d.id), d]));
+    const oldByPoint = new Map(existingPoints.map((p) => [String(p.id), p]));
+
     await transaction(async (connection) => {
+      for (const meter of meters) {
+        const pointId = asString(meter.id);
+        const dev = meter.deviceId ? deviceById.get(asString(meter.deviceId)) : undefined;
+        const newSerial = (asString(meter.serialNumber).trim() || asString(dev?.sn).trim()).replace(/^SN:\s*/i, "");
+        const newCat = asString(dev?.category).trim() || "PM2230";
+        const prev = oldByPoint.get(pointId);
+        const oldSerial = prev ? asString(prev.serialNumber).trim().replace(/^SN:\s*/i, "") : "";
+        const oldCat = prev ? asString(prev.category).trim() || "PM2230" : "PM2230";
+
+        if (oldSerial && newSerial && oldSerial !== newSerial) {
+          // Đóng hiệu lực của đồng hồ cũ tại thời điểm thay thế
+          const [updated] = await connection.execute(
+            `UPDATE meter_point_history
+                SET valid_to = UTC_TIMESTAMP()
+              WHERE project_id = ? AND meter_point_id = ? AND serial_number = ? AND valid_to IS NULL`,
+            [projectId, pointId, oldSerial],
+          );
+          const affected = (updated as { affectedRows?: number }).affectedRows ?? 0;
+          if (affected === 0) {
+            await connection.execute(
+              `INSERT INTO meter_point_history (project_id, meter_point_id, category, serial_number, valid_from, valid_to)
+               VALUES (?, ?, ?, ?, '2020-01-01 00:00:00', UTC_TIMESTAMP())`,
+              [projectId, pointId, oldCat, oldSerial],
+            );
+          }
+          // Mở hiệu lực cho đồng hồ mới
+          await connection.execute(
+            `INSERT INTO meter_point_history (project_id, meter_point_id, category, serial_number, valid_from, valid_to)
+             VALUES (?, ?, ?, ?, UTC_TIMESTAMP(), NULL)`,
+            [projectId, pointId, newCat, newSerial],
+          );
+        }
+      }
+
       await connection.execute("DELETE FROM meter_points WHERE project_id = ?", [projectId]);
       const parents = meters.filter((meter) => !meter.parentId);
       const children = meters.filter((meter) => meter.parentId);
       for (const meter of [...parents, ...children]) {
+        const dev = meter.deviceId ? deviceById.get(asString(meter.deviceId)) : undefined;
+        const resolvedSerial = asString(meter.serialNumber).trim() || asString(dev?.sn).trim() || null;
         await connection.execute(
           `INSERT INTO meter_points
              (id, project_id, name, code, device_type, parent_id, utility, device_id, serial_number)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [meter.id, projectId, meter.name, meter.code, meter.type, meter.parentId || null,
-            meter.utility, meter.deviceId || null, meter.serialNumber || null],
+            meter.utility, meter.deviceId || null, resolvedSerial],
         );
       }
     });
@@ -739,18 +1228,20 @@ async function saveResource(resource: string, body: Row) {
           !rawGroupId || rawGroupId === "none" ? null : rawGroupId;
         const gasKey = !rawGasKey || rawGasKey === "none" ? null : rawGasKey;
         const multipliers = asMultipliers(source.multipliers);
+        const manualMonthly = asManualMonthly(source.manualMonthly);
         await connection.execute(
           `INSERT INTO ghg_emission_sources
             (id, project_id, scope_id, name, input_method, factor_group_id, gas_key,
              factor_value, formula, multipliers_json, applied_at, meter_point_id,
-             manual_value, manual_unit, tons_co2e)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             manual_value, manual_unit, manual_monthly_json, tons_co2e)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [source.id, projectId, asNumber(source.scope), source.name, source.method,
             factorGroupId, gasKey, asNumber(source.factorValue),
             source.formula || "", multipliers.length ? JSON.stringify(multipliers) : null,
             source.appliedAt, asString(source.meterPointId) || null,
             source.manualValue == null ? null : asNumber(source.manualValue),
             asString(source.manualUnit) || null,
+            manualMonthly ? JSON.stringify(manualMonthly) : null,
             source.tons == null ? null : asNumber(source.tons)],
         );
       }
@@ -815,6 +1306,8 @@ async function saveResource(resource: string, body: Row) {
        ON DUPLICATE KEY UPDATE payload = VALUES(payload), updated_at = CURRENT_TIMESTAMP`,
       [projectId, payload],
     );
+    lastAlertEvalAt.delete(projectId);
+    void evaluateProjectAlerts(projectId);
     return getResource(resource, new NextRequest(`http://localhost/api/ems/project-settings?projectId=${encodeURIComponent(projectId)}`));
   }
   throw new Error(`Unknown resource: ${resource}`);
@@ -852,7 +1345,13 @@ async function deleteResource(resource: string, request: NextRequest) {
   const key = resource === "emission-factors" ? "id" : resource === "meter-types" ? "name" : "id";
   if (resource === "devices") {
     await ensureDeviceColumns();
-    await emsDb.execute("UPDATE meter_points SET device_id = NULL WHERE device_id = ?", [id]);
+    const linked = (await deviceProjectLinks()).get(id) ?? [];
+    if (linked.length > 0) {
+      const names = linked.map((item) => `${item.projectName} (${item.meterName})`).join(", ");
+      throw new UserFacingError(
+        `Đồng hồ đang được gắn trong dự án: ${names}. Hãy gỡ đồng hồ khỏi điểm đo trong dự án trước khi xóa.`,
+      );
+    }
   }
   if (resource === "accounts") {
     await ensureAccountProjectsSchema();

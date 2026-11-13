@@ -11,6 +11,7 @@ import {
   upsertFactorGroup,
   type FactorGroup,
 } from "@/lib/emission-factors";
+import { formatAppNumberInput, formatLiveNumberInput } from "@/lib/number-format";
 
 type GasRow = {
   id: string;
@@ -21,9 +22,9 @@ type GasRow = {
 };
 
 const defaultRows: GasRow[] = [
-  { id: "row-co2", key: "co2", label: "CO2", value: "74.100", unit: "kg CO2/TJ" },
+  { id: "row-co2", key: "co2", label: "CO2", value: "74 100", unit: "kg CO2/TJ" },
   { id: "row-ch4", key: "ch4", label: "CH4", value: "3", unit: "kg CH4/TJ" },
-  { id: "row-n2o", key: "n2o", label: "N2O", value: "0.6", unit: "kg N2O/TJ" },
+  { id: "row-n2o", key: "n2o", label: "N2O", value: "0,6", unit: "kg N2O/TJ" },
 ];
 
 function rowsFromGroup(group: FactorGroup): GasRow[] {
@@ -238,7 +239,8 @@ export function AddEmissionFactorForm() {
                   <div>
                     <input
                       value={row.value}
-                      onChange={(e) => updateRow(row.id, { value: e.target.value })}
+                      onChange={(e) => updateRow(row.id, { value: formatLiveNumberInput(e.target.value) })}
+                      onBlur={(e) => updateRow(row.id, { value: formatAppNumberInput(e.target.value) })}
                       inputMode="decimal"
                       placeholder="0"
                       className="input"

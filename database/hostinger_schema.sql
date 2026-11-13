@@ -646,7 +646,7 @@ CREATE TABLE `project_settings` (
 
 LOCK TABLES `project_settings` WRITE;
 /*!40000 ALTER TABLE `project_settings` DISABLE KEYS */;
-INSERT INTO `project_settings` VALUES ('PRJ-2401','{\"alertConfig\":{\"categoriesByUtility\":{\"Điện\":[{\"id\":\"energy\",\"label\":\"Energy\"},{\"id\":\"ui\",\"label\":\"U/I\"},{\"id\":\"frequency\",\"label\":\"Tần số\"},{\"id\":\"power\",\"label\":\"Công suất\"},{\"id\":\"harmonics\",\"label\":\"Sóng hài\"},{\"id\":\"imbalance\",\"label\":\"Mất cân bằng pha\"}]},\"activeUtility\":\"Điện\",\"activeId\":\"harmonics\",\"alarmsByCategory\":{}},\"costConfig\":{\"utility\":\"Điện\",\"applyDate\":\"\",\"slots\":[],\"flatPrices\":{},\"electricity\":{\"voltageLevel\":\"kv22\",\"prices\":{\"normal\":\"1\",\"off\":\"1\",\"peak\":\"1\"}}}}','2026-11-08 09:45:00'),('PRJ-2402','{\"alertConfig\":{\"categoriesByUtility\":{\"Điện\":[{\"id\":\"energy\",\"label\":\"Energy\"},{\"id\":\"ui\",\"label\":\"U/I\"},{\"id\":\"frequency\",\"label\":\"Tần số\"},{\"id\":\"power\",\"label\":\"Công suất\"},{\"id\":\"harmonics\",\"label\":\"Sóng hài\"},{\"id\":\"imbalance\",\"label\":\"Mất cân bằng pha\"}]},\"activeUtility\":\"Điện\",\"activeId\":\"energy\",\"alarmsByCategory\":{}}}','2026-11-07 15:32:55');
+INSERT INTO `project_settings` VALUES ('PRJ-2401','{\"alertConfig\":{\"categoriesByUtility\":{\"Điện\":[{\"id\":\"energy\",\"label\":\"Energy\"},{\"id\":\"ui\",\"label\":\"U/I\"},{\"id\":\"frequency\",\"label\":\"Tần số\"},{\"id\":\"power\",\"label\":\"Công suất\"},{\"id\":\"harmonics\",\"label\":\"Sóng hài\"},{\"id\":\"imbalance\",\"label\":\"Mất cân bằng pha\"}]},\"activeUtility\":\"Điện\",\"activeId\":\"harmonics\",\"alarmsByCategory\":{}},\"costConfig\":{\"utility\":\"Điện\",\"applyDate\":\"\",\"slots\":[],\"flatPrices\":{},\"electricity\":{\"voltageLevel\":\"kv22\",\"prices\":{\"normal\":\"1.833\",\"off\":\"1.190\",\"peak\":\"3.398\"}}}}','2026-11-08 09:45:00'),('PRJ-2402','{\"alertConfig\":{\"categoriesByUtility\":{\"Điện\":[{\"id\":\"energy\",\"label\":\"Energy\"},{\"id\":\"ui\",\"label\":\"U/I\"},{\"id\":\"frequency\",\"label\":\"Tần số\"},{\"id\":\"power\",\"label\":\"Công suất\"},{\"id\":\"harmonics\",\"label\":\"Sóng hài\"},{\"id\":\"imbalance\",\"label\":\"Mất cân bằng pha\"}]},\"activeUtility\":\"Điện\",\"activeId\":\"energy\",\"alarmsByCategory\":{}}}','2026-11-07 15:32:55');
 /*!40000 ALTER TABLE `project_settings` ENABLE KEYS */;
 UNLOCK TABLES;
 
@@ -816,7 +816,7 @@ CREATE TABLE `gateway_samples` (
   `crc_ok` tinyint(1) NOT NULL,
   `values_json` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL CHECK (json_valid(`values_json`)),
   PRIMARY KEY (`id`),
-  UNIQUE KEY `uq_gateway_sample` (`gateway_id`,`meter_id`,`packet_number`),
+  UNIQUE KEY `uq_gateway_sample_time` (`gateway_id`,`meter_id`,`received_at`,`packet_number`),
   KEY `idx_gateway_sample_meter` (`meter_model`,`meter_id`,`received_at`)
 ) ENGINE=InnoDB AUTO_INCREMENT=108212 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;

@@ -2,6 +2,7 @@
 
 import { exportToExcel, type ExcelCellValue } from "@/lib/excel-export";
 import { chartTimeLabel, type ChartSample } from "@/lib/gateway-series";
+import { formatAppNumber } from "@/lib/number-format";
 import { formatStoredVietnam } from "@/lib/vietnam-time";
 
 export type ChartViewMode = "chart" | "table";
@@ -41,7 +42,7 @@ export function buildSampleTableRows(
     const values = seriesList.map((s) => {
       const digits = s.digits ?? 2;
       const num = Number((s.values[pos] ?? 0).toFixed(digits));
-      const formatted = num.toFixed(digits);
+      const formatted = formatAppNumber(num, { minDecimals: digits, maxDecimals: digits });
       return {
         raw: num,
         display: s.unit ? `${formatted} ${s.unit}` : formatted,

@@ -52,10 +52,14 @@ export function hydrateAccounts() {
   if (accountsHydration) return accountsHydration;
   accountsHydration = dbFetch<Account[]>("accounts")
     .then((accounts) => {
+      const prevJson = JSON.stringify(accountsCache);
       accountsCache = accounts;
-      emitDbChange("accounts");
+      if (prevJson !== JSON.stringify(accounts)) {
+        emitDbChange("accounts");
+      }
       return accountsCache;
     })
+    .catch(() => accountsCache)
     .finally(() => {
       accountsHydration = null;
     });

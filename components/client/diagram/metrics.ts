@@ -3,6 +3,7 @@ import {
   registerToKwh,
   type MeterParameter,
 } from "@/lib/meter-parameters";
+import { formatAppNumber } from "@/lib/number-format";
 import type { MeterMetric, MeterStatus } from "./types";
 
 /** Thông số mặc định trên thẻ sơ đồ (điện áp / dòng / công suất / tần số). */
@@ -66,9 +67,9 @@ export function formatMetricReading(key: string, values: Record<string, number> 
 
   const abs = Math.abs(num);
   const digits = abs >= 100 ? 1 : abs >= 10 ? 2 : abs >= 1 ? 2 : 3;
-  const text = num.toLocaleString("en-US", {
-    maximumFractionDigits: digits,
-    minimumFractionDigits: Number.isInteger(num) ? 0 : Math.min(digits, 1),
+  const text = formatAppNumber(num, {
+    maxDecimals: digits,
+    minDecimals: Number.isInteger(num) ? 0 : Math.min(digits, 1),
   });
   return unit ? `${text} ${unit}` : text;
 }

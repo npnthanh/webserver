@@ -69,16 +69,14 @@ export function periodIndexForInstant(value: TimeFilterValue, at: string, length
   } else if (value.mode === "year") {
     if (parts.year === value.year) index = parts.month - 1;
   } else if (value.mode === "day" && parts.date === value.date) {
-    index = parts.hour;
-  } else if (value.mode === "custom_date" && value.customDateMode !== "range") {
-    if (parts.date === civilDatePart(value.customDate)) index = parts.hour;
-  } else if (value.mode === "custom_date" && value.customDateMode === "range") {
+    index = length === 48 ? parts.hour * 2 + (parts.minute >= 30 ? 1 : 0) : parts.hour;
+  } else if (value.mode === "custom_date") {
     const { fromMs, toMs } = orderedRange(value);
     const currentMs = filterInstantMs(`${parts.date}T${String(parts.hour).padStart(2, "0")}:${String(parts.minute).padStart(2, "0")}`);
     if (currentMs < fromMs || currentMs > toMs) return -1;
     const span = timeFilterSpan(value);
     if (span.hourly) {
-      index = Math.floor((currentMs - fromMs) / (60 * 60 * 1000));
+      index = Math.floor((currentMs - fromMs) / (30 * 60 * 1000));
     } else {
       const startDay = Date.parse(`${civilDatePart(span.from)}T00:00:00+07:00`);
       const currentDay = Date.parse(`${parts.date}T00:00:00+07:00`);
@@ -95,9 +93,7 @@ export function getTimeFilterLabel(value: TimeFilterValue): string {
         ? `Hôm nay (${formatCivilDate(value.date)})`
         : formatCivilDate(value.date);
     case "custom_date":
-      return value.customDateMode === "range"
-        ? `${formatCivilDateTime(value.startDate)} → ${formatCivilDateTime(value.endDate)}`
-        : formatCivilDateTime(value.customDate);
+      return `${formatCivilDateTime(value.startDate)} → ${formatCivilDateTime(value.endDate)}`;
     case "month": {
       const [y, m] = value.month.split("-");
       return `Tháng ${m}/${y}`;
@@ -110,11 +106,15 @@ export function getTimeFilterLabel(value: TimeFilterValue): string {
 }
 
 export function getTimeFilterPeriods(value: TimeFilterValue): { key: string | number; label: string }[] {
-  if (value.mode === "day" || (value.mode === "custom_date" && value.customDateMode !== "range")) {
-    return Array.from({ length: 24 }, (_, i) => ({
-      key: i,
-      label: `${String(i).padStart(2, "0")}:00`,
-    }));
+  if (value.mode === "day") {
+    return Array.from({ length: 48 }, (_, i) => {
+      const h = Math.floor(i / 2);
+      const m = i % 2 === 0 ? "00" : "30";
+      return {
+        key: i,
+        label: `${String(h).padStart(2, "0")}:${m}`,
+      };
+    });
   }
 
   if (value.mode === "month") {
@@ -133,17 +133,17 @@ export function getTimeFilterPeriods(value: TimeFilterValue): { key: string | nu
     }));
   }
 
-  if (value.mode === "custom_date" && value.customDateMode === "range") {
+  if (value.mode === "custom_date") {
     const span = timeFilterSpan(value);
     const { fromMs, toMs } = orderedRange(value);
     if (span.hourly) {
-      const hours = Math.max(1, Math.min(168, Math.floor((toMs - fromMs) / (60 * 60 * 1000)) + 1));
-      return Array.from({ length: hours }, (_, i) => {
-        const t = new Date(fromMs + i * 60 * 60 * 1000);
+      const sameDay = civilDatePart(span.from) === civilDatePart(span.to);
+      const slots = Math.max(1, Math.min(336, Math.floor((toMs - fromMs) / (30 * 60 * 1000)) + 1));
+      return Array.from({ length: slots }, (_, i) => {
+        const t = new Date(fromMs + i * 30 * 60 * 1000);
         const label = new Intl.DateTimeFormat("vi-VN", {
           timeZone: "Asia/Ho_Chi_Minh",
-          day: "2-digit",
-          month: "2-digit",
+          ...(sameDay ? {} : { day: "2-digit", month: "2-digit" }),
           hour: "2-digit",
           minute: "2-digit",
           hourCycle: "h23",
@@ -178,7 +178,6 @@ export function getTimeFilterScaleFactor(value: TimeFilterValue): number {
     case "day":
       return 1 / 365;
     case "custom_date": {
-      if (value.customDateMode !== "range") return 1 / 365;
       const { fromMs, toMs } = orderedRange(value);
       const diffDays = Math.max(1, (toMs - fromMs) / (1000 * 60 * 60 * 24));
       return diffDays / 365;
@@ -205,19 +204,12 @@ export function timeFilterSpan(value: TimeFilterValue): { from: string; to: stri
     };
   }
   if (value.mode === "year") return { from: `${value.year}-01-01`, to: `${value.year}-12-31`, hourly: false };
-  if (value.mode === "custom_date" && value.customDateMode === "range") {
-    const { from, to, fromMs, toMs } = orderedRange(value);
-    const hours = (toMs - fromMs) / (60 * 60 * 1000);
-    return {
-      from: civilDatePart(from),
-      to: civilDatePart(to),
-      hourly: hours <= 48,
-    };
-  }
+  const { from, to, fromMs, toMs } = orderedRange(value);
+  const hours = (toMs - fromMs) / (60 * 60 * 1000);
   return {
-    from: civilDatePart(value.customDate),
-    to: civilDatePart(value.customDate),
-    hourly: true,
+    from: civilDatePart(from),
+    to: civilDatePart(to),
+    hourly: hours <= 48,
   };
 }
 
@@ -281,18 +273,23 @@ function withCivilDate(value: TimeFilterValue, date: string): TimeFilterValue {
 export function TimeFilterBar({
   value,
   onChange,
+  allowedModes,
   className = "",
 }: {
   value: TimeFilterValue;
   onChange: (next: TimeFilterValue) => void;
+  allowedModes?: TimeFilterMode[];
   className?: string;
 }) {
-  const modes: { id: TimeFilterMode; label: string }[] = [
+  const allModes: { id: TimeFilterMode; label: string }[] = [
     { id: "day", label: "Ngày" },
     { id: "month", label: "Tháng" },
     { id: "year", label: "Năm" },
     { id: "custom_date", label: "Tùy chọn" },
   ];
+  const modes = allowedModes
+    ? allModes.filter((m) => allowedModes.includes(m.id))
+    : allModes;
 
   const years = useMemo(() => [2023, 2024, 2025, 2026, 2027], []);
 
@@ -305,7 +302,13 @@ export function TimeFilterBar({
             <button
               key={item.id}
               type="button"
-              onClick={() => onChange({ ...value, mode: item.id })}
+              onClick={() =>
+                onChange({
+                  ...value,
+                  mode: item.id,
+                  customDateMode: "range",
+                })
+              }
               className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition-all ${
                 active
                   ? "bg-slate-900 text-white shadow-xs"
@@ -318,7 +321,7 @@ export function TimeFilterBar({
         })}
       </div>
 
-      <div className="inline-flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
+      <div className="inline-flex max-w-full shrink-0 items-center gap-1.5">
         <button
           type="button"
           aria-label="Kỳ trước"
@@ -328,19 +331,12 @@ export function TimeFilterBar({
           ‹
         </button>
         {value.mode === "day" && (
-          <div className="inline-flex h-9 items-center gap-1 rounded-xl border border-slate-200 bg-white px-1.5 text-xs font-medium text-slate-700 shadow-xs">
-            <StepButton
-              label="Ngày trước"
-              onClick={() => onChange(withCivilDate(value, shiftCivilDate(value.date, -1)))}
-            />
+          <div className="inline-flex h-9 items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 text-xs font-medium text-slate-700 shadow-xs whitespace-nowrap">
+            <CalendarSmallIcon className="h-3.5 w-3.5 shrink-0 text-emerald-600" />
             <VietnamDateInput
               value={value.date}
               onChange={(date) => onChange(withCivilDate(value, date))}
-              className="min-w-[4.5rem] border-0 bg-transparent text-xs font-semibold text-slate-900 outline-none"
-            />
-            <StepButton
-              label="Ngày sau"
-              onClick={() => onChange(withCivilDate(value, shiftCivilDate(value.date, 1)))}
+              className="min-w-[5.25rem] border-0 bg-transparent text-xs font-semibold text-slate-900 outline-none"
             />
           </div>
         )}
@@ -353,11 +349,11 @@ export function TimeFilterBar({
         )}
 
         {value.mode === "year" && (
-          <div className="relative">
+          <div className="relative min-w-[104px]">
             <CustomSelect
               value={value.year}
               onChange={(e) => onChange({ ...value, year: Number(e.target.value) })}
-              className="h-9 cursor-pointer appearance-none rounded-xl border border-slate-200 bg-white pr-8 pl-3 text-xs font-semibold text-slate-900 shadow-xs outline-none transition-colors hover:border-slate-300 focus:border-emerald-500"
+              className="h-9 w-full cursor-pointer appearance-none rounded-xl border border-slate-200 bg-white pr-8 pl-3 text-xs font-semibold whitespace-nowrap text-slate-900 shadow-xs outline-none transition-colors hover:border-slate-300 focus:border-emerald-500"
             >
               {years.map((y) => (
                 <option key={y} value={y}>
@@ -403,20 +399,16 @@ export function TimeFilterBar({
 }
 
 export function DateSelectionControl({
-  mode,
-  onModeChange,
-  date,
-  onDateChange,
   startDate,
   endDate,
   onStartDateChange,
   onEndDateChange,
   compact = false,
 }: {
-  mode: CustomDateMode;
-  onModeChange: (mode: CustomDateMode) => void;
-  date: string;
-  onDateChange: (date: string) => void;
+  mode?: CustomDateMode;
+  onModeChange?: (mode: CustomDateMode) => void;
+  date?: string;
+  onDateChange?: (date: string) => void;
   startDate: string;
   endDate: string;
   onStartDateChange: (date: string) => void;
@@ -425,48 +417,34 @@ export function DateSelectionControl({
 }) {
   const textClass = compact ? "text-[12px]" : "text-xs";
   const inputClass = compact
-    ? "border-0 bg-transparent text-[12px] font-medium text-emerald-800 outline-none [color-scheme:light]"
-    : "border-0 bg-transparent text-xs font-semibold text-slate-900 outline-none cursor-pointer [color-scheme:light]";
+    ? "border-0 bg-transparent text-[12px] font-medium text-emerald-800 outline-none"
+    : "border-0 bg-transparent text-xs font-semibold text-slate-900 outline-none cursor-pointer";
 
   return (
     <div
       className={`inline-flex min-h-9 max-w-full flex-wrap items-center gap-x-2 gap-y-1.5 rounded-xl border border-slate-200 bg-white px-2.5 py-1 sm:px-3 ${textClass} font-medium text-slate-700 shadow-xs transition-colors hover:border-slate-300`}
     >
       <CalendarSmallIcon className="h-3.5 w-3.5 shrink-0 text-emerald-600" />
-      <span className="hidden whitespace-nowrap text-slate-500 sm:inline">Tùy chọn:</span>
-      <CustomSelect
-        value={mode}
-        onChange={(e) => onModeChange(e.target.value as CustomDateMode)}
-        className={`${textClass} cursor-pointer border-0 bg-transparent font-semibold text-slate-900 outline-none`}
-      >
-        <option value="single">Một mốc giờ</option>
-        <option value="range">Khoảng giờ → ngày</option>
-      </CustomSelect>
-
-      {mode === "single" ? (
-        <VietnamDateTimeInput value={date} onChange={onDateChange} className={inputClass} />
-      ) : (
-        <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-          <span className="inline-flex items-center gap-1 whitespace-nowrap">
-            <span className="text-slate-400">Từ</span>
-            <VietnamDateTimeInput
-              value={startDate}
-              max={endDate || undefined}
-              onChange={onStartDateChange}
-              className={inputClass}
-            />
-          </span>
-          <span className="inline-flex items-center gap-1 whitespace-nowrap">
-            <span className="text-slate-400">→ Đến</span>
-            <VietnamDateTimeInput
-              value={endDate}
-              min={startDate || undefined}
-              onChange={onEndDateChange}
-              className={inputClass}
-            />
-          </span>
-        </div>
-      )}
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <span className="inline-flex items-center gap-1 whitespace-nowrap">
+          <span className="text-slate-400">Từ</span>
+          <VietnamDateTimeInput
+            value={startDate}
+            max={endDate || undefined}
+            onChange={onStartDateChange}
+            className={inputClass}
+          />
+        </span>
+        <span className="inline-flex items-center gap-1 whitespace-nowrap">
+          <span className="text-slate-400">→ Đến</span>
+          <VietnamDateTimeInput
+            value={endDate}
+            min={startDate || undefined}
+            onChange={onEndDateChange}
+            className={inputClass}
+          />
+        </span>
+      </div>
     </div>
   );
 }
@@ -506,13 +484,13 @@ function MonthField({ month, onChange }: { month: string; onChange: (month: stri
         onClick={() => setOpen((current) => !current)}
         aria-expanded={open}
         aria-label="Chọn tháng"
-        className="inline-flex h-9 items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-900 shadow-xs transition-colors hover:border-slate-300"
+        className="inline-flex h-9 items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 text-xs font-semibold whitespace-nowrap text-slate-900 shadow-xs transition-colors hover:border-slate-300"
       >
         <CalendarSmallIcon className="h-3.5 w-3.5 shrink-0 text-emerald-600" />
-        Tháng {String(monthIndex).padStart(2, "0")}/{year}
+        <span>Tháng {String(monthIndex).padStart(2, "0")}/{year}</span>
       </button>
       {open ? (
-        <div className="absolute left-0 z-40 mt-1 w-[232px] rounded-xl border border-slate-200 bg-white p-3 shadow-lg sm:left-auto sm:right-0">
+        <div className="absolute left-1/2 z-40 mt-1 w-[232px] -translate-x-1/2 rounded-xl border border-slate-200 bg-white p-3 shadow-lg sm:left-auto sm:right-0 sm:translate-x-0">
           <div className="mb-2 flex items-center justify-between">
             <StepButton label="Năm trước" onClick={() => choose(year - 1, monthIndex)} />
             <span className="text-sm font-semibold text-slate-900">{year}</span>
@@ -605,6 +583,9 @@ function VietnamDateInput({
   );
 }
 
+const HOURS_24 = Array.from({ length: 24 }, (_, i) => String(i).padStart(2, "0"));
+const MINUTES_60 = Array.from({ length: 60 }, (_, i) => String(i).padStart(2, "0"));
+
 function VietnamDateTimeInput({
   value,
   onChange,
@@ -618,39 +599,141 @@ function VietnamDateTimeInput({
   max?: string;
   className?: string;
 }) {
-  const inputRef = useRef<HTMLInputElement>(null);
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const dateInputRef = useRef<HTMLInputElement>(null);
+
   const local = toCivilDateTime(value, civilTimePart(value, "00:00"));
+  const dayPart = civilDatePart(local);
+  const timePart = civilTimePart(local, "00:00");
+  const [hourStr = "00", minStr = "00"] = timePart.split(":");
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointer = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", onPointer);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onPointer);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  const updateDateTime = (nextDay: string, nextHour: string, nextMin: string) => {
+    const cleanDay = /^\d{4}-\d{2}-\d{2}$/.test(nextDay) ? nextDay : dayPart;
+    const cleanHour = /^\d{2}$/.test(nextHour) ? nextHour : hourStr;
+    const cleanMin = /^\d{2}$/.test(nextMin) ? nextMin : minStr;
+    onChange(`${cleanDay}T${cleanHour}:${cleanMin}`);
+  };
+
   return (
-    <label
-      className="relative inline-flex cursor-pointer items-center"
-      onClick={(event) => {
-        event.preventDefault();
-        const input = inputRef.current;
-        if (!input) return;
-        try {
-          input.showPicker();
-        } catch {
-          input.focus();
-        }
-      }}
-    >
-      <span className={className}>{formatCivilDateTime(local)}</span>
-      <input
-        ref={inputRef}
-        type="datetime-local"
-        value={local}
-        min={min ? toCivilDateTime(min) : undefined}
-        max={max ? toCivilDateTime(max) : undefined}
-        step={60}
-        aria-label="Chọn ngày giờ"
-        onChange={(event) => {
-          const next = event.target.value;
-          if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(next)) return;
-          onChange(next.slice(0, 16));
-        }}
-        className="absolute inset-0 cursor-pointer opacity-0"
-      />
-    </label>
+    <div ref={rootRef} className="relative inline-flex items-center">
+      <button
+        type="button"
+        onClick={() => setOpen((prev) => !prev)}
+        className={`inline-flex items-center gap-1 rounded-md px-1 py-0.5 hover:bg-slate-100 transition-colors ${className ?? ""}`}
+        aria-label="Chọn ngày giờ (24h)"
+      >
+        <span>{formatCivilDateTime(local)}</span>
+      </button>
+
+      {open ? (
+        <div className="absolute top-full left-0 z-50 mt-1.5 w-[248px] rounded-xl border border-slate-200 bg-white p-3 text-xs text-slate-700 shadow-xl">
+          <div className="mb-2.5">
+            <span className="mb-1 block text-[10px] font-semibold tracking-wider text-slate-400 uppercase">
+              Ngày (DD/MM/YYYY)
+            </span>
+            <div
+              className="relative flex h-9 cursor-pointer items-center justify-between rounded-lg border border-slate-200 bg-slate-50 px-2.5 font-semibold text-slate-900 hover:border-emerald-400"
+              onClick={() => {
+                const el = dateInputRef.current;
+                if (!el) return;
+                try {
+                  el.showPicker();
+                } catch {
+                  el.focus();
+                }
+              }}
+            >
+              <span>{formatCivilDate(dayPart)}</span>
+              <CalendarSmallIcon className="h-3.5 w-3.5 text-emerald-600" />
+              <input
+                ref={dateInputRef}
+                type="date"
+                value={dayPart}
+                min={min ? civilDatePart(min) : undefined}
+                max={max ? civilDatePart(max) : undefined}
+                onChange={(e) => {
+                  if (/^\d{4}-\d{2}-\d{2}$/.test(e.target.value)) {
+                    updateDateTime(e.target.value, hourStr, minStr);
+                  }
+                }}
+                className="absolute inset-0 cursor-pointer opacity-0"
+              />
+            </div>
+          </div>
+
+          <div className="mb-2.5">
+            <span className="mb-1 block text-[10px] font-semibold tracking-wider text-slate-400 uppercase">
+              Giờ định dạng 24h (00:00 – 23:59)
+            </span>
+            <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-1.5">
+              <select
+                value={hourStr}
+                onChange={(e) => updateDateTime(dayPart, e.target.value, minStr)}
+                aria-label="Giờ (00-23)"
+                className="h-9 cursor-pointer rounded-lg border border-slate-200 bg-white px-2 text-center font-mono text-xs font-bold text-slate-900 outline-none focus:border-emerald-500"
+              >
+                {HOURS_24.map((h) => (
+                  <option key={h} value={h}>
+                    {h} giờ
+                  </option>
+                ))}
+              </select>
+              <span className="font-mono text-sm font-bold text-slate-400">:</span>
+              <select
+                value={minStr}
+                onChange={(e) => updateDateTime(dayPart, hourStr, e.target.value)}
+                aria-label="Phút (00-59)"
+                className="h-9 cursor-pointer rounded-lg border border-slate-200 bg-white px-2 text-center font-mono text-xs font-bold text-slate-900 outline-none focus:border-emerald-500"
+              >
+                {MINUTES_60.map((m) => (
+                  <option key={m} value={m}>
+                    {m} phút
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-1 border-t border-slate-100 pt-2">
+            {(["00:00", "06:00", "12:00", "18:00", "23:59"] as const).map((preset) => {
+              const [ph, pm] = preset.split(":");
+              const active = hourStr === ph && minStr === pm;
+              return (
+                <button
+                  key={preset}
+                  type="button"
+                  onClick={() => updateDateTime(dayPart, ph, pm)}
+                  className={`rounded-md px-1.5 py-1 font-mono text-[10px] font-semibold transition-colors ${
+                    active
+                      ? "bg-emerald-600 text-white"
+                      : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+                  }`}
+                >
+                  {preset}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      ) : null}
+    </div>
   );
 }
 

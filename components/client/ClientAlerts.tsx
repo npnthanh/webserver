@@ -6,7 +6,9 @@ import { CustomSelect } from "@/components/ui/CustomSelect";
 import type { Project } from "@/lib/projects";
 import {
   alertCategory,
+  alertValueText,
   hydrateAlertEvents,
+  isConnectivityEvent,
   loadAlertEvents,
   type AlertEvent,
 } from "@/lib/alert-events";
@@ -105,6 +107,8 @@ function dbAlertToItem(event: AlertEvent, config: AlertConfig): AlertItem {
     U_unb: "Độ mất cân bằng điện áp",
     I_rms: "Dòng điện hiệu dụng",
     P_sum: "Công suất hữu công",
+    "Mất kết nối": "Mất kết nối đồng hồ (Quá Timeout)",
+    "Kết nối trở lại": "Đồng hồ có kết nối trở lại",
   };
   const category = alertCategory(event.parameter, event.category) as AlertCategory;
   const storedSeverity: AlertSeverity =
@@ -138,7 +142,7 @@ function dbAlertToItem(event: AlertEvent, config: AlertConfig): AlertItem {
     location: event.utility ?? "Điện",
     parameter: event.parameter,
     paramName: paramMeta?.name ?? parameterNames[event.parameter] ?? event.parameter,
-    actualValue: String(event.value),
+    actualValue: isConnectivityEvent(event) ? alertValueText(event) : String(event.value),
     thresholdValue: thresholdDisplay,
     unit,
     severity: resolveConfiguredSeverity(category, storedSeverity, config, event.parameter),
@@ -176,15 +180,17 @@ export function ClientAlerts({ project }: { project: Project }) {
   useEffect(() => {
     let active = true;
     void Promise.all([
-      hydrateAlertEvents(project.id),
+      hydrateAlertEvents(project.id, { force: true }).catch(() => loadAlertEvents(project.id)),
       hydrateProjectSettings(project.id, { force: true }).catch(() => ({})),
       loadProjectGatewayLatest(project.id).catch(() => []),
       hydrateClientMeters(project.id).catch(() => loadClientMeters(project.id)),
     ])
       .then(([events, settings, latestList, meterList]) => {
         if (!active) return;
+        const settingsRec = settings as Record<string, unknown>;
         const userConfig = normalizeAlertConfig(
-          (settings as Record<string, unknown>).alertsConfig,
+          settingsRec.alertsConfig,
+          settingsRec.alertConfig,
         );
         setNotificationsConfig(userConfig.notifications);
         const source = events.length ? events : loadAlertEvents(project.id);
@@ -263,7 +269,7 @@ export function ClientAlerts({ project }: { project: Project }) {
         }
       })
       .catch(() => {
-        if (active) setAlerts([]);
+        // Giữ nguyên danh sách cảnh báo hiện có khi lỗi mạng tạm thời
       });
     return () => {
       active = false;

@@ -37,7 +37,8 @@ export async function GET(request: NextRequest) {
       return Response.json(days);
     }
     if (civilDate.test(from) && civilDate.test(to) && summary === "slot") {
-      const slots = await getProjectGatewayEnergySlots(projectId, from, to);
+      const slotMinutes = request.nextUrl.searchParams.get("slotMinutes") === "15" ? 15 : 30;
+      const slots = await getProjectGatewayEnergySlots(projectId, from, to, slotMinutes);
       return Response.json(slots);
     }
     const samples = await getProjectGatewaySeries(projectId, {

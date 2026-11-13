@@ -5,6 +5,47 @@ import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 const rootDir = process.cwd();
+
+function fixPermissions(dir) {
+  try {
+    fs.chmodSync(dir, 0o755);
+  } catch {}
+  let entries = [];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (entry.name === 'node_modules' || entry.name === '.git') continue;
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      fixPermissions(fullPath);
+    } else {
+      try {
+        fs.chmodSync(fullPath, 0o644);
+      } catch {}
+    }
+  }
+}
+
+function fixParentDomainDirs(dir) {
+  // Ensure parent domain directories (e.g. domains/webserver.kivon.tech and public_html) have 0755
+  const parent1 = path.resolve(dir, '..');
+  const parent2 = path.resolve(dir, '..', '..');
+  const publicHtml = path.join(parent2, 'public_html');
+  for (const p of [parent2, parent1, dir, publicHtml]) {
+    try {
+      if (fs.existsSync(p)) {
+        fs.chmodSync(p, 0o755);
+      }
+    } catch {}
+  }
+}
+
+fixParentDomainDirs(rootDir);
+fixPermissions(rootDir);
+
 const globalsCssPath = path.join(rootDir, 'app', 'globals.css');
 const compiledCssPath = path.join(rootDir, 'app', 'globals.compiled.css');
 const postcssConfigPath = path.join(rootDir, 'postcss.config.mjs');
@@ -44,12 +85,18 @@ try {
     stdio: 'inherit',
     env: {
       ...process.env,
+      CIRCLE_NODE_TOTAL: '2',
+      UV_THREADPOOL_SIZE: '2',
+      NEXT_TELEMETRY_DISABLED: '1',
     },
   });
 
   if (result.status !== 0) {
     process.exit(result.status ?? 1);
   }
+
+  fixPermissions(path.join(rootDir, '.next'));
+  fixParentDomainDirs(rootDir);
 } finally {
   if (originalGlobalsCss !== null) {
     fs.writeFileSync(globalsCssPath, originalGlobalsCss, 'utf8');

@@ -4,6 +4,13 @@ import { dbFetch, emitDbChange } from "@/lib/db-client";
 
 export type MeterUtility = string;
 
+export type MeterSerialHistoryItem = {
+  serialNumber: string;
+  category?: string;
+  validFrom?: string;
+  validTo?: string;
+};
+
 export type ClientMeter = {
   id: string;
   name: string;
@@ -17,6 +24,8 @@ export type ClientMeter = {
   deviceId: string | null;
   /** Serial nhập tay khi chưa gán được thiết bị trong thư viện */
   serialNumber?: string | null;
+  /** Lịch sử thay thế công tơ / đồng hồ tại điểm đo này */
+  serialHistory?: MeterSerialHistoryItem[];
 };
 
 const meterCache: Store = {};
@@ -56,10 +65,14 @@ export function hydrateClientMeters(projectId: string) {
   if (active) return active;
   const request = dbFetch<ClientMeter[]>("client-meters", { query: { projectId } })
     .then((meters) => {
+      const prevJson = JSON.stringify(meterCache[projectId] ?? null);
       meterCache[projectId] = meters;
-      emitDbChange("client-meters");
+      if (prevJson !== JSON.stringify(meters)) {
+        emitDbChange("client-meters");
+      }
       return meterCache[projectId];
     })
+    .catch(() => loadClientMeters(projectId))
     .finally(() => {
       meterHydration.delete(projectId);
     });

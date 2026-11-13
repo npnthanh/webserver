@@ -14,6 +14,7 @@ import {
   type CustomerAccount,
 } from "@/lib/customer-accounts";
 import { canAccessAdminProject, hasPermission } from "@/lib/permissions";
+import { formatAppNumber } from "@/lib/number-format";
 import {
   emptyTelemetry,
   loadProjectsTelemetry,
@@ -354,8 +355,8 @@ export function ProjectList() {
                         <div className="flex items-center gap-2">
                           <span className="font-mono font-bold text-slate-900">
                             {telem.hasGatewayData
-                              ? telem.loadKw.toLocaleString("vi-VN", {
-                                  maximumFractionDigits: telem.loadKw >= 100 ? 0 : 1,
+                              ? formatAppNumber(telem.loadKw, {
+                                  maxDecimals: telem.loadKw >= 100 ? 0 : 1,
                                 })
                               : "—"}
                           </span>
@@ -377,9 +378,9 @@ export function ProjectList() {
                       <td className="px-5 py-4">
                         <span className="font-mono font-semibold text-slate-800">
                           {telem.co2Day > 0
-                            ? telem.co2Day.toLocaleString("vi-VN", {
-                                maximumFractionDigits: 2,
-                                minimumFractionDigits: 0,
+                            ? formatAppNumber(telem.co2Day, {
+                                maxDecimals: 2,
+                                minDecimals: 0,
                               })
                             : "—"}
                         </span>
@@ -513,11 +514,11 @@ function FilterSelect({
   options: { value: string; label: string }[];
 }) {
   return (
-    <div className="relative">
+    <div className="relative w-full sm:w-auto">
       <CustomSelect
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        className="h-10 appearance-none rounded-xl border border-slate-200 bg-white py-0 pr-8 pl-3 text-xs font-medium text-slate-700 outline-none hover:border-slate-300 focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/15 transition-all shadow-xs"
+        className="h-10 w-full sm:w-auto appearance-none rounded-xl border border-slate-200 bg-white py-0 pr-8 pl-3 text-xs font-medium text-slate-700 outline-none hover:border-slate-300 focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/15 transition-all shadow-xs"
       >
         {options.map((opt) => (
           <option key={opt.value} value={opt.value}>

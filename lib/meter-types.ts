@@ -69,10 +69,14 @@ export function hydrateMeterTypeDefs() {
   if (meterTypesHydration) return meterTypesHydration;
   meterTypesHydration = dbFetch<MeterTypeDef[]>("meter-types")
     .then((defs) => {
+      const prevJson = JSON.stringify(meterTypeCache);
       meterTypeCache = defs.length ? defs : DEFAULT_METER_TYPE_DEFS;
-      emitDbChange("meter-types");
+      if (prevJson !== JSON.stringify(meterTypeCache)) {
+        emitDbChange("meter-types");
+      }
       return meterTypeCache;
     })
+    .catch(() => meterTypeCache)
     .finally(() => {
       meterTypesHydration = null;
     });

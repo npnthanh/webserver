@@ -1,3 +1,5 @@
+import { formatAppNumber, parseAppNumber } from "@/lib/number-format";
+
 /** Biểu giá điện sản xuất, Quyết định 1279/QĐ-BCT ngày 09/05/2025. Chưa gồm VAT. */
 export const INDUSTRIAL_TARIFF_DECISION = "1279/QĐ-BCT ngày 09/05/2025";
 /** Khung giờ sử dụng điện, Quyết định 963/QĐ-BCT năm 2026. */
@@ -22,16 +24,11 @@ export function voltageLevelById(id: string | undefined) {
 }
 
 export function formatTariffPrice(value: number) {
-  return value.toLocaleString("vi-VN");
+  return formatAppNumber(value, { maxDecimals: 3 });
 }
 
 export function parseTariffPrice(value: unknown) {
-  const text = String(value ?? "").trim().replace(/\s/g, "");
-  if (!text) return 0;
-  if (/^\d{1,3}(\.\d{3})+$/.test(text)) return Number(text.replace(/\./g, ""));
-  if (/^\d{1,3}(,\d{3})+$/.test(text)) return Number(text.replace(/,/g, ""));
-  const number = Number(text.replace(",", "."));
-  return Number.isFinite(number) ? number : 0;
+  return parseAppNumber(value, 0);
 }
 
 export function pricesForLevel(id: string | undefined): TouPrices {
@@ -48,12 +45,153 @@ export function resolveTouPrices(
   const pick = (band: TouBand) => {
     const text = raw?.[band];
     if (text == null || String(text).trim() === "") return official[band];
-    return parseTariffPrice(text);
+    const parsed = parseTariffPrice(text);
+    return parsed > 0 ? parsed : official[band];
   };
+  const n = pick("normal");
+  const o = pick("off");
+  const p = pick("peak");
+  // Nếu dữ liệu cũ đang lưu giá trị test 1 đ/kWh cho cả 3 khung thì dùng biểu giá chuẩn EVN theo cấp điện áp
+  if (n === 1 && o === 1 && p === 1) {
+    return { levelId: level.id, prices: official };
+  }
   return {
     levelId: level.id,
-    prices: { normal: pick("normal"), off: pick("off"), peak: pick("peak") },
+    prices: { normal: n, off: o, peak: p },
   };
+}
+
+export type CustomTariffSlot = {
+  id: string;
+  name: string;
+  color: string;
+  /** Giờ bắt đầu HH:mm */
+  from: string;
+  /** Giờ kết thúc HH:mm */
+  to: string;
+  /** Đơn giá đ/kWh */
+  price: string;
+  /** Nhóm quy đổi biểu đồ (peak / normal / off) */
+  bandGroup?: TouBand;
+  /** Có áp dụng Chủ nhật không (mặc định true trừ khung Cao điểm) */
+  applySunday?: boolean;
+};
+
+export type TariffHistoryEntry = {
+  id?: string;
+  /** Ngày bắt đầu hiệu lực YYYY-MM-DD */
+  applyDate: string;
+  note?: string;
+  voltageLevel: VoltageLevelId;
+  prices: Record<TouBand, string>;
+  /** Nếu có danh sách khung giờ tùy chỉnh (ví dụ 4 khung giá) thì ưu tiên tính theo slots */
+  slots?: CustomTariffSlot[];
+};
+
+export type SavedElectricityCostConfig = {
+  utility?: string;
+  applyDate?: string;
+  slots?: CustomTariffSlot[];
+  flatPrices?: Record<string, string>;
+  electricity?: {
+    voltageLevel?: string;
+    prices?: Partial<Record<TouBand, unknown>>;
+  };
+  tariffHistory?: TariffHistoryEntry[];
+};
+
+function parseHmMinutes(hm: string, isEnd = false) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(hm.trim());
+  if (!m) return isEnd ? 24 * 60 : 0;
+  const h = Number(m[1]);
+  const min = Number(m[2]);
+  if (h === 24 && min === 0) return 24 * 60;
+  return Math.max(0, Math.min(24 * 60, h * 60 + min));
+}
+
+function normalizeDateKey(input: string | undefined): string {
+  if (!input) return "";
+  const trimmed = input.trim();
+  if (/^\d{4}-\d{2}-\d{2}/.test(trimmed)) return trimmed.slice(0, 10);
+  const dmy = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(trimmed);
+  if (dmy) {
+    return `${dmy[3]}-${dmy[2].padStart(2, "0")}-${dmy[1].padStart(2, "0")}`;
+  }
+  return "";
+}
+
+/**
+ * Tra cứu đơn giá & khung giờ điện tại thời điểm `parts` (hỗ trợ đổi từ 3 khung giá sang 4+ khung giá từ ngày hiệu lực `applyDate`).
+ */
+export function resolveElectricityRateAt(
+  config: SavedElectricityCostConfig | undefined,
+  parts: { year: number; month: number; day: number; hour: number; minute: number; date?: string },
+): { price: number; band: TouBand; slotName?: string } {
+  const dayKey =
+    parts.date ??
+    `${parts.year}-${String(parts.month).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`;
+  const weekday = civilWeekday(parts.year, parts.month, parts.day);
+  const minuteOfDay = parts.hour * 60 + parts.minute;
+
+  // 1. Kiểm tra lịch sử biểu giá theo ngày hiệu lực (tariffHistory)
+  const history = Array.isArray(config?.tariffHistory) ? config!.tariffHistory : [];
+  if (history.length > 0) {
+    const sorted = [...history]
+      .map((item) => ({ ...item, normDate: normalizeDateKey(item.applyDate) || "0000-01-01" }))
+      .sort((a, b) => a.normDate.localeCompare(b.normDate));
+    let active = sorted[0];
+    for (const entry of sorted) {
+      if (entry.normDate <= dayKey) active = entry;
+    }
+    if (active.slots && active.slots.length > 0) {
+      const matched = matchCustomSlot(active.slots, weekday, minuteOfDay);
+      if (matched) return matched;
+    }
+    const resolved = resolveTouPrices(active.voltageLevel, active.prices);
+    const band = industrialBand(weekday, parts.hour, parts.minute);
+    return { price: resolved.prices[band], band };
+  }
+
+  // 2. Nếu có cấu hình slots tùy chỉnh (ví dụ 4 khung giờ) và ngày hiện tại >= applyDate (hoặc không đặt applyDate)
+  const configApplyDate = normalizeDateKey(config?.applyDate);
+  const customSlots = Array.isArray(config?.slots) ? config!.slots : [];
+  if (customSlots.length > 0 && (!configApplyDate || dayKey >= configApplyDate)) {
+    const matched = matchCustomSlot(customSlots, weekday, minuteOfDay);
+    if (matched) return matched;
+  }
+
+  // 3. Mặc định dùng biểu giá 3 khung chuẩn EVN
+  const baseTou = resolveTouPrices(config?.electricity?.voltageLevel, config?.electricity?.prices);
+  const band = industrialBand(weekday, parts.hour, parts.minute);
+  return { price: baseTou.prices[band], band };
+}
+
+function matchCustomSlot(
+  slots: CustomTariffSlot[],
+  weekday: number,
+  minuteOfDay: number,
+): { price: number; band: TouBand; slotName: string } | null {
+  for (const slot of slots) {
+    const price = parseTariffPrice(slot.price);
+    if (price <= 0) continue;
+    const isPeakLike =
+      slot.bandGroup === "peak" || /cao\s*điểm/i.test(slot.name);
+    const applySun = slot.applySunday ?? !isPeakLike;
+    if (weekday === 0 && !applySun) continue;
+    const startMin = parseHmMinutes(slot.from, false);
+    const endMin = parseHmMinutes(slot.to, true);
+    const inSlot =
+      startMin <= endMin
+        ? minuteOfDay >= startMin && minuteOfDay < endMin
+        : minuteOfDay >= startMin || minuteOfDay < endMin;
+    if (inSlot) {
+      const band: TouBand =
+        slot.bandGroup ??
+        (/cao/i.test(slot.name) ? "peak" : /thấp/i.test(slot.name) ? "off" : "normal");
+      return { price, band, slotName: slot.name };
+    }
+  }
+  return null;
 }
 
 /** 0 = Chủ nhật … 6 = thứ Bảy, theo ngày dương lịch Việt Nam. */

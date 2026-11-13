@@ -1,479 +1,76 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { ChartTimeline } from "@/components/client/ChartTimeline";
-import {
-  buildSampleTableRows,
-  ChartDataTable,
-  ChartViewToolbar,
-  type ChartViewMode,
-} from "@/components/client/ChartViewToolbar";
-import { useChartSize } from "@/components/client/useChartSize";
+import { SampleTrendChart, type TrendSeriesConfig } from "@/components/client/SampleTrendChart";
 import { CustomSelect } from "@/components/ui/CustomSelect";
-import { chartTimeLabel, chartTimeTicks, domainTicks, paddedDomain, valuesForKeysAverage, type ChartSample } from "@/lib/gateway-series";
-import { getTimeFilterLabel, type TimeFilterValue } from "./TimeFilterBar";
+import type { ChartSample } from "@/lib/gateway-series";
+import type { TimeFilterValue } from "./TimeFilterBar";
 
-const N = 160;
-const AGGS = ["MAX", "AVG", "MIN"] as const;
-const COLORS: Record<(typeof AGGS)[number], string> = {
-  MAX: "#0d47a1",
-  AVG: "#1e88e5",
-  MIN: "#90caf9",
-};
-
-type Agg = (typeof AGGS)[number];
-type Series = { key: string; name: string; color: string; values: number[] };
-
-function toggleIn<T>(list: T[], value: T) {
-  if (list.includes(value)) return list.length === 1 ? list : list.filter((item) => item !== value);
-  return [...list, value];
-}
-
-function smoothPath(pts: [number, number][]) {
-  if (pts.length < 2) return "";
-  let d = `M ${pts[0][0]} ${pts[0][1]}`;
-  for (let i = 0; i < pts.length - 1; i++) {
-    const p0 = pts[i - 1] ?? pts[i];
-    const p1 = pts[i];
-    const p2 = pts[i + 1];
-    const p3 = pts[i + 2] ?? p2;
-    d += ` C ${p1[0] + (p2[0] - p0[0]) / 6} ${p1[1] + (p2[1] - p0[1]) / 6}, ${p2[0] - (p3[0] - p1[0]) / 6} ${p2[1] - (p3[1] - p1[1]) / 6}, ${p2[0]} ${p2[1]}`;
-  }
-  return d;
-}
-
-function unbalanceKeys(qty: string) {
-  if (qty.startsWith("I")) return ["IuA", "IuB", "IuC"];
-  if (qty === "Uneg" || qty === "Uzero") return ["Vuan", "Vubn", "Vucn"];
-  return ["Vuab", "Vubc", "Vuca"];
-}
+type UnbVoltageMode = "phase" | "line";
 
 export function UnbalanceChart({
   samples,
-  timeFilter,
   onRefresh,
 }: {
   samples?: ChartSample[];
   timeFilter?: TimeFilterValue;
   onRefresh?: () => void;
 }) {
-  const [view, setView] = useState<ChartViewMode>("chart");
-  const [topQty, setTopQty] = useState("Uunb");
-  const [botQty, setBotQty] = useState("Iunb");
-  const [aggs, setAggs] = useState<Agg[]>(["AVG"]);
-  const [hover, setHover] = useState<number | null>(null);
-  const [viewWin, setViewWin] = useState({ start: 0, end: N - 1 });
-  const [crosshair, setCrosshair] = useState(true);
+  const [vMode, setVMode] = useState<UnbVoltageMode>("phase");
 
-  const uSeries = useMemo<Series[]>(
-    () =>
-      aggs.map((agg) => ({
-        key: `u-${agg}`,
-        name: `${topQty} ${agg}`,
-        color: COLORS[agg],
-        values:
-          valuesForKeysAverage(samples, unbalanceKeys(topQty), N) ?? Array.from({ length: N }, () => 0),
-      })),
-    [aggs, topQty, samples],
-  );
+  const vSeries = useMemo<TrendSeriesConfig[]>(() => {
+    if (vMode === "phase") {
+      return [
+        { key: "Vuan", label: "U_unb_Ph1 (Vuan)", color: "#5470c6", unit: "%", digits: 2 },
+        { key: "Vubn", label: "U_unb_Ph2 (Vubn)", color: "#91cc75", unit: "%", digits: 2 },
+        { key: "Vucn", label: "U_unb_Ph3 (Vucn)", color: "#fac858", unit: "%", digits: 2 },
+      ];
+    }
+    return [
+      { key: "Vuab", label: "U_unb_L12 (Vuab)", color: "#5470c6", unit: "%", digits: 2 },
+      { key: "Vubc", label: "U_unb_L23 (Vubc)", color: "#91cc75", unit: "%", digits: 2 },
+      { key: "Vuca", label: "U_unb_L31 (Vuca)", color: "#fac858", unit: "%", digits: 2 },
+    ];
+  }, [vMode]);
 
-  const iSeries = useMemo<Series[]>(
-    () =>
-      aggs.map((agg) => ({
-        key: `i-${agg}`,
-        name: `${botQty} ${agg}`,
-        color: COLORS[agg],
-        values:
-          valuesForKeysAverage(samples, unbalanceKeys(botQty), N) ?? Array.from({ length: N }, () => 0),
-      })),
-    [aggs, botQty, samples],
-  );
-
-  const uDomain = samples?.length ? paddedDomain(uSeries, [0, 2]) : ([0, 2] as [number, number]);
-  const iDomain = samples?.length ? paddedDomain(iSeries, [1, 5]) : ([1, 5] as [number, number]);
-  const uTicks = samples?.length ? domainTicks(uDomain) : [0, 0.5, 1, 1.5, 2];
-  const iTicks = samples?.length ? domainTicks(iDomain) : [1, 2, 3, 4, 5];
-
-  const span = viewWin.end - viewWin.start;
-  const zoomIn = () => {
-    const next = Math.max(32, Math.floor(span * 0.7));
-    const mid = Math.floor((viewWin.start + viewWin.end) / 2);
-    const start = Math.max(0, mid - Math.floor(next / 2));
-    setViewWin({ start, end: Math.min(N - 1, start + next) });
-  };
-  const zoomOut = () => {
-    const next = Math.min(N - 1, Math.floor(span / 0.7));
-    const mid = Math.floor((viewWin.start + viewWin.end) / 2);
-    const start = Math.max(0, mid - Math.floor(next / 2));
-    setViewWin({ start, end: Math.min(N - 1, start + next) });
-  };
-
-  const timelineLabels = useMemo(
-    () => Array.from({ length: N }, (_, index) => chartTimeLabel(samples, index, N, "full") || ""),
-    [samples],
-  );
-  const timelineValues = uSeries[0]?.values ?? Array.from({ length: N }, () => 0);
-
-  const tableColumns = useMemo(
+  const iSeries = useMemo<TrendSeriesConfig[]>(
     () => [
-      { header: "Thời điểm" },
-      ...uSeries.map((s) => ({ header: `${s.name} (%)`, color: s.color })),
-      ...iSeries.map((s) => ({ header: `${s.name} (%)`, color: s.color })),
+      { key: "IuA", label: "I_unb_Ph1 (IuA)", color: "#5470c6", unit: "%", digits: 2 },
+      { key: "IuB", label: "I_unb_Ph2 (IuB)", color: "#91cc75", unit: "%", digits: 2 },
+      { key: "IuC", label: "I_unb_Ph3 (IuC)", color: "#fac858", unit: "%", digits: 2 },
     ],
-    [uSeries, iSeries],
-  );
-
-  const tableRows = useMemo(
-    () =>
-      buildSampleTableRows(
-        samples,
-        [
-          ...uSeries.map((s) => ({ ...s, unit: "%", digits: 2 })),
-          ...iSeries.map((s) => ({ ...s, unit: "%", digits: 2 })),
-        ],
-        viewWin,
-        N,
-      ),
-    [samples, uSeries, iSeries, viewWin],
+    [],
   );
 
   return (
-    <section className="mt-4 w-full min-w-0 rounded-lg border border-slate-200 bg-white p-3 shadow-[0_1px_2px_rgba(16,24,40,0.04)] lg:p-4">
-      <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
-        <div className="flex flex-wrap items-center gap-2">
+    <div className="space-y-4">
+      <SampleTrendChart
+        title="Mất cân bằng điện áp"
+        unitLabel="%"
+        series={vSeries}
+        samples={samples}
+        onRefresh={onRefresh}
+        startAtZero
+        headerControls={
           <CustomSelect
-            value={topQty}
-            onChange={(e) => setTopQty(e.target.value)}
-            className="h-8 rounded-lg border border-slate-200 bg-white px-2.5 text-[13px] font-medium text-slate-700 shadow-2xs"
+            value={vMode}
+            onChange={(e) => setVMode(e.target.value as UnbVoltageMode)}
+            className="h-8 min-w-[220px] rounded-md border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-700 outline-none focus:border-emerald-500"
           >
-            <option>Uunb</option>
-            <option>Uneg</option>
-            <option>Uzero</option>
+            <option value="phase">Mất cân bằng Điện áp pha (Vuan, Vubn, Vucn)</option>
+            <option value="line">Mất cân bằng Điện áp dây (Vuab, Vubc, Vuca)</option>
           </CustomSelect>
-          <CustomSelect
-            value={botQty}
-            onChange={(e) => setBotQty(e.target.value)}
-            className="h-8 rounded-lg border border-slate-200 bg-white px-2.5 text-[13px] font-medium text-slate-700 shadow-2xs"
-          >
-            <option>Iunb</option>
-            <option>Ineg</option>
-            <option>Izero</option>
-          </CustomSelect>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="flex items-center gap-3 rounded border border-slate-200 px-2.5 py-1 text-[12px] text-slate-600">
-            {AGGS.map((agg) => (
-              <label key={agg} className="inline-flex cursor-pointer items-center gap-1">
-                <input
-                  type="checkbox"
-                  checked={aggs.includes(agg)}
-                  onChange={() => setAggs((list) => toggleIn(list, agg))}
-                  className="accent-emerald-600"
-                />
-                {agg}
-              </label>
-            ))}
-          </div>
-          <ChartViewToolbar view={view} onViewChange={setView} onRefresh={onRefresh} />
-        </div>
-      </div>
-
-      <div className="mb-2">
-        <ChartTimeline compact labels={timelineLabels} values={timelineValues} range={viewWin} onRange={setViewWin} />
-      </div>
-
-      {view === "chart" ? (
-        <>
-          <div className="min-w-0 w-full overflow-hidden rounded-[2px] border border-slate-400 bg-white">
-            <UnbPane
-              title={`${topQty} [%]`}
-              series={uSeries}
-              samples={samples}
-              viewWin={viewWin}
-              hover={crosshair ? hover : null}
-              onHover={setHover}
-              domain={uDomain}
-              ticks={uTicks}
-              formatTick={(v) => (v === 0 ? "0" : v.toFixed(1))}
-            />
-            <div className="h-px bg-slate-400" />
-            <UnbPane
-              title={`${botQty} [%]`}
-              series={iSeries}
-              samples={samples}
-              viewWin={viewWin}
-              hover={crosshair ? hover : null}
-              onHover={setHover}
-              domain={iDomain}
-              ticks={iTicks}
-              formatTick={(v) => String(v)}
-              axis
-            />
-          </div>
-
-          <div className="mt-2 flex w-[68px] flex-wrap gap-1">
-            <ToolBtn label="Phóng to" onClick={zoomIn}>
-              <ZoomIcon plus />
-            </ToolBtn>
-            <ToolBtn label="Thu nhỏ" onClick={zoomOut}>
-              <ZoomIcon plus={false} />
-            </ToolBtn>
-            <ToolBtn label="Vừa khung" onClick={() => setViewWin({ start: 0, end: N - 1 })}>
-              <FitIcon />
-            </ToolBtn>
-            <ToolBtn label="Con trỏ" active={crosshair} onClick={() => setCrosshair((v) => !v)}>
-              <CursorIcon />
-            </ToolBtn>
-          </div>
-        </>
-      ) : (
-        <ChartDataTable
-          title={`Biểu đồ Mất cân bằng pha (${topQty} / ${botQty})`}
-          subtitle={timeFilter ? `Kỳ hiển thị: ${getTimeFilterLabel(timeFilter)}` : undefined}
-          filename="bieu-do-mat-can-bang-pha"
-          columns={tableColumns}
-          rows={tableRows}
-        />
-      )}
-    </section>
-  );
-}
-
-function UnbPane({
-  title,
-  series,
-  samples,
-  viewWin,
-  hover,
-  onHover,
-  domain,
-  ticks,
-  formatTick,
-  axis = false,
-}: {
-  title: string;
-  series: Series[];
-  samples?: ChartSample[];
-  viewWin: { start: number; end: number };
-  hover: number | null;
-  onHover: (index: number | null) => void;
-  domain: [number, number];
-  ticks: number[];
-  formatTick: (value: number) => string;
-  axis?: boolean;
-}) {
-  const { ref, width: W, height: H } = useChartSize();
-  const pad = { l: 52, r: 10, t: 12, b: axis ? 40 : 28 };
-  const innerW = W - pad.l - pad.r;
-  const innerH = H - pad.t - pad.b;
-  const [yMin, yMax] = domain;
-  const filterId = `unb-tip-${title.replace(/[^a-z0-9]/gi, "")}`;
-  const tipW = 168;
-  const tipH = 22 + Math.max(series.length, 1) * 18;
-  const xAt = (i: number) =>
-    pad.l + ((i - viewWin.start) / Math.max(1, viewWin.end - viewWin.start)) * innerW;
-  const yAt = (v: number) => pad.t + ((yMax - v) / (yMax - yMin || 1)) * innerH;
-
-  const timeTicks = axis ? chartTimeTicks(viewWin.start, viewWin.end) : [];
-  const timeLabel = (index: number, kind: "full" | "min" | "sec" | "tooltip") =>
-    chartTimeLabel(samples, index, N, kind);
-
-  return (
-    <div ref={ref} className="h-[200px] w-full min-w-0 sm:h-[240px]">
-    {W > 0 && H > 0 ? (
-    <svg
-      viewBox={`0 0 ${W} ${H}`}
-      className="block h-full w-full"
-      onMouseLeave={() => onHover(null)}
-      onMouseMove={(e) => {
-        const box = e.currentTarget.getBoundingClientRect();
-        const x = ((e.clientX - box.left) / box.width) * W;
-        const t = (x - pad.l) / innerW;
-        const i = Math.round(viewWin.start + t * (viewWin.end - viewWin.start));
-        onHover(Math.max(viewWin.start, Math.min(viewWin.end, i)));
-      }}
-    >
-      <rect x={pad.l} y={pad.t} width={innerW} height={innerH} fill="white" stroke="#6b7280" />
-      <text x="14" y={H / 2} className="fill-slate-600" fontSize="12" transform={`rotate(-90 14 ${H / 2})`}>
-        {title}
-      </text>
-      {ticks.map((v) => {
-        const y = yAt(v);
-        return (
-          <g key={v}>
-            <line x1={pad.l} x2={W - pad.r} y1={y} y2={y} stroke="#e5e7eb" />
-            <text x={pad.l - 6} y={y + 3} textAnchor="end" className="fill-slate-500" fontSize="10">
-              {formatTick(v)}
-            </text>
-          </g>
-        );
-      })}
-      {Array.from({ length: 9 }, (_, n) => {
-        const i = viewWin.start + ((viewWin.end - viewWin.start) * n) / 8;
-        return <line key={n} x1={xAt(i)} x2={xAt(i)} y1={pad.t} y2={H - pad.b} stroke="#eef0f2" />;
-      })}
-      {series.map((s) => {
-        const pts: [number, number][] = [];
-        for (let i = viewWin.start; i <= viewWin.end; i++) pts.push([xAt(i), yAt(s.values[i])]);
-        return (
-          <path
-            key={s.key}
-            d={smoothPath(pts)}
-            fill="none"
-            stroke={s.color}
-            strokeWidth="1.6"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          />
-        );
-      })}
-      <defs>
-        <filter id={filterId} x="-20%" y="-20%" width="140%" height="140%">
-          <feDropShadow dx="0" dy="1" stdDeviation="2" floodOpacity="0.12" />
-        </filter>
-      </defs>
-      {hover != null ? (
-        <g pointerEvents="none">
-          <line
-            x1={xAt(hover)}
-            x2={xAt(hover)}
-            y1={pad.t}
-            y2={H - pad.b}
-            stroke="#64748b"
-            strokeDasharray="4 3"
-          />
-          {series.map((s) => (
-            <circle
-              key={`${s.key}-dot`}
-              cx={xAt(hover)}
-              cy={yAt(s.values[hover])}
-              r="3.5"
-              fill={s.color}
-              stroke="white"
-              strokeWidth="1.5"
-            />
-          ))}
-          <rect
-            x={Math.min(Math.max(xAt(hover) - 78, pad.l), W - pad.r - 156)}
-            y={H - pad.b + 2}
-            width="156"
-            height="16"
-            rx="2"
-            fill="#334155"
-          />
-          <text
-            x={Math.min(Math.max(xAt(hover), pad.l + 78), W - pad.r - 78)}
-            y={H - pad.b + 13}
-            textAnchor="middle"
-            fill="white"
-            fontSize="10"
-            fontWeight="600"
-          >
-            {timeLabel(hover, "tooltip")}
-          </text>
-          {(() => {
-            const hx = xAt(hover);
-            const tipX = hx + 12 + tipW > W - pad.r - 4 ? hx - tipW - 12 : hx + 12;
-            const tipY = Math.min(pad.t + 8, H - pad.b - tipH - 4);
-            return (
-              <g transform={`translate(${Math.max(pad.l, tipX)}, ${Math.max(pad.t, tipY)})`}>
-                <rect
-                  width={tipW}
-                  height={tipH}
-                  rx="6"
-                  fill="white"
-                  stroke="#e2e8f0"
-                  filter={`url(#${filterId})`}
-                />
-                <text x="10" y="16" className="fill-slate-600" fontSize="11" fontWeight="600">
-                  {timeLabel(hover, "tooltip")}
-                </text>
-                {series.map((s, i) => (
-                  <g key={`${s.key}-tip`} transform={`translate(10, ${28 + i * 18})`}>
-                    <circle cx="4" cy="-3" r="3.5" fill={s.color} />
-                    <text x="14" y="0" fontSize="11" fill="#475569">
-                      {s.name}
-                    </text>
-                    <text x={tipW - 12} y="0" textAnchor="end" fontSize="11" fontWeight="700" fill="#0f172a">
-                      {s.values[hover].toFixed(3)}
-                    </text>
-                  </g>
-                ))}
-              </g>
-            );
-          })()}
-        </g>
-      ) : null}
-      {timeTicks.map((tick) => (
-        <text
-          key={`${tick.i}-${tick.kind}`}
-          x={xAt(tick.i)}
-          y={H - 10}
-          textAnchor="middle"
-          className="fill-slate-600"
-          fontSize="10"
-        >
-          {timeLabel(tick.i, tick.kind)}
-        </text>
-      ))}
-    </svg>
-    ) : null}
-    </div>
-  );
-}
-
-function ToolBtn({
-  children,
-  label,
-  onClick,
-  active = false,
-}: {
-  children: React.ReactNode;
-  label: string;
-  onClick: () => void;
-  active?: boolean;
-}) {
-  return (
-    <button
-      type="button"
-      title={label}
-      onClick={onClick}
-      className={`flex h-7 w-7 items-center justify-center rounded-sm border text-slate-500 ${
-        active ? "border-emerald-600 bg-emerald-50 text-emerald-700" : "border-slate-300 bg-white hover:bg-slate-50"
-      }`}
-    >
-      {children}
-    </button>
-  );
-}
-
-function ZoomIcon({ plus }: { plus: boolean }) {
-  return (
-    <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" aria-hidden>
-      <circle cx="10.5" cy="10.5" r="5.5" stroke="currentColor" strokeWidth="1.7" />
-      <path d="m15 15 4 4" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
-      <path
-        d={plus ? "M10.5 8v5M8 10.5h5" : "M8 10.5h5"}
-        stroke="currentColor"
-        strokeWidth="1.7"
-        strokeLinecap="round"
+        }
       />
-    </svg>
-  );
-}
 
-function FitIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" aria-hidden>
-      <path d="M8 5H5v3M16 5h3v3M8 19H5v-3M16 19h3v-3" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
-    </svg>
-  );
-}
-
-function CursorIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" aria-hidden>
-      <path d="M12 4v16M4 12h16" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
-    </svg>
+      <SampleTrendChart
+        title="Mất cân bằng dòng điện (IuA, IuB, IuC)"
+        unitLabel="%"
+        series={iSeries}
+        samples={samples}
+        onRefresh={onRefresh}
+        startAtZero
+      />
+    </div>
   );
 }

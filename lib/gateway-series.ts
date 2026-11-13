@@ -15,6 +15,7 @@ export type ChartTimeKind = "full" | "min" | "sec" | "tooltip";
 
 export type GatewayDailyPoint = {
   meterPointId: string;
+  meterId?: string;
   day: string;
   firstWh: number;
   lastWh: number;
@@ -25,12 +26,18 @@ export type GatewayDailySummary = {
   latest: ProjectGatewaySample | null;
 };
 
+const lastGoodDaily = new Map<string, GatewayDailySummary>();
+const lastGoodSlots = new Map<string, GatewayEnergySlotSummary>();
+const lastGoodSamples = new Map<string, ProjectGatewaySample[]>();
+const lastGoodLatest = new Map<string, ProjectGatewaySample[]>();
+
 export async function loadProjectGatewayDaily(
   projectId: string,
   year: number,
   month: number,
 ): Promise<GatewayDailySummary> {
-  const empty = { days: [], latest: null };
+  const key = `${projectId}:${year}:${month}`;
+  const fallback = lastGoodDaily.get(key) ?? { days: [], latest: null };
   try {
     const params = new URLSearchParams({
       projectId,
@@ -38,14 +45,19 @@ export async function loadProjectGatewayDaily(
       month: String(month),
     });
     const response = await fetch(`/api/gateway/series?${params}`, { cache: "no-store" });
-    if (!response.ok) return empty;
+    if (!response.ok) return fallback;
     const body = (await response.json()) as Partial<GatewayDailySummary>;
-    return {
+    const result: GatewayDailySummary = {
       days: Array.isArray(body.days) ? body.days : [],
       latest: body.latest ?? null,
     };
+    if (result.days.length > 0 || result.latest) {
+      lastGoodDaily.set(key, result);
+      return result;
+    }
+    return fallback.days.length > 0 ? fallback : result;
   } catch {
-    return empty;
+    return fallback;
   }
 }
 
@@ -54,23 +66,30 @@ export async function loadProjectGatewayDailyRange(
   from: string,
   to: string,
 ): Promise<GatewayDailySummary> {
-  const empty = { days: [], latest: null };
+  const key = `${projectId}:${from}:${to}`;
+  const fallback = lastGoodDaily.get(key) ?? { days: [], latest: null };
   try {
     const params = new URLSearchParams({ projectId, from, to, summary: "day" });
     const response = await fetch(`/api/gateway/series?${params}`, { cache: "no-store" });
-    if (!response.ok) return empty;
+    if (!response.ok) return fallback;
     const body = (await response.json()) as Partial<GatewayDailySummary>;
-    return {
+    const result: GatewayDailySummary = {
       days: Array.isArray(body.days) ? body.days : [],
       latest: body.latest ?? null,
     };
+    if (result.days.length > 0 || result.latest) {
+      lastGoodDaily.set(key, result);
+      return result;
+    }
+    return fallback.days.length > 0 ? fallback : result;
   } catch {
-    return empty;
+    return fallback;
   }
 }
 
 export type GatewayEnergySlot = {
   meterPointId: string;
+  meterId?: string;
   day: string;
   hour: number;
   minute: number;
@@ -87,19 +106,27 @@ export async function loadProjectGatewayEnergySlots(
   projectId: string,
   from: string,
   to: string,
+  slotMinutes: 15 | 30 = 30,
 ): Promise<GatewayEnergySlotSummary> {
-  const empty = { slots: [], latest: null };
+  const key = `${projectId}:${from}:${to}:${slotMinutes}`;
+  const fallback = lastGoodSlots.get(key) ?? { slots: [], latest: null };
   try {
     const params = new URLSearchParams({ projectId, from, to, summary: "slot" });
+    if (slotMinutes !== 30) params.set("slotMinutes", String(slotMinutes));
     const response = await fetch(`/api/gateway/series?${params}`, { cache: "no-store" });
-    if (!response.ok) return empty;
+    if (!response.ok) return fallback;
     const body = (await response.json()) as Partial<GatewayEnergySlotSummary>;
-    return {
+    const result: GatewayEnergySlotSummary = {
       slots: Array.isArray(body.slots) ? body.slots : [],
       latest: body.latest ?? null,
     };
+    if (result.slots.length > 0 || result.latest) {
+      lastGoodSlots.set(key, result);
+      return result;
+    }
+    return fallback.slots.length > 0 ? fallback : result;
   } catch {
-    return empty;
+    return fallback;
   }
 }
 
@@ -107,6 +134,8 @@ export async function loadProjectGatewaySamples(
   projectId: string,
   range?: { from?: string; to?: string; limit?: number },
 ): Promise<ProjectGatewaySample[]> {
+  const key = `${projectId}:${range?.from ?? ""}:${range?.to ?? ""}:${range?.limit ?? ""}`;
+  const fallback = lastGoodSamples.get(key) ?? [];
   try {
     const params = new URLSearchParams({ projectId });
     if (range?.from && range.to) {
@@ -115,23 +144,34 @@ export async function loadProjectGatewaySamples(
     }
     if (range?.limit) params.set("limit", String(range.limit));
     const response = await fetch(`/api/gateway/series?${params}`, { cache: "no-store" });
-    if (!response.ok) return [];
+    if (!response.ok) return fallback;
     const body = (await response.json()) as ProjectGatewaySample[];
-    return Array.isArray(body) ? body : [];
+    const rows = Array.isArray(body) ? body : [];
+    if (rows.length > 0) {
+      lastGoodSamples.set(key, rows);
+      return rows;
+    }
+    return fallback.length > 0 ? fallback : rows;
   } catch {
-    return [];
+    return fallback;
   }
 }
 
 export async function loadProjectGatewayLatest(projectId: string): Promise<ProjectGatewaySample[]> {
+  const fallback = lastGoodLatest.get(projectId) ?? [];
   try {
     const params = new URLSearchParams({ projectId, summary: "latest" });
     const response = await fetch(`/api/gateway/series?${params}`, { cache: "no-store" });
-    if (!response.ok) return [];
+    if (!response.ok) return fallback;
     const body = (await response.json()) as ProjectGatewaySample[];
-    return Array.isArray(body) ? body : [];
+    const rows = Array.isArray(body) ? body : [];
+    if (rows.length > 0) {
+      lastGoodLatest.set(projectId, rows);
+      return rows;
+    }
+    return fallback.length > 0 ? fallback : rows;
   } catch {
-    return [];
+    return fallback;
   }
 }
 

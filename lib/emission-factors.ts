@@ -1,4 +1,5 @@
 import { dbFetch, emitDbChange } from "@/lib/db-client";
+import { formatAppNumber, parseAppNumber } from "@/lib/number-format";
 
 export type GasKey = "co2" | "ch4" | "n2o";
 
@@ -20,20 +21,11 @@ let factorGroupsCache: FactorGroup[] = [];
 let factorsHydration: Promise<FactorGroup[]> | null = null;
 
 export function parseFactorNumber(value: string) {
-  const trimmed = value.trim().replace(/\s/g, "");
-  if (!trimmed) return 0;
-  if (/^\d{1,3}(\.\d{3})+$/.test(trimmed)) {
-    return Number(trimmed.replace(/\./g, ""));
-  }
-  const next = Number(trimmed.replace(",", "."));
-  return Number.isFinite(next) ? next : 0;
+  return parseAppNumber(value, 0);
 }
 
 export function formatFactorValue(value: number) {
-  if (Number.isInteger(value) && Math.abs(value) >= 1000) {
-    return value.toLocaleString("vi-VN");
-  }
-  return String(value);
+  return formatAppNumber(value, { maxDecimals: 6 });
 }
 
 export function loadFactorGroups(): FactorGroup[] {
@@ -56,10 +48,14 @@ export function hydrateFactorGroups() {
   if (factorsHydration) return factorsHydration;
   factorsHydration = dbFetch<FactorGroup[]>("emission-factors")
     .then((groups) => {
+      const prevJson = JSON.stringify(factorGroupsCache);
       factorGroupsCache = groups;
-      emitDbChange("emission-factors");
+      if (prevJson !== JSON.stringify(groups)) {
+        emitDbChange("emission-factors");
+      }
       return factorGroupsCache;
     })
+    .catch(() => factorGroupsCache)
     .finally(() => {
       factorsHydration = null;
     });

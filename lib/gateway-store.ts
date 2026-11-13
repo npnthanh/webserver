@@ -259,7 +259,7 @@ const STATEMENTS = [
     crc_ok TINYINT(1) NOT NULL,
     values_json JSON NOT NULL,
     PRIMARY KEY (id),
-    UNIQUE KEY uq_gateway_sample (gateway_id, meter_id, packet_number),
+    UNIQUE KEY uq_gateway_sample_time (gateway_id, meter_id, received_at, packet_number),
     KEY idx_gateway_sample_meter (meter_model, meter_id, received_at)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
   `CREATE TABLE IF NOT EXISTS gateway_meter_latest (
@@ -274,15 +274,67 @@ const STATEMENTS = [
     values_json JSON NOT NULL,
     PRIMARY KEY (meter_model, meter_id)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+  `CREATE TABLE IF NOT EXISTS meter_point_history (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    project_id VARCHAR(64) NOT NULL,
+    meter_point_id VARCHAR(100) NOT NULL,
+    category VARCHAR(100) NULL,
+    serial_number VARCHAR(100) NOT NULL,
+    valid_from DATETIME NOT NULL DEFAULT '2020-01-01 00:00:00',
+    valid_to DATETIME NULL,
+    PRIMARY KEY (id),
+    KEY idx_mph_point (project_id, meter_point_id, valid_from)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 ];
 
 let schemaReady: Promise<void> | null = null;
-let lastDirectIngestAt = 0;
+/**
+ * Gateway nào đang gửi TRỰC TIẾP về server này (theo gatewayId) và lúc nào.
+ * Chỉ bỏ qua đồng bộ upstream cho đúng các gateway đó; các gateway còn gửi về server upstream
+ * vẫn được đồng bộ bình thường (trước đây một gateway gửi trực tiếp làm dừng đồng bộ của tất cả).
+ */
+const directIngestAtByGateway = new Map<string, number>();
+const DIRECT_INGEST_WINDOW_MS = 60_000;
+
+function isDirectGateway(gatewayId: unknown) {
+  const at = directIngestAtByGateway.get(String(gatewayId ?? ""));
+  return at != null && Date.now() - at < DIRECT_INGEST_WINDOW_MS;
+}
 let lastUpstreamSyncAt = 0;
 let upstreamSyncInFlight: Promise<void> | null = null;
 let upstreamBackfillDone = false;
 let upstreamBackfillInFlight: Promise<void> | null = null;
 let cachedUpstreamConsole: Partial<GatewayConsole> | null = null;
+
+type SeriesCacheEntry<T = unknown> = {
+  expiresAt: number;
+  data: T;
+};
+const queryCache = new Map<string, SeriesCacheEntry>();
+const syncedUpstreamDays = new Map<string, number>();
+const syncedEmptyBuckets = new Set<number>();
+const daySyncInFlight = new Map<string, Promise<void>>();
+
+function getCachedQuery<T>(key: string): T | null {
+  const entry = queryCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    queryCache.delete(key);
+    return null;
+  }
+  return entry.data as T;
+}
+
+function setCachedQuery<T>(key: string, data: T, ttlMs = 6000): T {
+  if (queryCache.size > 200) {
+    const now = Date.now();
+    for (const [k, v] of queryCache.entries()) {
+      if (now > v.expiresAt) queryCache.delete(k);
+    }
+  }
+  queryCache.set(key, { expiresAt: Date.now() + ttlMs, data });
+  return data;
+}
 
 const DEFAULT_UPSTREAM_GATEWAY_URL = "https://webserver.demopage.top";
 
@@ -305,7 +357,43 @@ async function createSchema() {
     await emsDb.query(statement);
   }
   await emsDb.query(
-    "ALTER TABLE gateway_devices ADD COLUMN IF NOT EXISTS hmac_secret VARCHAR(128) NULL",
+    "ALTER TABLE gateway_devices ADD COLUMN hmac_secret VARCHAR(128) NULL",
+  ).catch(() => undefined);
+  await emsDb.query(
+    "ALTER TABLE gateway_samples ADD UNIQUE KEY uq_gateway_sample_time (gateway_id, meter_id, received_at, packet_number)",
+  ).catch(() => undefined);
+  await emsDb.query(
+    "ALTER TABLE gateway_samples DROP INDEX uq_gateway_sample",
+  ).catch(() => undefined);
+  await emsDb.query(
+    `INSERT IGNORE INTO gateway_samples (
+       gateway_id, meter_type, meter_model, meter_id, packet_number, received_at,
+       sampled_unix, is_replay, error_code, crc_ok, values_json
+     )
+     SELECT CAST(gateway_id AS UNSIGNED),
+            1,
+            0,
+            CAST(meter_id AS UNSIGNED),
+            CAST(packet_number AS UNSIGNED),
+            STR_TO_DATE(SUBSTRING(REPLACE(REPLACE(received_at, 'T', ' '), 'Z', ''), 1, 23), '%Y-%m-%d %H:%i:%s.%f'),
+            CASE WHEN reading_time_raw REGEXP '^[0-9]+$' AND CAST(reading_time_raw AS UNSIGNED) > 0
+                 THEN CAST(reading_time_raw AS UNSIGNED)
+                 ELSE NULL END,
+            is_replay,
+            error_code,
+            1,
+            values_json
+       FROM gateway_packets
+      WHERE disposition = 'accepted'
+        AND gateway_id REGEXP '^[0-9]+$'
+        AND meter_id REGEXP '^[0-9]+$'
+        AND packet_number REGEXP '^[0-9]+$'`,
+  ).catch(() => undefined);
+  await emsDb.query(
+    `DELETE FROM gateway_samples
+      WHERE meter_id = 250384934
+        AND JSON_EXTRACT(values_json, '$.EPaed') IS NOT NULL
+        AND CAST(JSON_UNQUOTE(JSON_EXTRACT(values_json, '$.EPaed')) AS DECIMAL(18,6)) < 500`,
   ).catch(() => undefined);
   await emsDb.query(
     "INSERT IGNORE INTO schema_migrations (version) VALUES ('2026-09-23-gateway-server-1')",
@@ -319,10 +407,10 @@ async function createSchema() {
 }
 
 export async function ingestGateway(rawText: string, headers?: Headers) {
-  lastDirectIngestAt = Date.now();
   await ensureGatewaySchema();
   const receivedAt = new Date().toISOString();
   const parsed = parseGatewayPacket(rawText);
+  if (parsed.gatewayId) directIngestAtByGateway.set(String(parsed.gatewayId), Date.now());
   const config = await loadConfig(parsed.gatewayId);
 
   if (!parsed.packet) {
@@ -380,13 +468,47 @@ export async function ingestGateway(rawText: string, headers?: Headers) {
     }
   } else if (disposition === "accepted") {
     if (packet.isReplay) {
-      // RE=1: không lưu số liệu. Vẫn ACK để gateway xóa buffer, không phát lại nữa.
-      disposition = "replay";
-      server = 4;
-      notes.push({
-        level: "log",
-        reason: "Bỏ qua RE=1: bản phát lại, không lưu. Chỉ nhận bản realtime RE=0.",
-      });
+      // RE=1: Bản tin truyền bù sau khi mất mạng. Kiểm tra Error, readingTime và lưu theo đúng mốc giờ đo TIM.
+      if (packet.error !== 0) {
+        disposition = "gateway_error";
+        server = 4;
+        notes.push({
+          level: "log",
+          reason: `Bỏ qua RE=1: Error=${packet.error} khác 0.`,
+        });
+      } else if (!packet.timeSynced) {
+        disposition = "replay_time";
+        server = 4;
+        notes.push({
+          level: "log",
+          reason: "Bỏ qua RE=1: readingTime (TIM) bằng 0 hoặc chưa đồng bộ giờ.",
+        });
+      } else if (packet.readingDate.getTime() > Date.now() + 20_000) {
+        disposition = "clock_replay";
+        server = 4;
+        notes.push({
+          level: "log",
+          reason: "Bỏ qua RE=1: readingTime vượt quá giờ server hơn 20 giây.",
+        });
+      } else {
+        const duplicate = await readingTimeTaken(packet);
+        if (duplicate) {
+          disposition = "duplicate";
+          server = 4;
+          notes.push({
+            level: "log",
+            reason: "Bỏ qua RE=1 trùng lặp: đã tồn tại cùng meterModel, meterId và readingTime.",
+          });
+        } else {
+          // Chấp nhận lưu bù dữ liệu mất mạng (RE=1), phản hồi ACK để gateway xóa khỏi bộ nhớ đệm
+          disposition = "accepted";
+          server = 1;
+          notes.push({
+            level: "info",
+            reason: `Đã lưu bù bản tin mất mạng (RE=1) tại mốc TIM=${packet.readingTime}.`,
+          });
+        }
+      }
     } else if (packet.timeSynced) {
       // RE=0: checksum đúng là lưu, kể cả readingTime=0. Chỉ chặn trùng mốc giờ đã lưu.
       const duplicate = await readingTimeTaken(packet);
@@ -436,7 +558,15 @@ export async function ingestGateway(rawText: string, headers?: Headers) {
 
     let packetId = 0;
     if (registered && sample && disposition === "accepted") {
-      const receivedSql = receivedAt.slice(0, 23).replace("T", " ").replace("Z", "");
+      queryCache.clear();
+      const validReadingTime =
+        packet.timeSynced &&
+        packet.readingDate.getTime() > 1_000_000_000_000 &&
+        Math.abs(packet.readingDate.getTime() - Date.now()) < 60 * 24 * 3600 * 1000;
+      const effectiveIso = validReadingTime
+        ? packet.readingDate.toISOString()
+        : receivedAt;
+      const receivedSql = effectiveIso.slice(0, 23).replace("T", " ").replace("Z", "");
       const valuesJson = JSON.stringify(packet.values);
       const crcOk = parsed.ok ? 1 : 0;
       await connection.execute(
@@ -465,13 +595,13 @@ export async function ingestGateway(rawText: string, headers?: Headers) {
           sampled_unix, error_code, values_json
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON DUPLICATE KEY UPDATE
-          gateway_id = VALUES(gateway_id),
-          meter_type = VALUES(meter_type),
-          packet_number = VALUES(packet_number),
-          received_at = VALUES(received_at),
-          sampled_unix = VALUES(sampled_unix),
-          error_code = VALUES(error_code),
-          values_json = VALUES(values_json)`,
+          gateway_id = IF(VALUES(received_at) >= received_at, VALUES(gateway_id), gateway_id),
+          meter_type = IF(VALUES(received_at) >= received_at, VALUES(meter_type), meter_type),
+          packet_number = IF(VALUES(received_at) >= received_at, VALUES(packet_number), packet_number),
+          sampled_unix = IF(VALUES(received_at) >= received_at, VALUES(sampled_unix), sampled_unix),
+          error_code = IF(VALUES(received_at) >= received_at, VALUES(error_code), error_code),
+          values_json = IF(VALUES(received_at) >= received_at, VALUES(values_json), values_json),
+          received_at = IF(VALUES(received_at) >= received_at, VALUES(received_at), received_at)`,
         [
           sample.meterModel,
           sample.meterId,
@@ -584,6 +714,7 @@ export async function ingestGateway(rawText: string, headers?: Headers) {
     }
 
     await connection.commit();
+    queryCache.clear();
   } catch (error) {
     await connection.rollback();
     throw error;
@@ -685,7 +816,6 @@ async function ensureUpstreamHistoryBackfill(base: string) {
 async function syncFromUpstreamGateway() {
   const base = upstreamBaseUrl();
   if (!base) return;
-  if (lastDirectIngestAt > Date.now() - 60_000) return;
 
   void ensureUpstreamHistoryBackfill(base);
 
@@ -706,9 +836,16 @@ async function syncFromUpstreamGateway() {
       const packets = Array.isArray(remote.packets) ? remote.packets : [];
 
       for (const gw of gateways) {
-        if (!gw?.gatewayId) continue;
+        if (!gw?.gatewayId || isDirectGateway(gw.gatewayId)) continue;
         const valuesJson = gw.lastValues ? JSON.stringify(gw.lastValues) : null;
         const lastSeen = gw.lastSeenAt || new Date().toISOString();
+        // Không để bản upstream cũ hơn ghi đè trạng thái mới hơn đã có (VD: gateway vừa chuyển sang gửi trực tiếp).
+        const existingSeen = await queryRows<RowDataPacket>(
+          "SELECT last_seen_at FROM gateway_devices WHERE gateway_id = ? LIMIT 1",
+          [String(gw.gatewayId)],
+        ).catch(() => [] as RowDataPacket[]);
+        const currentSeenMs = Date.parse(String(existingSeen[0]?.last_seen_at ?? ""));
+        if (Number.isFinite(currentSeenMs) && currentSeenMs >= Date.parse(lastSeen)) continue;
         await emsDb
           .execute(
             `INSERT INTO gateway_devices (
@@ -790,42 +927,64 @@ async function syncFromUpstreamGateway() {
         }
       }
 
-      const recentPackets = packets.slice(0, 35).reverse();
+      const recentPackets = packets.slice(0, 100).reverse();
+      const samplePlaceholders: string[] = [];
+      const sampleParams: Array<string | number | null> = [];
       for (const pkt of recentPackets) {
         if (!pkt?.gatewayId || !pkt?.meterId || !pkt?.values) continue;
+        if (isDirectGateway(pkt.gatewayId)) continue;
         const receivedAt = pkt.receivedAt || new Date().toISOString();
-        const receivedSql = receivedAt.slice(0, 23).replace("T", " ").replace("Z", "");
+        const sampledUnix =
+          pkt.readingTime && /^\d+$/.test(String(pkt.readingTime))
+            ? Number(pkt.readingTime)
+            : null;
+        const sampleIso =
+          pkt.isReplay && sampledUnix && sampledUnix > 1_000_000_000
+            ? new Date(sampledUnix * 1000).toISOString()
+            : receivedAt;
+        const receivedSql = sampleIso.slice(0, 23).replace("T", " ").replace("Z", "");
         const valuesJson = JSON.stringify(pkt.values);
         const modelCode = modelCodeForCategory(pkt.meterModel ?? "PM2230") ?? 0;
         const meterIdNum = Number(pkt.meterId);
         const gatewayIdNum = Number(pkt.gatewayId) || 1;
         const packetNum = Number(pkt.packetNumber) || 0;
-        const sampledUnix =
-          pkt.readingTime && /^\d+$/.test(String(pkt.readingTime))
-            ? Number(pkt.readingTime)
-            : null;
 
-        if (pkt.disposition === "accepted" && Number.isSafeInteger(meterIdNum)) {
-          await emsDb
-            .execute(
-              `INSERT IGNORE INTO gateway_samples (
-                gateway_id, meter_type, meter_model, meter_id, packet_number, received_at,
-                sampled_unix, is_replay, error_code, crc_ok, values_json
-              ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
-              [
-                gatewayIdNum,
-                modelCode,
-                meterIdNum,
-                packetNum,
-                receivedSql,
-                sampledUnix,
-                pkt.isReplay ? 1 : 0,
-                pkt.error ?? 0,
-                valuesJson,
-              ],
-            )
-            .catch(() => undefined);
+        const canStoreSample =
+          pkt.disposition === "accepted" ||
+          (pkt.disposition === "replay" && (pkt.error ?? 0) === 0 && sampledUnix != null && sampledUnix > 0);
+
+        if (canStoreSample && Number.isSafeInteger(meterIdNum) && packetNum > 0) {
+          samplePlaceholders.push("(?, 1, ?, ?, ?, ?, ?, ?, ?, 1, ?)");
+          sampleParams.push(
+            gatewayIdNum,
+            modelCode,
+            meterIdNum,
+            packetNum,
+            receivedSql,
+            sampledUnix,
+            pkt.isReplay ? 1 : 0,
+            pkt.error ?? 0,
+            valuesJson,
+          );
         }
+      }
+      if (samplePlaceholders.length > 0) {
+        await emsDb
+          .execute(
+            `INSERT IGNORE INTO gateway_samples (
+              gateway_id, meter_type, meter_model, meter_id, packet_number, received_at,
+              sampled_unix, is_replay, error_code, crc_ok, values_json
+            ) VALUES ${samplePlaceholders.join(",")}`,
+            sampleParams,
+          )
+          .catch(() => undefined);
+        queryCache.clear();
+      }
+
+      for (const pkt of recentPackets.slice(-25)) {
+        if (!pkt?.gatewayId || !pkt?.meterId || !pkt?.values) continue;
+        const receivedAt = pkt.receivedAt || new Date().toISOString();
+        const valuesJson = JSON.stringify(pkt.values);
 
         const existingPkt = await queryRows<RowDataPacket>(
           `SELECT 1 AS ok FROM gateway_packets
@@ -1354,68 +1513,424 @@ function isDuplicate(error: unknown) {
   return typeof error === "object" && error !== null && "code" in error && (error as { code?: string }).code === "ER_DUP_ENTRY";
 }
 
-export async function getProjectGatewaySeries(
-  projectId: string,
-  options?: { from?: string; to?: string; limit?: number },
-): Promise<ProjectGatewaySample[]> {
-  const id = projectId.trim();
-  if (!id) return [];
-  await ensureGatewaySchema();
-  await syncFromUpstreamGateway();
+type MeterHistorySegment = {
+  pointId: string;
+  model: number;
+  meterId: string;
+  validFrom: string | null;
+  validTo: string | null;
+};
 
+async function loadProjectMeterSegments(projectId: string): Promise<MeterHistorySegment[]> {
   let points: Array<{
     id: string;
     serialNumber: string | null;
     category: string | null;
     deviceSerial: string | null;
   }> = [];
+  let historyRows: Array<{
+    meterPointId: string;
+    category: string | null;
+    serialNumber: string;
+    validFrom: string | Date | null;
+    validTo: string | Date | null;
+  }> = [];
   try {
-    points = await queryRows(
-      `SELECT mp.id, mp.serial_number AS serialNumber, d.category AS category, d.serial_number AS deviceSerial
-         FROM meter_points mp
-         LEFT JOIN devices d ON d.id = mp.device_id
-        WHERE mp.project_id = ?`,
-      [id],
-    );
+    [points, historyRows] = await Promise.all([
+      queryRows<{
+        id: string;
+        serialNumber: string | null;
+        category: string | null;
+        deviceSerial: string | null;
+      }>(
+        `SELECT mp.id, mp.serial_number AS serialNumber, d.category AS category, d.serial_number AS deviceSerial
+           FROM meter_points mp
+           LEFT JOIN devices d ON d.id = mp.device_id
+          WHERE mp.project_id = ?`,
+        [projectId],
+      ),
+      queryRows<{
+        meterPointId: string;
+        category: string | null;
+        serialNumber: string;
+        validFrom: string | Date | null;
+        validTo: string | Date | null;
+      }>(
+        `SELECT meter_point_id AS meterPointId, category, serial_number AS serialNumber,
+                DATE_FORMAT(valid_from, '%Y-%m-%d %H:%i:%s') AS validFrom,
+                DATE_FORMAT(valid_to, '%Y-%m-%d %H:%i:%s') AS validTo
+           FROM meter_point_history
+          WHERE project_id = ?
+          ORDER BY valid_from ASC, id ASC`,
+        [projectId],
+      ).catch(() => []),
+    ]);
   } catch (error) {
     console.error("Project gateway match failed", error);
     return [];
   }
 
-  const pairs = new Map<string, { model: number; meterId: string; pointIds: string[] }>();
-  for (const point of points) {
-    const model = modelCodeForCategory(point.category ?? "");
-    const meterId = serialToMeterId(point.serialNumber || point.deviceSerial || "");
-    if (model == null || !meterId) continue;
-    const key = `${model}:${meterId}`;
-    const existing = pairs.get(key);
-    if (existing) existing.pointIds.push(String(point.id));
-    else pairs.set(key, { model, meterId, pointIds: [String(point.id)] });
+  const historyByPoint = new Map<string, typeof historyRows>();
+  for (const row of historyRows) {
+    const pid = String(row.meterPointId);
+    const list = historyByPoint.get(pid) ?? [];
+    list.push(row);
+    historyByPoint.set(pid, list);
   }
 
+  const segments: MeterHistorySegment[] = [];
+  for (const point of points) {
+    const pointId = String(point.id);
+    const currentModel = modelCodeForCategory(point.category ?? "") ?? 0;
+    const currentMeterId = serialToMeterId(point.serialNumber || point.deviceSerial || "");
+    const history = historyByPoint.get(pointId) ?? [];
+
+    if (history.length > 0) {
+      let hasCurrentActive = false;
+      for (const h of history) {
+        const hModel = modelCodeForCategory(h.category ?? point.category ?? "") ?? currentModel;
+        const hMeterId = serialToMeterId(String(h.serialNumber ?? ""));
+        if (!hMeterId) continue;
+        const vFrom = h.validFrom ? String(h.validFrom) : null;
+        const vTo = h.validTo ? String(h.validTo) : null;
+        if (!vTo && hMeterId === currentMeterId) hasCurrentActive = true;
+        segments.push({
+          pointId,
+          model: hModel,
+          meterId: hMeterId,
+          validFrom: vFrom && vFrom > "2020-01-02 00:00:00" ? vFrom : null,
+          validTo: vTo,
+        });
+      }
+      if (currentMeterId && !hasCurrentActive) {
+        const lastTo = history[history.length - 1]?.validTo;
+        segments.push({
+          pointId,
+          model: currentModel,
+          meterId: currentMeterId,
+          validFrom: lastTo ? String(lastTo) : null,
+          validTo: null,
+        });
+      }
+    } else if (currentMeterId) {
+      segments.push({
+        pointId,
+        model: currentModel,
+        meterId: currentMeterId,
+        validFrom: null,
+        validTo: null,
+      });
+    }
+  }
+  return segments;
+}
+
+async function syncUpstreamDayIfNeeded(day: string) {
+  const base = upstreamBaseUrl();
+  if (!base || !/^\d{4}-\d{2}-\d{2}$/.test(day)) return;
+
+  const existingJob = daySyncInFlight.get(day);
+  if (existingJob) return existingJob;
+
+  const job = (async () => {
+    try {
+      const bounds = vietnamRangeBounds(day, day);
+      if (!bounds) return;
+
+      const dayStartMs = Date.parse(`${bounds.start.replace(" ", "T")}Z`);
+      const dayEndMs = Math.min(Date.now() + 15_000, Date.parse(`${bounds.end.replace(" ", "T")}Z`));
+      if (!Number.isFinite(dayStartMs) || !Number.isFinite(dayEndMs) || dayStartMs >= dayEndMs) return;
+
+      const bucketRows = await queryRows<RowDataPacket>(
+        `SELECT FLOOR(UNIX_TIMESTAMP(received_at) / 900) AS bucket_id,
+                COUNT(*) AS cnt
+           FROM gateway_samples
+          WHERE received_at >= ? AND received_at < ?
+            AND packet_number < 1700000000
+          GROUP BY bucket_id`,
+        [bounds.start, bounds.end],
+      ).catch(() => []);
+
+      const bucketCounts = new Map<number, number>();
+      for (const row of bucketRows) {
+        bucketCounts.set(Number(row.bucket_id), Number(row.cnt));
+      }
+
+      const startBucket = Math.floor(dayStartMs / 900_000);
+      const endBucket = Math.floor(dayEndMs / 900_000);
+      const nowBucket = Math.floor(Date.now() / 900_000);
+      const lastSync = syncedUpstreamDays.get(day) ?? 0;
+
+      const bucketsToFetch: number[] = [];
+      for (let b = startBucket; b <= endBucket; b++) {
+        const cnt = bucketCounts.get(b) ?? 0;
+        if (b >= nowBucket) {
+          if (Date.now() - lastSync >= 8_000) {
+            bucketsToFetch.push(b);
+          }
+        } else if (cnt < 60 && !syncedEmptyBuckets.has(b)) {
+          bucketsToFetch.push(b);
+        }
+      }
+
+      if (bucketsToFetch.length === 0) return;
+      syncedUpstreamDays.set(day, Date.now());
+
+      const batchSize = 8;
+      let insertedAny = false;
+      const syncedBuckets: number[] = [];
+      for (let i = 0; i < bucketsToFetch.length; i += batchSize) {
+        const batch = bucketsToFetch.slice(i, i + batchSize);
+        const results = await Promise.all(
+          batch.map(async (b) => {
+            const wStartIso = new Date(b * 900_000).toISOString();
+            const wEndIso = new Date((b + 1) * 900_000 - 1).toISOString();
+            const url = `${base}/api/gateway/console?from=${encodeURIComponent(wStartIso)}&to=${encodeURIComponent(wEndIso)}`;
+            let res = await fetch(url, {
+              cache: "no-store",
+              signal: AbortSignal.timeout(8000),
+            }).catch(() => null);
+            if (!res || !res.ok) {
+              res = await fetch(url, {
+                cache: "no-store",
+                signal: AbortSignal.timeout(8000),
+              }).catch(() => null);
+            }
+            if (!res || !res.ok) return { bucket: b, packets: null };
+            const body = (await res.json()) as Partial<GatewayConsole>;
+            return {
+              bucket: b,
+              packets: Array.isArray(body.packets) ? body.packets : [],
+            };
+          }),
+        );
+
+        const placeholders: string[] = [];
+        const params: Array<string | number | null> = [];
+        for (const { bucket, packets } of results) {
+          if (!packets) continue;
+          if (packets.length > 0) {
+            syncedBuckets.push(bucket);
+          }
+          if (bucket < nowBucket && packets.length < 60) {
+            syncedEmptyBuckets.add(bucket);
+          }
+          for (const pkt of packets) {
+            if (!pkt?.gatewayId || !pkt?.meterId || !pkt?.values) continue;
+            if (isDirectGateway(pkt.gatewayId)) continue;
+            const receivedAt = pkt.receivedAt || new Date().toISOString();
+            const sampledUnix =
+              pkt.readingTime && /^\d+$/.test(String(pkt.readingTime))
+                ? Number(pkt.readingTime)
+                : null;
+            const sampleIso =
+              pkt.isReplay && sampledUnix && sampledUnix > 1_000_000_000
+                ? new Date(sampledUnix * 1000).toISOString()
+                : receivedAt;
+            const receivedSql = sampleIso.slice(0, 23).replace("T", " ").replace("Z", "");
+            const modelCode = modelCodeForCategory(pkt.meterModel ?? "PM2230") ?? 0;
+            const meterIdNum = Number(pkt.meterId);
+            const gatewayIdNum = Number(pkt.gatewayId) || 1;
+            const packetNum = Number(pkt.packetNumber) || 0;
+            const canStoreSample =
+              pkt.disposition === "accepted" ||
+              (pkt.disposition === "replay" && (pkt.error ?? 0) === 0 && sampledUnix != null && sampledUnix > 0);
+            if (!canStoreSample || !Number.isSafeInteger(meterIdNum) || packetNum <= 0) continue;
+
+            placeholders.push("(?, 1, ?, ?, ?, ?, ?, ?, ?, 1, ?)");
+            params.push(
+              gatewayIdNum,
+              modelCode,
+              meterIdNum,
+              packetNum,
+              receivedSql,
+              sampledUnix,
+              pkt.isReplay ? 1 : 0,
+              pkt.error ?? 0,
+              JSON.stringify(pkt.values),
+            );
+          }
+        }
+
+        const chunkRows = 250;
+        for (let k = 0; k < placeholders.length; k += chunkRows) {
+          const phChunk = placeholders.slice(k, k + chunkRows);
+          const pmChunk = params.slice(k * 9, (k + chunkRows) * 9);
+          await emsDb
+            .execute(
+              `INSERT IGNORE INTO gateway_samples (
+                gateway_id, meter_type, meter_model, meter_id, packet_number, received_at,
+                sampled_unix, is_replay, error_code, crc_ok, values_json
+              ) VALUES ${phChunk.join(",")}`,
+              pmChunk,
+            )
+            .catch(() => undefined);
+          insertedAny = true;
+        }
+      }
+
+      if (insertedAny && syncedBuckets.length > 0) {
+        // Chỉ xóa các mẫu tổng hợp thưa (packet_number >= 1700000000) trong đúng các khung 15 phút đã tải thành công bản tin 10s thực
+        for (const b of syncedBuckets) {
+          const bStartSql = new Date(b * 900_000).toISOString().slice(0, 19).replace("T", " ");
+          const bEndSql = new Date((b + 1) * 900_000).toISOString().slice(0, 19).replace("T", " ");
+          await emsDb
+            .execute(
+              `DELETE FROM gateway_samples
+                WHERE received_at >= ? AND received_at < ?
+                  AND packet_number >= 1700000000`,
+              [bStartSql, bEndSql],
+            )
+            .catch(() => undefined);
+        }
+        queryCache.clear();
+      }
+    } catch {
+      // Ignore background day sync error
+    } finally {
+      daySyncInFlight.delete(day);
+    }
+  })();
+
+  daySyncInFlight.set(day, job);
+  return job;
+}
+
+async function triggerUpstreamSync() {
+  if (lastUpstreamSyncAt > 0 && Date.now() - lastUpstreamSyncAt < 8_000) {
+    return;
+  }
+  if (lastUpstreamSyncAt > 0) {
+    void syncFromUpstreamGateway();
+    return;
+  }
+  await syncFromUpstreamGateway();
+}
+
+export async function getProjectGatewaySeries(
+  projectId: string,
+  options?: { from?: string; to?: string; limit?: number; resolution?: "auto" | "raw" },
+): Promise<ProjectGatewaySample[]> {
+  const id = projectId.trim();
+  if (!id) return [];
+  await ensureGatewaySchema();
+  await triggerUpstreamSync();
+
   const bounds = options?.from && options?.to ? vietnamRangeBounds(options.from, options.to) : null;
-  const limit = Math.min(8000, Math.max(1, Math.floor(options?.limit ?? (bounds ? 2000 : 800))));
-  const samples: ProjectGatewaySample[] = [];
-  for (const pair of pairs.values()) {
-    const rows = await queryRows<RowDataPacket>(
-      `SELECT received_at, values_json
-         FROM gateway_samples
-        WHERE meter_model = ? AND meter_id = ?
-          ${bounds ? "AND received_at >= ? AND received_at < ?" : ""}
-        ORDER BY received_at DESC
-        LIMIT ${limit}`,
-      bounds ? [pair.model, pair.meterId, bounds.start, bounds.end] : [pair.model, pair.meterId],
-    );
-    const chronological = [...rows].reverse();
-    for (const row of chronological) {
-      const values = numericValues(row.values_json);
-      const at = receivedAtText(row.received_at);
-      for (const meterPointId of pair.pointIds) {
-        samples.push({ meterPointId, at, values });
+  const spanDays = bounds
+    ? Math.max(
+        1,
+        Math.round(
+          (Date.parse(`${bounds.end.replace(" ", "T")}Z`) -
+            Date.parse(`${bounds.start.replace(" ", "T")}Z`)) /
+            (24 * 3600 * 1000),
+        ),
+      )
+    : 1;
+
+  if (options?.from && options?.to && spanDays <= 2) {
+    if (!syncedUpstreamDays.has(options.from)) {
+      await syncUpstreamDayIfNeeded(options.from);
+    } else {
+      void syncUpstreamDayIfNeeded(options.from);
+    }
+    if (options.to !== options.from) {
+      if (!syncedUpstreamDays.has(options.to)) {
+        await syncUpstreamDayIfNeeded(options.to);
+      } else {
+        void syncUpstreamDayIfNeeded(options.to);
       }
     }
   }
-  return samples;
+
+  const cacheKey = `series:${id}:${options?.from ?? ""}:${options?.to ?? ""}:${options?.limit ?? ""}:${options?.resolution ?? "auto"}`;
+  const cached = getCachedQuery<ProjectGatewaySample[]>(cacheKey);
+  if (cached) return cached;
+
+  const segments = await loadProjectMeterSegments(id);
+
+  // Khi xem theo Ngày (spanDays <= 2): trả về 100% mẫu thời gian thật (10s/lần, tối đa 18,000 mẫu).
+  // Khi xem theo Tháng hoặc Năm (spanDays > 2): tự động gom nhóm (downsample) trên Server để tránh treo máy & tăng tốc tải.
+  let bucketSeconds = 0;
+  if (options?.resolution !== "raw" && spanDays > 2) {
+    if (spanDays <= 10) bucketSeconds = 600; // 10 phút/điểm (~1,440 điểm)
+    else if (spanDays <= 45) bucketSeconds = 1800; // 30 phút/điểm cho chế độ Tháng (~1,488 điểm)
+    else if (spanDays <= 120) bucketSeconds = 7200; // 2 giờ/điểm (~1,440 điểm)
+    else bucketSeconds = 14400; // 4 giờ/điểm cho chế độ Năm (~2,190 điểm)
+  }
+
+  const defaultLimit = spanDays <= 2 ? 18000 : 3000;
+  const limit = Math.min(20000, Math.max(1, Math.floor(options?.limit ?? defaultLimit)));
+  const samples: ProjectGatewaySample[] = [];
+
+  for (const seg of segments) {
+    const startBound =
+      bounds && seg.validFrom
+        ? bounds.start > seg.validFrom
+          ? bounds.start
+          : seg.validFrom
+        : bounds?.start ?? seg.validFrom;
+    const endBound =
+      bounds && seg.validTo
+        ? bounds.end < seg.validTo
+          ? bounds.end
+          : seg.validTo
+        : bounds?.end ?? seg.validTo;
+
+    if (startBound && endBound && startBound >= endBound) continue;
+
+    const clauses = ["meter_id = ?"];
+    const params: Array<string | number> = [seg.meterId];
+    if (startBound) {
+      clauses.push("received_at >= ?");
+      params.push(startBound);
+    }
+    if (endBound) {
+      clauses.push("received_at < ?");
+      params.push(endBound);
+    }
+
+    let chronological: RowDataPacket[] = [];
+    if (bucketSeconds > 0) {
+      const bucketRows = await queryRows<RowDataPacket>(
+        `SELECT s.received_at, s.values_json
+           FROM (
+             SELECT MAX(id) AS pick_id
+               FROM gateway_samples
+              WHERE ${clauses.join(" AND ")}
+              GROUP BY FLOOR(UNIX_TIMESTAMP(received_at) / ?)
+           ) b
+           JOIN gateway_samples s ON s.id = b.pick_id
+          ORDER BY s.received_at ASC
+          LIMIT ${limit}`,
+        [...params, bucketSeconds],
+      ).catch(() => null);
+
+      if (bucketRows) {
+        chronological = bucketRows;
+      }
+    }
+
+    if (chronological.length === 0 && bucketSeconds === 0) {
+      const rows = await queryRows<RowDataPacket>(
+        `SELECT received_at, values_json
+           FROM gateway_samples
+          WHERE ${clauses.join(" AND ")}
+          ORDER BY received_at DESC
+          LIMIT ${limit}`,
+        params,
+      );
+      chronological = [...rows].reverse();
+    }
+
+    for (const row of chronological) {
+      const values = numericValues(row.values_json);
+      const at = receivedAtText(row.received_at);
+      samples.push({ meterPointId: seg.pointId, at, values });
+    }
+  }
+  samples.sort((a, b) => a.at.localeCompare(b.at));
+  return setCachedQuery(cacheKey, samples, spanDays <= 2 ? 4000 : 12000);
 }
 
 /** Bản tin mới nhất theo từng điểm đo (đọc `gateway_meter_latest`, fallback `gateway_samples`). */
@@ -1423,7 +1938,11 @@ export async function getProjectGatewayLatest(projectId: string): Promise<Projec
   const id = projectId.trim();
   if (!id) return [];
   await ensureGatewaySchema();
-  await syncFromUpstreamGateway();
+  await triggerUpstreamSync();
+
+  const cacheKey = `latest:${id}`;
+  const cached = getCachedQuery<ProjectGatewaySample[]>(cacheKey);
+  if (cached) return cached;
 
   let points: Array<{
     id: string;
@@ -1461,18 +1980,19 @@ export async function getProjectGatewayLatest(projectId: string): Promise<Projec
       let rows = await queryRows<RowDataPacket>(
         `SELECT received_at, values_json
            FROM gateway_meter_latest
-          WHERE meter_model = ? AND meter_id = ?
+          WHERE meter_id = ?
+          ORDER BY received_at DESC
           LIMIT 1`,
-        [pair.model, pair.meterId],
+        [pair.meterId],
       ).catch(() => []);
       if (!rows.length) {
         rows = await queryRows<RowDataPacket>(
           `SELECT received_at, values_json
              FROM gateway_samples
-            WHERE meter_model = ? AND meter_id = ?
+            WHERE meter_id = ?
             ORDER BY received_at DESC, id DESC
             LIMIT 1`,
-          [pair.model, pair.meterId],
+          [pair.meterId],
         ).catch(() => []);
       }
       const row = rows[0];
@@ -1484,7 +2004,7 @@ export async function getProjectGatewayLatest(projectId: string): Promise<Projec
       }
     }),
   );
-  return samples;
+  return setCachedQuery(cacheKey, samples, 3000);
 }
 
 export type GatewayDailyEnergy = {
@@ -1533,41 +2053,21 @@ async function queryProjectGatewayDaily(
   const id = projectId.trim();
   if (!id) return empty;
   await ensureGatewaySchema();
-  await syncFromUpstreamGateway();
+  await triggerUpstreamSync();
 
-  let points: Array<{
-    id: string;
-    serialNumber: string | null;
-    category: string | null;
-    deviceSerial: string | null;
-  }> = [];
-  try {
-    points = await queryRows(
-      `SELECT mp.id, mp.serial_number AS serialNumber, d.category AS category, d.serial_number AS deviceSerial
-         FROM meter_points mp
-         LEFT JOIN devices d ON d.id = mp.device_id
-        WHERE mp.project_id = ?`,
-      [id],
-    );
-  } catch (error) {
-    console.error("Project gateway match failed", error);
-    return empty;
-  }
+  const cacheKey = `daily:${id}:${bounds.start}:${bounds.end}`;
+  const cached = getCachedQuery<GatewayDailySummary>(cacheKey);
+  if (cached) return cached;
 
-  const pairs = new Map<string, { model: number; meterId: string; pointIds: string[] }>();
-  for (const point of points) {
-    const model = modelCodeForCategory(point.category ?? "");
-    const meterId = serialToMeterId(point.serialNumber || point.deviceSerial || "");
-    if (model == null || !meterId) continue;
-    const key = `${model}:${meterId}`;
-    const existing = pairs.get(key);
-    if (existing) existing.pointIds.push(String(point.id));
-    else pairs.set(key, { model, meterId, pointIds: [String(point.id)] });
-  }
-
-  const days: GatewayDailyEnergy[] = [];
+  const segments = await loadProjectMeterSegments(id);
+  const rawDays: Array<GatewayDailyEnergy & { meterId: string }> = [];
   let latest: ProjectGatewaySample | null = null;
-  for (const pair of pairs.values()) {
+
+  for (const seg of segments) {
+    const startBound = seg.validFrom && seg.validFrom > bounds.start ? seg.validFrom : bounds.start;
+    const endBound = seg.validTo && seg.validTo < bounds.end ? seg.validTo : bounds.end;
+    if (startBound >= endBound) continue;
+
     const [rows, latestRows] = await Promise.all([
       queryRows<RowDataPacket>(
         `SELECT day_vn,
@@ -1585,44 +2085,78 @@ async function queryProjectGatewayDaily(
                       ORDER BY received_at DESC, id DESC
                     ) AS rn_desc
                FROM gateway_samples
-              WHERE meter_model = ? AND meter_id = ?
+              WHERE meter_id = ?
                 AND received_at >= ? AND received_at < ?
                 AND JSON_EXTRACT(values_json, '$.EPaed') IS NOT NULL
+                AND CAST(JSON_UNQUOTE(JSON_EXTRACT(values_json, '$.EPaed')) AS DECIMAL(18,6)) > 0
            ) ranked
           WHERE rn_asc = 1 OR rn_desc = 1
           GROUP BY day_vn
           ORDER BY day_vn`,
-        [pair.model, pair.meterId, bounds.start, bounds.end],
+        [seg.meterId, startBound, endBound],
       ),
-      queryRows<RowDataPacket>(
-        `SELECT received_at, values_json
-           FROM gateway_samples
-          WHERE meter_model = ? AND meter_id = ?
-          ORDER BY received_at DESC, id DESC
-          LIMIT 1`,
-        [pair.model, pair.meterId],
-      ),
+      !seg.validTo
+        ? queryRows<RowDataPacket>(
+            `SELECT received_at, values_json
+               FROM gateway_samples
+              WHERE meter_id = ?
+              ORDER BY received_at DESC, id DESC
+              LIMIT 1`,
+            [seg.meterId],
+          )
+        : Promise.resolve([] as RowDataPacket[]),
     ]);
     for (const row of rows) {
       const day = String(row.day_vn ?? "");
       const firstWh = Number(row.first_wh);
       const lastWh = Number(row.last_wh);
       if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || !Number.isFinite(firstWh) || !Number.isFinite(lastWh)) continue;
-      for (const meterPointId of pair.pointIds) {
-        days.push({ meterPointId, day, firstWh, lastWh });
-      }
+      rawDays.push({ meterPointId: seg.pointId, day, firstWh, lastWh, meterId: seg.meterId });
     }
     const latestRow = latestRows[0];
     if (latestRow) {
       const sample = {
-        meterPointId: pair.pointIds[0] ?? "",
+        meterPointId: seg.pointId,
         at: receivedAtText(latestRow.received_at),
         values: numericValues(latestRow.values_json),
       };
       if (!latest || sample.at > latest.at) latest = sample;
     }
   }
-  return { days, latest };
+
+  // Gộp theo (meterPointId, day): nếu trong cùng 1 ngày điểm đo có thay thế đồng hồ (nhiều meterId), cộng tổng ΔWh của từng đồng hồ
+  const groupedDays = new Map<string, Array<GatewayDailyEnergy & { meterId: string }>>();
+  for (const item of rawDays) {
+    const key = `${item.meterPointId}:${item.day}`;
+    const list = groupedDays.get(key) ?? [];
+    list.push(item);
+    groupedDays.set(key, list);
+  }
+  const days: GatewayDailyEnergy[] = [];
+  for (const list of groupedDays.values()) {
+    if (list.length === 1) {
+      const single = list[0];
+      days.push({
+        meterPointId: single.meterPointId,
+        day: single.day,
+        firstWh: single.firstWh,
+        lastWh: single.lastWh >= single.firstWh ? single.lastWh : single.firstWh + Math.max(0, single.lastWh),
+      });
+    } else {
+      const totalDeltaWh = list.reduce(
+        (sum, r) => sum + (r.lastWh >= r.firstWh ? r.lastWh - r.firstWh : Math.max(0, r.lastWh)),
+        0,
+      );
+      days.push({
+        meterPointId: list[0].meterPointId,
+        day: list[0].day,
+        firstWh: 0,
+        lastWh: totalDeltaWh,
+      });
+    }
+  }
+  days.sort((a, b) => a.day.localeCompare(b.day));
+  return setCachedQuery(cacheKey, { days, latest }, 8000);
 }
 
 export async function getProjectGatewayDailyEnergy(
@@ -1650,6 +2184,7 @@ export async function getProjectGatewayDailyRange(
 
 export type GatewayEnergySlot = {
   meterPointId: string;
+  meterId?: string;
   day: string;
   hour: number;
   minute: number;
@@ -1666,47 +2201,28 @@ export async function getProjectGatewayEnergySlots(
   projectId: string,
   from: string,
   to: string,
+  slotMinutes: 15 | 30 = 30,
 ): Promise<GatewayEnergySlotSummary> {
   const empty = { slots: [], latest: null };
   const bounds = vietnamRangeBounds(from, to);
   const id = projectId.trim();
   if (!id || !bounds) return empty;
   await ensureGatewaySchema();
-  await syncFromUpstreamGateway();
+  await triggerUpstreamSync();
 
-  let points: Array<{
-    id: string;
-    serialNumber: string | null;
-    category: string | null;
-    deviceSerial: string | null;
-  }> = [];
-  try {
-    points = await queryRows(
-      `SELECT mp.id, mp.serial_number AS serialNumber, d.category AS category, d.serial_number AS deviceSerial
-         FROM meter_points mp
-         LEFT JOIN devices d ON d.id = mp.device_id
-        WHERE mp.project_id = ?`,
-      [id],
-    );
-  } catch (error) {
-    console.error("Project gateway match failed", error);
-    return empty;
-  }
+  const cacheKey = `slots:${id}:${bounds.start}:${bounds.end}:${slotMinutes}`;
+  const cached = getCachedQuery<GatewayEnergySlotSummary>(cacheKey);
+  if (cached) return cached;
 
-  const pairs = new Map<string, { model: number; meterId: string; pointIds: string[] }>();
-  for (const point of points) {
-    const model = modelCodeForCategory(point.category ?? "");
-    const meterId = serialToMeterId(point.serialNumber || point.deviceSerial || "");
-    if (model == null || !meterId) continue;
-    const key = `${model}:${meterId}`;
-    const existing = pairs.get(key);
-    if (existing) existing.pointIds.push(String(point.id));
-    else pairs.set(key, { model, meterId, pointIds: [String(point.id)] });
-  }
-
+  const segments = await loadProjectMeterSegments(id);
   const slots: GatewayEnergySlot[] = [];
   let latest: ProjectGatewaySample | null = null;
-  for (const pair of pairs.values()) {
+
+  for (const seg of segments) {
+    const startBound = seg.validFrom && seg.validFrom > bounds.start ? seg.validFrom : bounds.start;
+    const endBound = seg.validTo && seg.validTo < bounds.end ? seg.validTo : bounds.end;
+    if (startBound >= endBound) continue;
+
     const [rows, latestRows] = await Promise.all([
       queryRows<RowDataPacket>(
         `SELECT slot_vn,
@@ -1721,7 +2237,7 @@ export async function getProjectGatewayEnergySlots(
                  SELECT DATE_FORMAT(
                           DATE_SUB(
                             DATE_ADD(received_at, INTERVAL 7 HOUR),
-                            INTERVAL MOD(MINUTE(DATE_ADD(received_at, INTERVAL 7 HOUR)), 30) MINUTE
+                            INTERVAL MOD(MINUTE(DATE_ADD(received_at, INTERVAL 7 HOUR)), ${slotMinutes}) MINUTE
                           ),
                           '%Y-%m-%d %H:%i'
                         ) AS slot_vn,
@@ -1729,84 +2245,82 @@ export async function getProjectGatewayEnergySlots(
                         received_at,
                         id
                    FROM gateway_samples
-                  WHERE meter_model = ? AND meter_id = ?
+                  WHERE meter_id = ?
                     AND received_at >= ? AND received_at < ?
                     AND JSON_EXTRACT(values_json, '$.EPaed') IS NOT NULL
+                    AND CAST(JSON_UNQUOTE(JSON_EXTRACT(values_json, '$.EPaed')) AS DECIMAL(18,6)) > 0
                ) stamped
            ) ranked
           WHERE rn_asc = 1 OR rn_desc = 1
           GROUP BY slot_vn
           ORDER BY slot_vn`,
-        [pair.model, pair.meterId, bounds.start, bounds.end],
+        [seg.meterId, startBound, endBound],
       ),
-      queryRows<RowDataPacket>(
-        `SELECT received_at, values_json
-           FROM gateway_samples
-          WHERE meter_model = ? AND meter_id = ?
-          ORDER BY received_at DESC, id DESC
-          LIMIT 1`,
-        [pair.model, pair.meterId],
-      ),
+      !seg.validTo
+        ? queryRows<RowDataPacket>(
+            `SELECT received_at, values_json
+               FROM gateway_samples
+              WHERE meter_id = ?
+              ORDER BY received_at DESC, id DESC
+              LIMIT 1`,
+            [seg.meterId],
+          )
+        : Promise.resolve([] as RowDataPacket[]),
     ]);
     for (const row of rows) {
       const match = /^(\d{4}-\d{2}-\d{2}) (\d{2}):(\d{2})$/.exec(String(row.slot_vn ?? ""));
       const firstWh = Number(row.first_wh);
       const lastWh = Number(row.last_wh);
       if (!match || !Number.isFinite(firstWh) || !Number.isFinite(lastWh)) continue;
-      for (const meterPointId of pair.pointIds) {
-        slots.push({
-          meterPointId,
-          day: match[1],
-          hour: Number(match[2]),
-          minute: Number(match[3]),
-          firstWh,
-          lastWh,
-        });
-      }
+      slots.push({
+        meterPointId: seg.pointId,
+        meterId: seg.meterId,
+        day: match[1],
+        hour: Number(match[2]),
+        minute: Number(match[3]),
+        firstWh,
+        lastWh,
+      });
     }
     const latestRow = latestRows[0];
     if (latestRow) {
       const sample = {
-        meterPointId: pair.pointIds[0] ?? "",
+        meterPointId: seg.pointId,
         at: receivedAtText(latestRow.received_at),
         values: numericValues(latestRow.values_json),
       };
       if (!latest || sample.at > latest.at) latest = sample;
     }
   }
-  return { slots, latest };
+  return setCachedQuery(cacheKey, { slots, latest }, 8000);
 }
 
 async function meterIsRegistered(packet: NormalizedPacket) {
   const serial = packet.meterId.trim();
   const category = packet.meterModel.trim();
-  if (!serial || !category) return false;
+  if (!serial) return false;
   const rows = await queryRows<RowDataPacket>(
     `SELECT 1 AS ok
        FROM devices d
-      WHERE LOWER(TRIM(d.category)) = LOWER(?)
-        AND (
-          TRIM(d.serial_number) IN (?, CONCAT('SN: ', ?), CONCAT('SN:', ?))
-          OR EXISTS (
-            SELECT 1
-              FROM meter_points mp
-             WHERE mp.device_id = d.id
-               AND TRIM(mp.serial_number) IN (?, CONCAT('SN: ', ?), CONCAT('SN:', ?))
-          )
-        )
+      WHERE TRIM(d.serial_number) IN (?, CONCAT('SN: ', ?), CONCAT('SN:', ?))
+         OR EXISTS (
+           SELECT 1
+             FROM meter_points mp
+            WHERE TRIM(mp.serial_number) IN (?, CONCAT('SN: ', ?), CONCAT('SN:', ?))
+         )
       LIMIT 1`,
-    [category, serial, serial, serial, serial, serial, serial],
+    [serial, serial, serial, serial, serial, serial],
   );
   return rows.length > 0;
 }
 
 function modelCodeForCategory(category: string) {
   const name = category.trim().toLowerCase();
-  if (!name) return null;
+  if (!name) return 0;
   for (const [code, label] of Object.entries(METER_MODEL_BY_CODE)) {
     if (label.toLowerCase() === name) return Number(code);
   }
-  return null;
+  return 0;
 }
 
 /** Điểm đo còn “online” nếu bản tin gần nhất trong cửa sổ này. */
@@ -1899,9 +2413,10 @@ export async function getProjectsListTelemetry(): Promise<ProjectListTelemetry[]
       const rows = await queryRows<RowDataPacket>(
         `SELECT received_at, values_json
            FROM gateway_meter_latest
-          WHERE meter_model = ? AND meter_id = ?
+          WHERE meter_id = ?
+          ORDER BY received_at DESC
           LIMIT 1`,
-        [pair.model, pair.meterId],
+        [pair.meterId],
       ).catch(() => []);
       const row = rows[0];
       if (!row) return;

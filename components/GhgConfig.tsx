@@ -22,6 +22,12 @@ import {
   type GhgMultiplier,
   type ScopeId,
 } from "@/lib/ghg-sources";
+import {
+  formatAppNumber,
+  formatAppNumberInput,
+  formatLiveNumberInput,
+  parseAppNumber,
+} from "@/lib/number-format";
 import { vietnamNow } from "@/lib/vietnam-time";
 import {
   hydrateClientMeters,
@@ -91,9 +97,9 @@ function draftsFromMultipliers(rows: GhgMultiplier[] | undefined): MultiplierDra
 }
 
 function formatFactor(value: number) {
-  return value.toLocaleString("en-US", {
-    minimumFractionDigits: 4,
-    maximumFractionDigits: 4,
+  return formatAppNumber(value, {
+    minDecimals: 4,
+    maxDecimals: 4,
   });
 }
 
@@ -349,8 +355,10 @@ export function GhgConfig({ projectId }: { projectId: string }) {
       return;
     }
     const parsedManual =
-      method === "manual" && manualValue.trim() ? Number(manualValue.replace(",", ".")) : undefined;
-    if (method === "manual" && manualValue.trim() && !Number.isFinite(parsedManual)) {
+      method !== "meter" && manualValue.trim()
+        ? parseAppNumber(manualValue, Number.NaN)
+        : undefined;
+    if (method !== "meter" && manualValue.trim() && !Number.isFinite(parsedManual)) {
       setFormError("Giá trị thủ công không hợp lệ.");
       return;
     }
@@ -383,6 +391,8 @@ export function GhgConfig({ projectId }: { projectId: string }) {
     }));
     const factorId = selectedGroup && primary ? `${selectedGroup.id}:${primary.key}` : "none:none";
     const factorValue = primary?.value ?? 0;
+    const effectiveManualValue =
+      method !== "meter" ? (parsedManual ?? existing?.manualValue) : undefined;
     const next: EmissionSource = {
       ...existing,
       id: existing?.id ?? `src-${Date.now()}`,
@@ -391,20 +401,24 @@ export function GhgConfig({ projectId }: { projectId: string }) {
       method,
       factorId,
       factorValue,
+      gases: selectedGroup?.gases ?? existing?.gases,
       multipliers: nextMultipliers,
       formula,
       appliedAt,
       meterPointId: method === "meter" ? meterPointId : undefined,
-      manualValue: method === "manual" ? parsedManual : undefined,
-      manualUnit: method === "manual" ? manualUnit.trim() || undefined : undefined,
+      manualValue: effectiveManualValue,
+      manualUnit: method !== "meter" ? manualUnit.trim() || "lít" : undefined,
+      manualMonthly: method !== "meter" ? existing?.manualMonthly : undefined,
       tons:
-        method === "manual"
+        method !== "meter"
           ? computeManualTons({
-              method: "manual",
-              manualValue: parsedManual,
+              method,
+              manualValue: effectiveManualValue,
               factorId,
               factorValue,
+              gases: selectedGroup?.gases ?? existing?.gases,
               multipliers: nextMultipliers,
+              formula,
             })
           : existing?.tons,
     };
@@ -424,7 +438,9 @@ export function GhgConfig({ projectId }: { projectId: string }) {
     setName(source.name);
     setMethod(source.method);
     setMeterPointId(source.meterPointId ?? "");
-    setManualValue(source.manualValue == null ? "" : String(source.manualValue));
+    setManualValue(
+      source.manualValue == null ? "" : formatAppNumber(source.manualValue, { maxDecimals: 6 }),
+    );
     setManualUnit(source.manualUnit ?? "lít");
     setFactorGroupId(groupIdFromFactor(source.factorId));
     setMultipliers(draftsFromMultipliers(source.multipliers));
@@ -606,28 +622,34 @@ export function GhgConfig({ projectId }: { projectId: string }) {
               </Field>
             ) : null}
 
-            {method === "manual" ? (
-              <Field label="GIÁ TRỊ THỦ CÔNG (KHỐI LƯỢNG / SỐ LIỆU)">
-                <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_140px]">
-                  <input
-                    value={manualValue}
-                    onChange={(e) => {
-                      setManualValue(e.target.value);
-                      if (formError) setFormError("");
-                    }}
-                    inputMode="decimal"
-                    placeholder="VD: 1200"
-                    className="input"
-                  />
-                  <input
-                    value={manualUnit}
-                    onChange={(e) => setManualUnit(e.target.value)}
-                    placeholder="Đơn vị (lít, kg...)"
-                    className="input"
-                  />
+            {method !== "meter" ? (
+              <Field label="ĐƠN VỊ ĐO CỐ ĐỊNH & GIÁ TRỊ MẶC ĐỊNH (TÙY CHỌN)">
+                <div className="grid gap-2 sm:grid-cols-[180px_minmax(0,1fr)]">
+                  <div>
+                    <input
+                      value={manualUnit}
+                      onChange={(e) => setManualUnit(e.target.value)}
+                      placeholder="Đơn vị (lít, kg, tấn, m³...)"
+                      className="input font-semibold text-slate-800"
+                      required
+                    />
+                  </div>
+                  <div>
+                    <input
+                      value={manualValue}
+                      onChange={(e) => {
+                        setManualValue(formatLiveNumberInput(e.target.value));
+                        if (formError) setFormError("");
+                      }}
+                      onBlur={(e) => setManualValue(formatAppNumberInput(e.target.value))}
+                      inputMode="decimal"
+                      placeholder="Giá trị mặc định (VD: 1 200) — có thể để trống"
+                      className="input"
+                    />
+                  </div>
                 </div>
                 <p className="mt-1.5 text-xs text-slate-500">
-                  Có thể nhập sẵn tại đây hoặc để trống — người dùng sẽ nhập số liệu trên trang Khí nhà kính của dự án.
+                  Đơn vị (ví dụ: lít, kg, tấn, m³) sẽ được cố định khi khách hàng nhập bảng số liệu 12 tháng hoặc import từ Excel trên trang Khí nhà kính.
                 </p>
               </Field>
             ) : null}
@@ -729,9 +751,18 @@ export function GhgConfig({ projectId }: { projectId: string }) {
                         <td className="px-2 py-2">
                           <input
                             value={row.value}
-                            onChange={(e) => updateMultiplier(row.id, { value: e.target.value })}
+                            onChange={(e) =>
+                              updateMultiplier(row.id, {
+                                value: formatLiveNumberInput(e.target.value),
+                              })
+                            }
+                            onBlur={(e) =>
+                              updateMultiplier(row.id, {
+                                value: formatAppNumberInput(e.target.value),
+                              })
+                            }
                             inputMode="decimal"
-                            placeholder="43.215"
+                            placeholder="43 215"
                             className="h-9 w-full rounded-lg border border-slate-200 px-2 font-mono text-sm outline-none focus:border-emerald-500"
                           />
                         </td>
@@ -767,7 +798,7 @@ export function GhgConfig({ projectId }: { projectId: string }) {
               </div>
             </div>
 
-            <Field label="NHẬP CÔNG THỨC TÍNH (KG CO₂E)">
+            <Field label="NHẬP CÔNG THỨC TÍNH (TẤN CO₂E)">
               <div className="overflow-hidden rounded-xl border border-slate-200 focus-within:border-emerald-500 focus-within:ring-2 focus-within:ring-emerald-500/15 transition-all">
                 <textarea
                   ref={formulaRef}
@@ -1015,11 +1046,13 @@ export function GhgConfig({ projectId }: { projectId: string }) {
                         </span>
                         <span>
                           <span className="block">{METHOD_LABEL[source.method]}</span>
-                          {source.method === "manual" ? (
+                          {source.method !== "meter" ? (
                             <span className="block text-[11px] text-slate-400">
                               {source.manualValue != null
-                                ? `${source.manualValue.toLocaleString("vi-VN")}${source.manualUnit ? ` ${source.manualUnit}` : ""}`
-                                : "Chưa nhập số liệu"}
+                                ? `${formatAppNumber(source.manualValue, { maxDecimals: 6 })}${source.manualUnit ? ` ${source.manualUnit}` : ""}`
+                                : source.manualUnit
+                                  ? `Đơn vị: ${source.manualUnit}`
+                                  : "Chưa nhập số liệu"}
                             </span>
                           ) : null}
                         </span>

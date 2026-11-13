@@ -6,6 +6,7 @@ import { ChartTimeline } from "@/components/client/ChartTimeline";
 import { ChartDataTable, type ChartViewMode } from "@/components/client/ChartViewToolbar";
 import { useChartSize } from "@/components/client/useChartSize";
 import { exportToExcel } from "@/lib/excel-export";
+import { formatAppNumber } from "@/lib/number-format";
 import {
   DEFAULT_TIME_FILTER,
   TimeFilterBar,
@@ -18,12 +19,12 @@ import {
 import { hydrateClientMeters, loadClientMeters, orderMetersByTree } from "@/lib/client-meters";
 import { loadProjectGatewayEnergySlots, type GatewayEnergySlot } from "@/lib/gateway-series";
 import {
-  civilWeekday,
   formatTariffPrice,
-  industrialBand,
   parseTariffPrice,
+  resolveElectricityRateAt,
   resolveTouPrices,
   voltageLevelById,
+  type SavedElectricityCostConfig,
   type TouPrices,
   type VoltageLevelId,
 } from "@/lib/industrial-electricity";
@@ -62,24 +63,27 @@ type CostBar = { key: string | number; label: string; light: number; dark: numbe
 type TouKwh = Record<Band, number>;
 type RateSource =
   | { kind: "flat"; price: number }
-  | { kind: "tou"; prices: TouPrices };
+  | { kind: "tou"; prices: TouPrices; costConfig?: SavedElectricityCostConfig };
 
 function formatVnd(n: number) {
-  return Math.round(n).toLocaleString("vi-VN");
+  return formatAppNumber(Math.round(n), { maxDecimals: 0 });
 }
 
 function formatKwh(n: number) {
-  return n.toLocaleString("vi-VN", { maximumFractionDigits: 3 });
+  return formatAppNumber(n, { maxDecimals: 3 });
 }
 
 function emptyKwh(): TouKwh {
   return { peak: 0, normal: 0, off: 0, none: 0 };
 }
 
-function rateAt(source: RateSource, parts: VietnamParts): { price: number; band: Band } {
+function rateAt(source: RateSource, parts: VietnamParts): { price: number; band: Band; label?: string } {
   if (source.kind === "flat") return { price: source.price, band: "normal" };
-  const band = industrialBand(civilWeekday(parts.year, parts.month, parts.day), parts.hour, parts.minute);
-  return { price: source.prices[band], band };
+  return resolveElectricityRateAt(source.costConfig ?? { electricity: { prices: {
+    normal: String(source.prices.normal),
+    off: String(source.prices.off),
+    peak: String(source.prices.peak),
+  } } }, parts);
 }
 
 function slotStoredAt(day: string, hour: number, minute: number) {
@@ -120,19 +124,56 @@ function costBarsFromSlots(filter: TimeFilterValue, slots: GatewayEnergySlot[], 
   const ordered = [...slots].sort(
     (a, b) => a.day.localeCompare(b.day) || a.hour - b.hour || a.minute - b.minute,
   );
-  // Chỉ tính ΔkWh (chỉ số tăng thêm). Không nhân cả chỉ số tích lũy EPaed.
+  // Chỉ tính ΔkWh (chỉ số tăng thêm). Xử lý cả trường hợp thay đồng hồ mới (meterId đổi hoặc chỉ số mới < chỉ số cũ).
   let previous: number | null = null;
+  let lastMeterId: string | undefined;
   let lastIndexKwh = 0;
-  for (const slot of ordered) {
+  for (let i = 0; i < ordered.length; i++) {
+    const slot = ordered[i];
     const startKwh = registerToKwh(slot.firstWh);
-    const endKwh = registerToKwh(slot.lastWh);
+    const rawEndKwh = registerToKwh(slot.lastWh);
+    const nextSlot = ordered[i + 1];
+    const nextStartKwh = nextSlot ? registerToKwh(nextSlot.firstWh) : NaN;
+    const endKwh =
+      rawEndKwh < startKwh - 1 &&
+      ordered
+        .slice(i + 1, i + 4)
+        .some((s) => registerToKwh(s.firstWh) >= startKwh - 1 || registerToKwh(s.lastWh) >= startKwh - 1)
+        ? Number.isFinite(nextStartKwh) && nextStartKwh >= startKwh && nextStartKwh - startKwh < 100
+          ? nextStartKwh
+          : startKwh
+        : rawEndKwh;
     const at = slotStoredAt(slot.day, slot.hour, slot.minute);
     const bucket = periodIndexForInstant(filter, at, bars.length);
     if (bucket >= 0) bars[bucket].light += 1;
+    if (previous != null && startKwh < previous - 1) {
+      const prevVal = previous;
+      const returnsToPrev =
+        endKwh >= prevVal - 1 ||
+        ordered.slice(i + 1, i + 4).some((s) => registerToKwh(s.lastWh) >= prevVal - 1);
+      if (returnsToPrev) {
+        const clampedStart = Math.max(prevVal, startKwh);
+        const clampedEnd = Math.max(clampedStart, endKwh);
+        const delta = Math.max(0, clampedEnd - prevVal);
+        if (delta > 0 && delta < 500) {
+          addSlotCost(filter, bars, tou, kwh, source, at, delta);
+        }
+        previous = Math.max(prevVal, endKwh);
+        lastIndexKwh = previous;
+        continue;
+      }
+    }
+    if (
+      previous != null &&
+      ((slot.meterId && lastMeterId && slot.meterId !== lastMeterId) || startKwh < previous)
+    ) {
+      previous = startKwh;
+    }
     const within = Math.max(0, endKwh - startKwh);
     const gap = previous == null ? 0 : Math.max(0, startKwh - previous);
     addSlotCost(filter, bars, tou, kwh, source, at, within + gap);
     previous = endKwh;
+    if (slot.meterId) lastMeterId = slot.meterId;
     lastIndexKwh = endKwh;
   }
   return {
@@ -167,7 +208,10 @@ export function CostCharts() {
   const projectId = params?.id ?? "default";
   const [energyKinds, setEnergyKinds] = useState<MeterType[]>(() => resolveMeterTypes(null));
   const [energy, setEnergy] = useState<string>("Điện");
-  const [timeFilter, setTimeFilter] = useState<TimeFilterValue>(DEFAULT_TIME_FILTER);
+  const [timeFilter, setTimeFilter] = useState<TimeFilterValue>(() => ({
+    ...DEFAULT_TIME_FILTER,
+    mode: "day",
+  }));
   const [allPoints, setAllPoints] = useState<CostPoint[]>([]);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [view, setView] = useState<ChartViewMode>("chart");
@@ -177,6 +221,7 @@ export function CostCharts() {
   const [slots, setSlots] = useState<GatewayEnergySlot[]>([]);
   const [voltageLevel, setVoltageLevel] = useState<VoltageLevelId>("kv-under-6");
   const [touPrices, setTouPrices] = useState<TouPrices>(() => resolveTouPrices("kv-under-6").prices);
+  const [savedCostConfig, setSavedCostConfig] = useState<SavedElectricityCostConfig | undefined>(undefined);
   const [flatPrices, setFlatPrices] = useState<Record<string, number>>({});
   const [reloadKey, setReloadKey] = useState(0);
   const [pointsOpen, setPointsOpen] = useState(false);
@@ -184,12 +229,27 @@ export function CostCharts() {
   const monthAligned = useRef(false);
   const filterTouched = useRef(false);
   const selectionTouched = useRef(false);
+  const lastFilterKeyRef = useRef<string>("");
 
   useEffect(() => {
     monthAligned.current = false;
     filterTouched.current = false;
     selectionTouched.current = false;
   }, [projectId]);
+
+  useEffect(() => {
+    const tick = () => {
+      if (document.visibilityState === "visible") {
+        setReloadKey((value) => value + 1);
+      }
+    };
+    const timer = window.setInterval(tick, 15_000);
+    document.addEventListener("visibilitychange", tick);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", tick);
+    };
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -200,13 +260,10 @@ export function CostCharts() {
         hydrateProjectSettings(projectId),
       ]).then(([projects, meterRows, settings]) => {
         if (!active) return;
-        const saved = settings.costConfig as {
+        const saved = settings.costConfig as (SavedElectricityCostConfig & {
           flatPrices?: Record<string, string>;
-          electricity?: {
-            voltageLevel?: string;
-            prices?: Partial<Record<"normal" | "off" | "peak", string>>;
-          };
-        } | undefined;
+        }) | undefined;
+        setSavedCostConfig(saved);
         const tariff = resolveTouPrices(saved?.electricity?.voltageLevel, saved?.electricity?.prices);
         setVoltageLevel(tariff.levelId);
         setTouPrices(tariff.prices);
@@ -245,48 +302,40 @@ export function CostCharts() {
 
   useEffect(() => {
     const span = timeFilterSpan(timeFilter);
+    const filterKey = `${projectId}:${timeFilter.mode}:${span.from}:${span.to}`;
+    const isSameFilter = lastFilterKeyRef.current === filterKey;
+    lastFilterKeyRef.current = filterKey;
     let active = true;
     void loadProjectGatewayEnergySlots(projectId, span.from, span.to).then((summary) => {
       if (!active) return;
-      setSlots(summary.slots);
+      setSlots((prev) =>
+        isSameFilter && summary.slots.length === 0 && prev.length > 0 ? prev : summary.slots,
+      );
       if (filterTouched.current) return;
-      const days = [...new Set(summary.slots.map((slot) => slot.day))].sort();
-      if (days.length > 0) {
-        if (monthAligned.current) return;
+      if (summary.slots.length > 0) {
         monthAligned.current = true;
-        const first = days[0];
-        const last = days[days.length - 1];
-        setTimeFilter((current) =>
-          current.mode === "custom_date" &&
-          current.customDateMode === "range" &&
-          current.startDate.slice(0, 10) === first &&
-          current.endDate.slice(0, 10) === last
-            ? current
-            : {
-                ...current,
-                mode: "custom_date",
-                customDateMode: "range",
-                startDate: `${first}T00:00`,
-                endDate: `${last}T23:59`,
-                date: last,
-                month: last.slice(0, 7),
-                year: Number(last.slice(0, 4)),
-              },
-        );
         return;
       }
       if (monthAligned.current || !summary.latest) return;
       const parts = vietnamFromStored(summary.latest.at);
-      if (!parts || (timeFilter.mode === "month" && timeFilter.month === parts.monthKey)) {
-        monthAligned.current = true;
-        return;
+      monthAligned.current = true;
+      if (!parts) return;
+      if (timeFilter.mode === "day" && timeFilter.date !== parts.date) {
+        setTimeFilter((current) => ({
+          ...current,
+          mode: "day",
+          date: parts.date,
+          month: parts.monthKey,
+          year: parts.year,
+        }));
+      } else if (timeFilter.mode === "month" && timeFilter.month !== parts.monthKey) {
+        setTimeFilter((current) => ({ ...current, mode: "month", month: parts.monthKey, year: parts.year }));
       }
-      setTimeFilter((current) => ({ ...current, mode: "month", month: parts.monthKey, year: parts.year }));
     });
     return () => {
       active = false;
     };
-  }, [projectId, timeFilter]);
+  }, [projectId, timeFilter, reloadKey]);
 
   const pointsForEnergy = useMemo(
     () => allPoints.filter((p) => p.energy === energy),
@@ -323,9 +372,9 @@ export function CostCharts() {
   );
 
   const rateSource = useMemo<RateSource>(() => {
-    if (energy === "Điện") return { kind: "tou", prices: touPrices };
+    if (energy === "Điện") return { kind: "tou", prices: touPrices, costConfig: savedCostConfig };
     return { kind: "flat", price: flatPrices[energy] ?? 0 };
-  }, [energy, flatPrices, touPrices]);
+  }, [energy, flatPrices, savedCostConfig, touPrices]);
 
   const series = useMemo(
     () =>
@@ -718,8 +767,8 @@ export function CostCharts() {
             )}
           </article>
 
-          <div className="grid w-full min-w-0 gap-4 md:grid-cols-2">
-            <article className="rounded-lg border border-slate-200 bg-white p-4 shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
+          <div className="grid w-full min-w-0 grid-cols-1 gap-4 md:grid-cols-2">
+            <article className="min-w-0 rounded-lg border border-slate-200 bg-white p-4 shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
               <h2 className="text-center text-[13px] font-bold tracking-wide text-slate-700">
                 TỔNG HỢP CHI PHÍ THEO ĐIỂM ĐO
               </h2>
@@ -751,7 +800,7 @@ export function CostCharts() {
             </article>
 
             {energy === "Điện" ? (
-              <article className="rounded-lg border border-slate-200 bg-white p-4 shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
+              <article className="min-w-0 rounded-lg border border-slate-200 bg-white p-4 shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
                 <h2 className="text-center text-[13px] font-bold tracking-wide text-slate-700">
                   TIỀN ĐIỆN THEO KHUNG GIỜ
                 </h2>
@@ -848,7 +897,9 @@ function MultiCostBarChart({
   const groupW = innerW / visibleLen;
   const barCount = Math.max(series.length, 1);
   const barW = Math.max(4, groupW / (barCount + 0.8));
-  const labelStep = Math.max(1, Math.ceil(visibleLen / 12));
+  const maxLabels = Math.max(3, Math.floor(innerW / 46));
+  const labelStep = Math.max(1, Math.ceil(visibleLen / maxLabels));
+  const lastStepIdx = Math.floor(Math.max(0, visibleLen - 1) / labelStep) * labelStep;
   const tickCount = 5;
   const ticks = Array.from({ length: tickCount + 1 }, (_, i) => (yMax * i) / tickCount);
 
@@ -869,7 +920,7 @@ function MultiCostBarChart({
           <g key={v}>
             <line x1={pad.l} x2={W - pad.r} y1={y} y2={y} stroke="#eceff3" />
             <text x={pad.l - 8} y={y + 4} textAnchor="end" className="fill-slate-400" fontSize="11">
-              {v === 0 ? "0" : v.toLocaleString("vi-VN")}
+              {v === 0 ? "0" : formatAppNumber(v, { maxDecimals: 0 })}
             </text>
           </g>
         );
@@ -932,13 +983,14 @@ function MultiCostBarChart({
               }
               return null;
             })}
-            {i % labelStep === 0 || i === base.length - 1 ? (
+            {i % labelStep === 0 ||
+            (i === base.length - 1 && innerW >= 90 && (base.length - 1 - lastStepIdx) * groupW >= 42) ? (
               <text
                 x={gx + groupW / 2}
                 y={H - 10}
                 textAnchor="middle"
                 className="fill-slate-500"
-                fontSize="11"
+                fontSize={W < 420 ? "10" : "11"}
               >
                 {bar.label}
               </text>

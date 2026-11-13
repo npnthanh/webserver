@@ -11,22 +11,21 @@ export type MeterParameter = {
 };
 
 /**
- * Gateway PM2230 gửi điện năng tác dụng bằng kWh (ví dụ 3.991).
- * Bản ghi cũ lưu Wh nguyên từ 1000 trở lên (3991 Wh = 3.991 kWh).
+ * Gateway PM2230 gửi điện năng bằng kWh / kVARh / kVAh (ví dụ 1251.979, 1252.0).
+ * Giữ nguyên giá trị số thực từ thanh ghi (không chia 1000 khi gặp số nguyên chẵn như 1252.0 -> 1252).
  */
 export function registerToKwh(value: number) {
   if (!Number.isFinite(value)) return 0;
-  if (Number.isInteger(value) && Math.abs(value) >= 1000) return value / 1000;
   return value;
 }
 
 export const METER_PARAMETERS: MeterParameter[] = [
-  { id: 1, group: "Điện năng 2 chiều", chart: "energy", name: "Điện năng tác dụng nhận", unit: "Wh", key: "EPaed" },
-  { id: 2, group: "Điện năng 2 chiều", chart: "energy", name: "Điện năng tác dụng phát", unit: "Wh", key: "EPaer" },
-  { id: 3, group: "Điện năng 2 chiều", chart: "energy", name: "Điện năng phản kháng nhận", unit: "VARh", key: "EQred" },
-  { id: 4, group: "Điện năng 2 chiều", chart: "energy", name: "Điện năng phản kháng phát", unit: "VARh", key: "EQrer" },
-  { id: 5, group: "Điện năng 2 chiều", chart: "energy", name: "Điện năng biểu kiến tiêu thụ", unit: "VAh", key: "ESaed" },
-  { id: 6, group: "Điện năng 2 chiều", chart: "energy", name: "Điện năng biểu kiến phát", unit: "VAh", key: "ESaer" },
+  { id: 1, group: "Điện năng 2 chiều", chart: "energy", name: "Điện năng tác dụng nhận", unit: "kWh", key: "EPaed" },
+  { id: 2, group: "Điện năng 2 chiều", chart: "energy", name: "Điện năng tác dụng phát", unit: "kWh", key: "EPaer" },
+  { id: 3, group: "Điện năng 2 chiều", chart: "energy", name: "Điện năng phản kháng nhận", unit: "kVARh", key: "EQred" },
+  { id: 4, group: "Điện năng 2 chiều", chart: "energy", name: "Điện năng phản kháng phát", unit: "kVARh", key: "EQrer" },
+  { id: 5, group: "Điện năng 2 chiều", chart: "energy", name: "Điện năng biểu kiến tiêu thụ", unit: "kVAh", key: "ESaed" },
+  { id: 6, group: "Điện năng 2 chiều", chart: "energy", name: "Điện năng biểu kiến phát", unit: "kVAh", key: "ESaer" },
 
   { id: 7, group: "Công suất tức thời", chart: "power", name: "Công suất tác dụng pha A", unit: "kW", key: "Papa" },
   { id: 8, group: "Công suất tức thời", chart: "power", name: "Công suất tác dụng pha B", unit: "kW", key: "Papb" },
