@@ -60,7 +60,7 @@ const ENERGY_KIND_META: Record<string, "bolt" | "heat" | "air" | "water" | "stea
 };
 
 const METRICS: { id: MetricId; label: string }[] = [
-  { id: "energy", label: "Energy" },
+  { id: "energy", label: "Điện năng" },
   { id: "ui", label: "U / I" },
   { id: "freq", label: "Tần số" },
   { id: "power", label: "Công suất" },

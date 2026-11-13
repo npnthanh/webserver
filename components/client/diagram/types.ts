@@ -48,6 +48,10 @@ export type SourceNodeData = {
   normalCount: number;
   warningCount: number;
   offlineCount: number;
+  /** Chiều rộng thanh cái (px) để trải hết các nhánh lộ ra cấp 1. */
+  busWidth?: number;
+  /** Vị trí (px, tính từ mép trái thanh cái) của từng nhánh lộ ra: mỗi nhánh có handle riêng để thả thẳng xuống. */
+  feeders?: { id: string; x: number }[];
 };
 
 export type MeterFlowNode = Node<MeterNodeData, "meter">;

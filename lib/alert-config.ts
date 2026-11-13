@@ -74,7 +74,7 @@ export type AlertConfig = {
 };
 
 export const DEFAULT_USER_ALERT_CATEGORIES: UserAlertCategoryTab[] = [
-  { id: "energy", label: "Energy" },
+  { id: "energy", label: "Điện năng" },
   { id: "ui", label: "U/I" },
   { id: "frequency", label: "Tần số" },
   { id: "power", label: "Công suất" },
@@ -428,7 +428,7 @@ export function cloneDefaultRulesByGroup(): Record<string, UserAlertRule[]> {
 
 function mapTagToCategory(tag: string): UserAlertCategoryTab {
   const normalized = tag.trim().toLowerCase();
-  if (normalized === "energy" || normalized === "điện năng") return { id: "energy", label: "Energy" };
+  if (normalized === "energy" || normalized === "điện năng") return { id: "energy", label: "Điện năng" };
   if (normalized === "u/i" || normalized === "ui") return { id: "ui", label: "U/I" };
   if (normalized === "tần số" || normalized === "frequency") return { id: "frequency", label: "Tần số" };
   if (normalized === "công suất" || normalized === "power") return { id: "power", label: "Công suất" };

@@ -81,7 +81,7 @@ type Category = {
 };
 
 const presetCategories: Category[] = [
-  { id: "energy", label: "Energy", icon: BoltIcon },
+  { id: "energy", label: "Điện năng", icon: BoltIcon },
   { id: "ui", label: "U/I", icon: GaugeIcon },
   { id: "frequency", label: "Tần số", icon: WaveIcon },
   { id: "power", label: "Công suất", icon: PowerIcon },

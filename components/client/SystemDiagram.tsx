@@ -69,7 +69,9 @@ const nodeTypes: NodeTypes = {
   source: SourceNode,
 };
 
-const edgeStyle = { stroke: "#059669", strokeWidth: 2.5 };
+/** Dây dẫn sơ đồ đơn tuyến: vàng khi có dữ liệu, xám nét đứt khi mất kết nối. */
+const edgeStyle = { stroke: "#facc15", strokeWidth: 3 };
+const offlineEdgeStyle = { stroke: "#475569", strokeWidth: 3, strokeDasharray: "5 4" };
 
 const SOURCE_NODE_ID = "__grid_source__";
 const SOURCE_W = 440;
@@ -329,10 +331,10 @@ function buildFlowFromMeters(
         target: child.id,
         targetHandle: "parent",
         type: "step",
-        animated: childOnline,
+        animated: false,
         style: childOnline
           ? edgeStyle
-          : { stroke: "#94a3b8", strokeWidth: 2, strokeDasharray: "4 3" },
+          : offlineEdgeStyle,
       });
       cursor += w + H_GAP;
     }
@@ -342,14 +344,27 @@ function buildFlowFromMeters(
   if (roots.length) {
     const totalRootsW =
       roots.reduce((sum, r) => sum + subtreeWidth(r.id), 0) + (roots.length - 1) * H_GAP;
-    const busCenterX = 80 + Math.max(totalRootsW, SOURCE_W) / 2;
+    const busWidth = Math.max(totalRootsW + 80, SOURCE_W);
+    const busCenterX = 80 + busWidth / 2;
+    const busLeft = busCenterX - busWidth / 2;
+
+    // Mỗi nhánh cấp 1 thả thẳng từ thanh cái xuống đúng vị trí của nó.
+    const feeders: { id: string; x: number }[] = [];
+    {
+      let feederCursor = busCenterX - totalRootsW / 2;
+      for (const root of roots) {
+        const w = subtreeWidth(root.id);
+        feeders.push({ id: root.id, x: feederCursor + w / 2 - busLeft });
+        feederCursor += w + H_GAP;
+      }
+    }
 
     nodes.push({
       id: SOURCE_NODE_ID,
       type: "source",
-      position: { x: busCenterX - SOURCE_W / 2, y: 16 },
-      data: buildSourceNodeData(projectName, energy, meters, displays, liveById),
-      draggable: true,
+      position: { x: busLeft, y: 16 },
+      data: { ...buildSourceNodeData(projectName, energy, meters, displays, liveById), busWidth, feeders },
+      draggable: false,
       selectable: false,
     });
 
@@ -363,14 +378,14 @@ function buildFlowFromMeters(
       edges.push({
         id: `e-bus-${root.id}`,
         source: SOURCE_NODE_ID,
-        sourceHandle: "bus-out",
+        sourceHandle: `bus-${root.id}`,
         target: root.id,
         targetHandle: "parent",
         type: "step",
-        animated: rootOnline,
+        animated: false,
         style: rootOnline
           ? edgeStyle
-          : { stroke: "#94a3b8", strokeWidth: 2, strokeDasharray: "4 3" },
+          : offlineEdgeStyle,
       });
       cursor += w + H_GAP;
     }
@@ -506,7 +521,8 @@ function SystemDiagramInner() {
     const hasSavedSource = Boolean(savedPositions[SOURCE_NODE_ID]);
 
     const restoredNodes: DiagramNode[] = built.nodes.map((node) => {
-      const savedPos = savedPositions[node.id];
+      // Thanh cái tổng luôn theo bố cục tự động để các nhánh thả thẳng xuống đúng điểm đấu.
+      const savedPos = node.type === "source" ? undefined : savedPositions[node.id];
       if (!savedPos) {
         return {
           ...node,
@@ -555,9 +571,14 @@ function SystemDiagramInner() {
     setNodes((current) =>
       current.map((item) => {
         if (item.type === "source") {
+          const prev = item.data as SourceNodeData;
           return {
             ...item,
-            data: buildSourceNodeData(projectName, energy, filtered, displays, liveById),
+            data: {
+              ...buildSourceNodeData(projectName, energy, filtered, displays, liveById),
+              busWidth: prev.busWidth,
+              feeders: prev.feeders,
+            },
           };
         }
         if (item.type !== "meter") return item;
@@ -580,10 +601,10 @@ function SystemDiagramInner() {
         const targetOnline = isSampleOnline(liveById[edge.target]?.at);
         return {
           ...edge,
-          animated: targetOnline,
+          animated: false,
           style: targetOnline
             ? edgeStyle
-            : { stroke: "#94a3b8", strokeWidth: 2, strokeDasharray: "4 3" },
+            : offlineEdgeStyle,
         };
       }),
     );
@@ -869,7 +890,10 @@ function SystemDiagramInner() {
           <div ref={wrapperRef} className="relative flex min-h-0 flex-1">
             <div className="relative min-h-0 min-w-0 flex-1">
               <ReactFlow
-                className="diagram-flow bg-[#f8fafc]"
+                className="diagram-flow"
+                // Đặt nền qua style: CSS gốc của React Flow (không thuộc layer Tailwind) đè lên class bg-*.
+                style={{ backgroundColor: "#0b1220" }}
+                colorMode="dark"
                 nodes={nodes}
                 edges={edges}
                 nodeTypes={nodeTypes}
@@ -904,7 +928,7 @@ function SystemDiagramInner() {
                 maxZoom={2.0}
                 proOptions={{ hideAttribution: true }}
               >
-                <Background gap={24} size={1} color="#cbd5e1" />
+                <Background gap={24} size={1} color="#334155" bgColor="#0b1220" />
 
                 {savedNotice && (
                   <Panel position="top-right" className="m-2 sm:m-3">
@@ -917,11 +941,27 @@ function SystemDiagramInner() {
 
                 <Panel
                   position="top-center"
-                  className="m-2 max-w-[calc(100vw-24px)] rounded-xl border border-slate-200/80 bg-white/95 px-3 py-1.5 text-xs font-semibold text-slate-800 shadow-xs backdrop-blur-sm sm:m-3 sm:px-5 sm:py-3 sm:text-sm"
+                  className="m-2 max-w-[calc(100vw-24px)] rounded-md border border-slate-600 bg-[#0b1220]/95 px-3 py-1.5 font-mono text-xs font-bold text-[#4ade80] sm:m-3 sm:px-4 sm:py-2 sm:text-sm"
                 >
                   <p className="flex items-center gap-2 truncate">
-                    <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500" />
-                    <span className="truncate">Sơ đồ hệ thống {projectName}</span>
+                    <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[#4ade80]" />
+                    <span className="truncate">SƠ ĐỒ ĐƠN TUYẾN · {projectName.toUpperCase()}</span>
+                  </p>
+                </Panel>
+
+                <Panel
+                  position="bottom-left"
+                  className="m-2 rounded-md border border-slate-700 bg-[#0b1220]/90 px-2.5 py-1.5 font-mono text-[10px] text-slate-300 sm:m-3"
+                >
+                  <p className="flex items-center gap-1.5">
+                    <span className="inline-block h-2.5 w-2.5 rounded-[1px] bg-[#ef4444]" /> Máy cắt đóng (có dữ liệu)
+                  </p>
+                  <p className="mt-0.5 flex items-center gap-1.5">
+                    <span className="inline-block h-2.5 w-2.5 rounded-[1px] bg-[#22c55e]" /> Máy cắt cắt / mất kết nối
+                  </p>
+                  <p className="mt-0.5 flex items-center gap-1.5">
+                    <span className="inline-block h-[3px] w-3 bg-[#facc15]" /> Dây có điện ·{" "}
+                    <span className="inline-block h-[3px] w-3 border-t-2 border-dashed border-slate-500" /> Mất kết nối
                   </p>
                 </Panel>
 

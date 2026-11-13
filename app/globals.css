@@ -34,7 +34,7 @@ body {
 
 .diagram-flow .react-flow__edge.selected .react-flow__edge-path,
 .diagram-flow .react-flow__edge:focus .react-flow__edge-path {
-  stroke: #059669;
+  stroke: #fde047;
 }
 
 .diagram-flow .react-flow__attribution {

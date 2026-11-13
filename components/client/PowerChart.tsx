@@ -115,7 +115,6 @@ export function PowerChart({
         }
       />
 
-      <PowerFactorChart samples={samples} onRefresh={onRefresh} />
     </div>
   );
 }
