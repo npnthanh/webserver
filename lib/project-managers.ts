@@ -18,5 +18,6 @@ export async function saveProjectManagers(projectId: string, accountIds: string[
     body: JSON.stringify({ projectId, accountIds }),
   });
   emitDbChange("accounts");
+  emitDbChange("projects");
   return saved;
 }

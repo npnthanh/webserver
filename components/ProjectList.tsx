@@ -5,16 +5,8 @@ import { CustomSelect } from "@/components/ui/CustomSelect";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useAuth } from "@/components/auth/useAuth";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
-import {
-  customerPassword,
-  ensureCustomerAccount,
-  getPrimaryCustomerAccount,
-  hydrateCustomerAccounts,
-  loadCustomerAccounts,
-  type CustomerAccount,
-} from "@/lib/customer-accounts";
+import { customerPassword, ensureCustomerAccount, hydrateCustomerAccounts } from "@/lib/customer-accounts";
 import { canAccessAdminProject, hasPermission } from "@/lib/permissions";
-import { formatAppNumber } from "@/lib/number-format";
 import {
   emptyTelemetry,
   loadProjectsTelemetry,
@@ -50,10 +42,10 @@ export function ProjectList() {
   const canManageProjects = hasPermission(session, "manageProjects");
   const canManageDevices = hasPermission(session, "manageDevices");
   const [items, setItems] = useState<Project[]>([]);
-  const [customerAccounts, setCustomerAccounts] = useState<CustomerAccount[]>([]);
   const [telemetry, setTelemetry] = useState<Record<string, ProjectTelemetry>>({});
   const [searchQuery, setSearchQuery] = useState("");
-  const [customer, setCustomer] = useState("all");
+  /** "all" | "none" (chưa phân công) | id tài khoản Manage. */
+  const [technician, setTechnician] = useState("all");
   const [status, setStatus] = useState<"all" | ProjectStatus>("all");
   const [page, setPage] = useState(1);
   const [copiedId, setCopiedId] = useState("");
@@ -69,71 +61,46 @@ export function ProjectList() {
       .catch(() => {
         if (active) setItems(loadProjects());
       });
-    void hydrateCustomerAccounts()
-      .then((accounts) => {
-        if (active) setCustomerAccounts(accounts);
-      })
-      .catch(() => {
-        if (active) setCustomerAccounts(loadCustomerAccounts());
-      });
+    // Nạp sẵn tài khoản khách hàng để nút "Sao chép thông tin đăng nhập" dùng đúng tài khoản đã có
+    // (ensureCustomerAccount sẽ tạo tài khoản mặc định nếu bộ nhớ đệm còn trống).
+    void hydrateCustomerAccounts().catch(() => undefined);
     void loadProjectsTelemetry().then((rows) => {
       if (active) setTelemetry(rows);
     });
-    const onCustomerAccountsChanged = () => {
-      if (active) setCustomerAccounts(loadCustomerAccounts());
-    };
-    window.addEventListener("ems-customer-accounts-changed", onCustomerAccountsChanged);
     return () => {
       active = false;
-      window.removeEventListener("ems-customer-accounts-changed", onCustomerAccountsChanged);
     };
   }, []);
-
-  const loadBarMax = useMemo(() => {
-    const values = Object.values(telemetry).map((item) => item.loadKw).filter((v) => v > 0);
-    if (!values.length) return 100;
-    return Math.max(...values) * 1.15;
-  }, [telemetry]);
 
   const accessibleItems = useMemo(() => {
     if (!session || session.portal !== "admin") return items;
     return items.filter((p) => canAccessAdminProject(session, p.id));
   }, [items, session]);
 
-  const adminAccountsByProject = useMemo(() => {
-    const map = new Map<string, CustomerAccount>();
-    for (const p of accessibleItems) {
-      map.set(p.id, getPrimaryCustomerAccount(p, customerAccounts));
-    }
-    return map;
-  }, [accessibleItems, customerAccounts]);
-
-  const customers = useMemo(
-    () =>
-      Array.from(
-        new Set(
-          accessibleItems.map((p) => adminAccountsByProject.get(p.id)?.username ?? p.id.toLowerCase()),
-        ),
-      ).sort(),
-    [accessibleItems, adminAccountsByProject],
-  );
+  /** Danh sách kỹ thuật phụ trách (tài khoản Manage) xuất hiện trong các dự án, dùng cho bộ lọc. */
+  const technicians = useMemo(() => {
+    const byId = new Map<string, string>();
+    for (const p of accessibleItems) for (const m of p.managers ?? []) byId.set(m.id, m.username);
+    return [...byId.entries()].sort((a, b) => a[1].localeCompare(b[1], "vi"));
+  }, [accessibleItems]);
 
   const filtered = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     return accessibleItems.filter((p) => {
-      const adminAcc = adminAccountsByProject.get(p.id);
-      const matchCustomer = customer === "all" || adminAcc?.username === customer;
+      const managers = p.managers ?? [];
+      const matchTechnician =
+        technician === "all" ||
+        (technician === "none" ? managers.length === 0 : managers.some((m) => m.id === technician));
       const matchStatus = status === "all" || p.status === status;
       const matchSearch =
         !q ||
         p.name.toLowerCase().includes(q) ||
         p.id.toLowerCase().includes(q) ||
         p.customer.toLowerCase().includes(q) ||
-        (adminAcc?.username.toLowerCase().includes(q) ?? false) ||
-        (adminAcc?.email.toLowerCase().includes(q) ?? false);
-      return matchCustomer && matchStatus && matchSearch;
+        managers.some((m) => m.username.toLowerCase().includes(q) || m.email.toLowerCase().includes(q));
+      return matchTechnician && matchStatus && matchSearch;
     });
-  }, [customer, status, searchQuery, accessibleItems, adminAccountsByProject]);
+  }, [technician, status, searchQuery, accessibleItems]);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const currentPage = Math.min(page, totalPages);
@@ -205,16 +172,17 @@ export function ProjectList() {
               />
             </div>
 
-            {/* Customer Admin Account Filter */}
+            {/* Lọc theo kỹ thuật phụ trách */}
             <FilterSelect
-              value={customer}
+              value={technician}
               onChange={(v) => {
-                setCustomer(v);
+                setTechnician(v);
                 setPage(1);
               }}
               options={[
-                { value: "all", label: "Tất cả tài khoản quản lý" },
-                ...customers.map((c) => ({ value: c, label: c })),
+                { value: "all", label: "Tất cả kỹ thuật phụ trách" },
+                ...technicians.map(([id, name]) => ({ value: id, label: name })),
+                { value: "none", label: "Chưa phân công" },
               ]}
             />
 
@@ -241,13 +209,11 @@ export function ProjectList() {
 
         {/* Project Table */}
         <div className="overflow-x-auto">
-          <table className="w-full min-w-[950px] text-left text-xs">
+          <table className="w-full min-w-[760px] text-left text-xs">
             <thead>
               <tr className="border-b border-slate-100 bg-slate-50/80 text-[11px] font-semibold tracking-wider text-slate-400 uppercase">
                 <th className="px-5 py-3.5">Cơ sở / Dự án</th>
-                <th className="px-5 py-3.5">Tài khoản quản lý</th>
-                <th className="px-5 py-3.5">Phụ tải hiện tại (kW)</th>
-                <th className="px-5 py-3.5">Phát thải / ngày</th>
+                <th className="px-5 py-3.5">Kỹ thuật phụ trách</th>
                 <th className="px-5 py-3.5">Hạ tầng đo</th>
                 <th className="px-5 py-3.5">Trạng thái</th>
                 <th className="px-5 py-3.5 text-right">Điều hành</th>
@@ -256,7 +222,7 @@ export function ProjectList() {
             <tbody className="divide-y divide-slate-100">
               {rows.length === 0 ? (
                 <tr>
-                  <td colSpan={7} className="px-5 py-14 text-center text-slate-400">
+                  <td colSpan={5} className="px-5 py-14 text-center text-slate-400">
                     Không tìm thấy dự án nào phù hợp với bộ lọc tìm kiếm.
                   </td>
                 </tr>
@@ -313,32 +279,31 @@ export function ProjectList() {
                         </div>
                       </td>
 
-                      {/* Customer Admin Account */}
+                      {/* Kỹ thuật phụ trách: tên + email các tài khoản Manage được giao */}
                       <td className="px-5 py-4">
                         {(() => {
-                          const adminAcc =
-                            adminAccountsByProject.get(project.id) ??
-                            getPrimaryCustomerAccount(project, customerAccounts);
+                          const managers = project.managers ?? [];
                           return (
                             <div className="flex items-center gap-2.5">
-                              <div className="min-w-0">
-                                <div className="flex items-center gap-1.5">
-                                  <span className="font-mono text-xs font-bold text-slate-800">
-                                    {adminAcc.username}
-                                  </span>
-                                  <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700 border border-emerald-200/70">
-                                    Admin
-                                  </span>
-                                </div>
-                                <span className="block font-mono text-[11px] text-slate-400 truncate max-w-[200px]">
-                                  {adminAcc.email}
-                                </span>
+                              <div className="min-w-0 space-y-1">
+                                {managers.length === 0 ? (
+                                  <span className="text-[11px] italic text-slate-400">Chưa phân công</span>
+                                ) : (
+                                  managers.map((m) => (
+                                    <div key={m.id} className="min-w-0">
+                                      <span className="block text-xs font-bold text-slate-800">{m.username}</span>
+                                      <span className="block font-mono text-[11px] text-slate-400 truncate max-w-[220px]">
+                                        {m.email}
+                                      </span>
+                                    </div>
+                                  ))
+                                )}
                               </div>
                               <button
                                 type="button"
                                 onClick={() => copyCustomerInvite(project, setCopiedId)}
                                 className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-400 hover:border-emerald-200 hover:bg-emerald-50 hover:text-emerald-700 transition-colors"
-                                title="Sao chép thông tin đăng nhập tài khoản Admin khách hàng"
+                                title="Sao chép link dự án và tài khoản đăng nhập của khách hàng"
                               >
                                 <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
                                   <rect width="14" height="14" x="8" y="8" rx="2" ry="2" />
@@ -348,47 +313,6 @@ export function ProjectList() {
                             </div>
                           );
                         })()}
-                      </td>
-
-                      {/* Load Demand */}
-                      <td className="px-5 py-4">
-                        <div className="flex items-center gap-2">
-                          <span className="font-mono font-bold text-slate-900">
-                            {telem.hasGatewayData
-                              ? formatAppNumber(telem.loadKw, {
-                                  maxDecimals: telem.loadKw >= 100 ? 0 : 1,
-                                })
-                              : "—"}
-                          </span>
-                          {telem.hasGatewayData ? (
-                            <span className="text-[10px] text-slate-400">kW</span>
-                          ) : null}
-                        </div>
-                        <div className="mt-1 h-1.5 w-24 rounded-full bg-slate-100 overflow-hidden">
-                          <div
-                            className="h-full rounded-full bg-emerald-500"
-                            style={{
-                              width: `${telem.hasGatewayData ? Math.min(100, (telem.loadKw / loadBarMax) * 100) : 0}%`,
-                            }}
-                          />
-                        </div>
-                      </td>
-
-                      {/* CO2 Emissions */}
-                      <td className="px-5 py-4">
-                        <span className="font-mono font-semibold text-slate-800">
-                          {telem.co2Day > 0
-                            ? formatAppNumber(telem.co2Day, {
-                                maxDecimals: 2,
-                                minDecimals: 0,
-                              })
-                            : "—"}
-                        </span>
-                        {telem.co2Day > 0 ? (
-                          <span className="text-[10px] text-slate-400 ml-1">tCO₂e</span>
-                        ) : (
-                          <span className="block text-[10px] text-slate-400">Chưa cấu hình GHG</span>
-                        )}
                       </td>
 
                       {/* Meters status */}

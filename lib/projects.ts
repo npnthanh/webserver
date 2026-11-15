@@ -30,6 +30,8 @@ export type Project = {
   logoUrl?: string;
   meterTypes?: MeterType[];
   recipients?: AlertRecipient[];
+  /** Kỹ thuật phụ trách: các tài khoản Manage được giao dự án (chỉ đọc, server trả về). */
+  managers?: { id: string; username: string; email: string }[];
 };
 
 export function resolveMeterTypes(project?: Pick<Project, "meterTypes"> | null): MeterType[] {

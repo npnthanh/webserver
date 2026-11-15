@@ -620,6 +620,25 @@ async function getProjects(projectId?: string, allowedProjectIds?: string[]) {
       ORDER BY project_id, id`,
     ids,
   );
+  // Kỹ thuật phụ trách = các tài khoản Manage được giao dự án (Admin xem mọi dự án nên không liệt kê).
+  await ensureAccountProjectsSchema();
+  const managerRows = await queryRows<Row>(
+    `SELECT ap.project_id AS projectId, a.id, a.username, a.email, a.role
+       FROM account_projects ap
+       JOIN accounts a ON a.id = ap.account_id
+      WHERE ap.project_id IN (${placeholders})
+      ORDER BY a.username, a.id`,
+    ids,
+  );
+  const managersByProject = new Map<string, Row[]>();
+  for (const row of managerRows) {
+    if (normalizeAccountRole(asString(row.role)) !== "Manage") continue;
+    const id = asString(row.projectId);
+    managersByProject.set(id, [
+      ...(managersByProject.get(id) ?? []),
+      { id: asString(row.id), username: asString(row.username), email: asString(row.email) },
+    ]);
+  }
   const typesByProject = new Map<string, string[]>();
   const recipientsByProject = new Map<string, Row[]>();
   for (const row of types) {
@@ -639,6 +658,7 @@ async function getProjects(projectId?: string, allowedProjectIds?: string[]) {
     ...project,
     meterTypes: typesByProject.get(project.id as string) ?? [],
     recipients: recipientsByProject.get(project.id as string) ?? [],
+    managers: managersByProject.get(project.id as string) ?? [],
   }));
 }
 
