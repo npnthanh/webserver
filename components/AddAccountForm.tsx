@@ -35,6 +35,8 @@ export function AddAccountForm() {
   const [password, setPassword] = useState("");
   const [currentPassword, setCurrentPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
+  /** true = Admin đặt lại mật khẩu, không cần mật khẩu cũ. */
+  const [resetMode, setResetMode] = useState(false);
   const [createdAt, setCreatedAt] = useState(todayLabel());
   const [isEdit, setIsEdit] = useState(false);
   const [existing, setExisting] = useState<Account | null>(null);
@@ -79,6 +81,7 @@ export function AddAccountForm() {
       setPassword("");
       setCurrentPassword("");
       setConfirmPassword("");
+      setResetMode(false);
     });
     return () => {
       active = false;
@@ -123,10 +126,15 @@ export function AddAccountForm() {
     if (!name || !mail) return;
 
     const nextPassword = password.trim();
-    // Đổi mật khẩu (chế độ sửa): điền một ô thì phải điền đủ cả ba ô.
-    const changingPassword = isEdit && Boolean(currentPassword || password || confirmPassword);
+    // Đổi mật khẩu (chế độ sửa): điền một ô thì phải điền đủ các ô của chế độ đang chọn.
+    const changingPassword =
+      isEdit && Boolean((resetMode ? "" : currentPassword) || password || confirmPassword);
     if (changingPassword) {
-      if (!currentPassword || !nextPassword || !confirmPassword) {
+      if (resetMode && (!nextPassword || !confirmPassword)) {
+        setError("Để đặt lại mật khẩu, vui lòng nhập mật khẩu mới và xác nhận mật khẩu mới.");
+        return;
+      }
+      if (!resetMode && (!currentPassword || !nextPassword || !confirmPassword)) {
         setError("Để đổi mật khẩu, vui lòng nhập đủ mật khẩu cũ, mật khẩu mới và xác nhận mật khẩu mới.");
         return;
       }
@@ -138,7 +146,7 @@ export function AddAccountForm() {
         setError("Xác nhận mật khẩu mới không khớp.");
         return;
       }
-      if (nextPassword === currentPassword) {
+      if (!resetMode && nextPassword === currentPassword) {
         setError("Mật khẩu mới phải khác mật khẩu cũ.");
         return;
       }
@@ -155,7 +163,8 @@ export function AddAccountForm() {
         projectIds: role === "Admin" ? [] : selectedProjectIds,
         createdAt: isEdit && existing ? createdAt : todayLabel(),
         password: isEdit ? (changingPassword ? nextPassword : undefined) : nextPassword || DEFAULT_PASSWORD,
-        currentPassword: changingPassword ? currentPassword : undefined,
+        currentPassword: changingPassword && !resetMode ? currentPassword : undefined,
+        resetPassword: changingPassword && resetMode ? true : undefined,
       });
       router.push("/tai-khoan");
     } catch (err) {
@@ -264,21 +273,44 @@ export function AddAccountForm() {
 
         {isEdit ? (
           <div className="mt-6 border-t border-slate-100 pt-6">
-            <h3 className="text-[14px] font-semibold text-slate-800">Đổi mật khẩu</h3>
-            <p className="mt-0.5 text-xs text-slate-500">
-              Để trống cả ba ô nếu giữ nguyên mật khẩu hiện tại.
-            </p>
-            <div className="mt-4 grid gap-4 sm:grid-cols-3">
-              <Field label="MẬT KHẨU CŨ">
-                <input
-                  type="password"
-                  value={currentPassword}
-                  onChange={(e) => setCurrentPassword(e.target.value)}
-                  placeholder="Nhập mật khẩu hiện tại"
-                  className="input"
-                  autoComplete="current-password"
-                />
-              </Field>
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <h3 className="text-[14px] font-semibold text-slate-800">
+                  {resetMode ? "Đặt lại mật khẩu" : "Đổi mật khẩu"}
+                </h3>
+                <p className="mt-0.5 text-xs text-slate-500">
+                  {resetMode
+                    ? "Đặt mật khẩu mới mà không cần mật khẩu cũ. Tài khoản sẽ bị đăng xuất khỏi các thiết bị đang đăng nhập."
+                    : "Để trống các ô nếu giữ nguyên mật khẩu hiện tại."}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setResetMode((current) => !current);
+                  setCurrentPassword("");
+                  setPassword("");
+                  setConfirmPassword("");
+                  setError("");
+                }}
+                className="text-xs font-semibold text-emerald-700 hover:underline"
+              >
+                {resetMode ? "Đổi bằng mật khẩu cũ" : "Quên mật khẩu cũ? Đặt lại mật khẩu"}
+              </button>
+            </div>
+            <div className={`mt-4 grid gap-4 ${resetMode ? "sm:grid-cols-2" : "sm:grid-cols-3"}`}>
+              {!resetMode ? (
+                <Field label="MẬT KHẨU CŨ">
+                  <input
+                    type="password"
+                    value={currentPassword}
+                    onChange={(e) => setCurrentPassword(e.target.value)}
+                    placeholder="Nhập mật khẩu hiện tại"
+                    className="input"
+                    autoComplete="current-password"
+                  />
+                </Field>
+              ) : null}
               <Field label="MẬT KHẨU MỚI">
                 <input
                   type="password"

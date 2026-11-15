@@ -13,6 +13,8 @@ export type Account = {
   password?: string;
   /** Bắt buộc khi đổi mật khẩu của tài khoản đã có; server kiểm tra trước khi đổi. */
   currentPassword?: string;
+  /** Admin đặt lại mật khẩu (không cần mật khẩu cũ). */
+  resetPassword?: boolean;
 };
 
 export const ACCOUNT_ROLES: AccountRole[] = ["Admin", "Manage"];

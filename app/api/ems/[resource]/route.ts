@@ -985,23 +985,31 @@ async function saveResource(resource: string, body: Row) {
   if (resource === "accounts") {
     await ensureAccountProjectsSchema();
     const items = Array.isArray(body.items) ? body.items : [body];
+    const session = await getServerSession();
     await transaction(async (connection) => {
       for (const item of items as Row[]) {
         const rawPassword = asString(item.password).trim();
         const insertPassword = rawPassword || "123456";
         const role = normalizeAccountRole(asString(item.role));
         if (rawPassword) {
-          // Đổi mật khẩu tài khoản đã có: bắt buộc đúng mật khẩu hiện tại (so sánh hash ở Node, không so chuỗi trong SQL).
           const [found] = await connection.execute<RowDataPacket[]>(
             "SELECT password_hash AS passwordHash FROM accounts WHERE id = ? LIMIT 1",
             [item.id],
           );
           const currentHash = found[0] ? asString(found[0].passwordHash).toLowerCase() : null;
-          if (currentHash) {
+          // Admin "Đặt lại mật khẩu" (route này chỉ Admin gọi được) thì bỏ qua bước kiểm tra mật khẩu cũ.
+          const isReset = item.resetPassword === true;
+          if (currentHash && !isReset) {
+            // Đổi mật khẩu tài khoản đã có: bắt buộc đúng mật khẩu hiện tại (so sánh hash ở Node, không so chuỗi trong SQL).
             const currentPassword = asString(item.currentPassword);
             if (!currentPassword) throw new UserFacingError("Vui lòng nhập mật khẩu hiện tại.");
             const provided = createHash("sha256").update(currentPassword, "utf8").digest("hex");
             if (provided !== currentHash) throw new UserFacingError("Mật khẩu hiện tại không đúng.");
+          }
+          // Mật khẩu của tài khoản đã có bị đổi: đăng xuất các phiên cũ của tài khoản đó
+          // (trừ khi đang tự đổi cho chính mình, để không tự đăng xuất).
+          if (currentHash && session?.userId !== asString(item.id)) {
+            await connection.execute("DELETE FROM auth_sessions WHERE portal = 'admin' AND user_id = ?", [item.id]);
           }
         }
         // Đổi mật khẩu khi có nhập: cờ số thay cho `? = ''` (tránh lỗi trộn collation trên MariaDB Hostinger).
