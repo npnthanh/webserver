@@ -16,7 +16,7 @@ import {
   type AccountRole,
 } from "@/lib/accounts";
 import { DEFAULT_PASSWORD } from "@/lib/auth";
-import { hasPermission } from "@/lib/permissions";
+import { canManageAccountRole, hasPermission } from "@/lib/permissions";
 import { hydrateProjects, loadProjects, type Project } from "@/lib/projects";
 
 export function AddAccountForm() {
@@ -42,6 +42,14 @@ export function AddAccountForm() {
   const [existing, setExisting] = useState<Account | null>(null);
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
+  // Khoá ô vai trò: không tự đổi vai trò của mình, người cùng cấp không đổi vai trò của nhau.
+  const isSelf = isEdit && existing !== null && existing.id === session?.userId;
+  const roleLocked = isEdit && existing !== null && !canManageAccountRole(session, existing);
+  const roleLockReason = !roleLocked
+    ? ""
+    : isSelf
+      ? "Không thể tự thay đổi vai trò của chính mình."
+      : "Chỉ người có cấp cao hơn mới được thay đổi vai trò của tài khoản này.";
 
   useEffect(() => {
     setProjects(loadProjects());
@@ -246,6 +254,8 @@ export function AddAccountForm() {
                 value={role}
                 onChange={(e) => setRole(e.target.value as AccountRole)}
                 className="input appearance-none pr-9"
+                disabled={roleLocked}
+                title={roleLockReason || undefined}
               >
                 {ACCOUNT_ROLES.map((item) => (
                   <option key={item} value={item}>
@@ -255,6 +265,7 @@ export function AddAccountForm() {
               </CustomSelect>
               <ChevronIcon className="pointer-events-none absolute top-1/2 right-3 h-4 w-4 -translate-y-1/2 text-slate-400" />
             </div>
+            {roleLocked ? <p className="mt-1.5 text-[11px] font-medium text-amber-700">{roleLockReason}</p> : null}
           </Field>
           {!isEdit ? (
             <Field label="MẬT KHẨU">

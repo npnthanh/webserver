@@ -12,7 +12,7 @@ import {
   type Account,
   type AccountRole,
 } from "@/lib/accounts";
-import { hasPermission } from "@/lib/permissions";
+import { canManageAccountRole, hasPermission } from "@/lib/permissions";
 import { hydrateProjects, loadProjects, type Project } from "@/lib/projects";
 
 const PAGE_SIZE = 6;
@@ -206,8 +206,15 @@ export function AccountList() {
                         <button
                           type="button"
                           onClick={() => setAccountToDelete(account)}
-                          className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-400 hover:bg-rose-50 hover:text-rose-600 hover:border-rose-200 transition-colors"
-                          title={`Xóa tài khoản ${account.username}`}
+                          disabled={!canManageAccountRole(session, account)}
+                          className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-400 hover:bg-rose-50 hover:text-rose-600 hover:border-rose-200 transition-colors disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-white disabled:hover:text-slate-400 disabled:hover:border-slate-200"
+                          title={
+                            canManageAccountRole(session, account)
+                              ? `Xóa tài khoản ${account.username}`
+                              : account.id === session?.userId
+                                ? "Không thể tự xoá tài khoản của chính mình"
+                                : "Chỉ người có cấp cao hơn mới được xoá tài khoản này"
+                          }
                         >
                           <TrashIcon className="h-3.5 w-3.5" />
                         </button>

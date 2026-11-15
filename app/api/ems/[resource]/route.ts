@@ -6,7 +6,7 @@ import { normalizeAlertConfig } from "@/lib/alert-config";
 import { alertCategory } from "@/lib/alert-events";
 import { getProjectGatewayLatest, getProjectsListTelemetry } from "@/lib/gateway-store";
 import { METER_PARAMETERS, readMeterValue } from "@/lib/meter-parameters";
-import { canAccessAdminProject, isAdminRole } from "@/lib/permissions";
+import { canAccessAdminProject, canManageAccountRole, isAdminRole } from "@/lib/permissions";
 import { ensureAccountProjectsSchema, ensureCustomerAccountsSchema, getServerSession, requirePermission } from "@/lib/server-auth";
 import { emsDb, jsonField, queryRows } from "@/lib/server-db";
 
@@ -991,11 +991,21 @@ async function saveResource(resource: string, body: Row) {
         const rawPassword = asString(item.password).trim();
         const insertPassword = rawPassword || "123456";
         const role = normalizeAccountRole(asString(item.role));
+        const [found] = await connection.execute<RowDataPacket[]>(
+          "SELECT password_hash AS passwordHash, role FROM accounts WHERE id = ? LIMIT 1",
+          [item.id],
+        );
+        const existingRole = found[0] ? normalizeAccountRole(asString(found[0].role)) : null;
+        if (existingRole && existingRole !== role) {
+          // Đổi vai trò: chỉ người cấp cao hơn tài khoản đó mới được làm, không ai tự đổi vai trò của mình.
+          if (session?.userId === asString(item.id)) {
+            throw new UserFacingError("Bạn không thể tự thay đổi vai trò của chính mình.");
+          }
+          if (!canManageAccountRole(session, { id: asString(item.id), role: existingRole })) {
+            throw new UserFacingError("Chỉ người có cấp cao hơn mới được thay đổi vai trò của tài khoản này.");
+          }
+        }
         if (rawPassword) {
-          const [found] = await connection.execute<RowDataPacket[]>(
-            "SELECT password_hash AS passwordHash FROM accounts WHERE id = ? LIMIT 1",
-            [item.id],
-          );
           const currentHash = found[0] ? asString(found[0].passwordHash).toLowerCase() : null;
           // Admin "Đặt lại mật khẩu" (route này chỉ Admin gọi được) thì bỏ qua bước kiểm tra mật khẩu cũ.
           const isReset = item.resetPassword === true;
@@ -1481,6 +1491,12 @@ export async function DELETE(request: NextRequest, context: Params) {
     if (resource === "accounts") {
       const gate = await requirePermission("manageUsers");
       if (!gate.ok) return forbidden("Chỉ Quản trị viên được quản lý người dùng.");
+      const id = request.nextUrl.searchParams.get("id") ?? "";
+      if (id === gate.session?.userId) return forbidden("Bạn không thể tự xoá tài khoản của chính mình.");
+      const [target] = await queryRows<Row>("SELECT id, role FROM accounts WHERE id = ? LIMIT 1", [id]);
+      if (target && !canManageAccountRole(gate.session, { id, role: asString(target.role) })) {
+        return forbidden("Chỉ người có cấp cao hơn mới được xoá tài khoản này.");
+      }
     }
     return Response.json(await deleteResource(resource, request));
   } catch (error) {

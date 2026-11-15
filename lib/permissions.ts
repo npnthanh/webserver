@@ -42,6 +42,26 @@ export function isAdminRole(session: AuthSession | null | undefined) {
   return normalizeAccountRole(session.role) === "Admin";
 }
 
+/** Cấp bậc vai trò: số lớn hơn = cấp cao hơn. */
+const ROLE_RANK: Record<AccountRole, number> = { Admin: 2, Manage: 1 };
+
+export function roleRank(role: string | undefined | null) {
+  return role ? ROLE_RANK[normalizeAccountRole(role)] ?? 0 : 0;
+}
+
+/**
+ * Chỉ người có cấp CAO HƠN mới được đổi vai trò hoặc xoá một tài khoản.
+ * Không ai tự hạ cấp / tự xoá chính mình, và người cùng cấp không sửa vai trò của nhau.
+ */
+export function canManageAccountRole(
+  session: AuthSession | null | undefined,
+  target: { id: string; role: string } | null | undefined,
+) {
+  if (!session || session.portal !== "admin" || !target) return false;
+  if (session.userId === target.id) return false;
+  return roleRank(session.role) > roleRank(target.role);
+}
+
 /** Kiểm tra tài khoản quản trị (Admin/Manage) có quyền truy cập vào dự án cụ thể hay không. */
 export function canAccessAdminProject(
   session: AuthSession | null | undefined,
