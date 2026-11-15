@@ -488,3 +488,40 @@ CREATE TABLE IF NOT EXISTS gateway_meter_latest (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 INSERT IGNORE INTO schema_migrations (version) VALUES ('2026-10-04-gateway-samples');
+
+-- Thông báo trang quản trị (chuông) và yêu cầu xoá dự án cần Admin khác duyệt.
+-- Thời gian lưu theo UTC. Ứng dụng cũng tự tạo các bảng này khi chạy (ensureProjectEventsSchema).
+CREATE TABLE IF NOT EXISTS project_deletion_requests (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  project_id VARCHAR(64) NOT NULL,
+  project_name VARCHAR(255) NOT NULL,
+  requested_by VARCHAR(64) NOT NULL,
+  requested_by_name VARCHAR(100) NOT NULL,
+  status VARCHAR(20) NOT NULL DEFAULT 'pending',
+  decided_by VARCHAR(64) NULL,
+  decided_by_name VARCHAR(100) NULL,
+  created_at DATETIME(3) NOT NULL,
+  decided_at DATETIME(3) NULL,
+  PRIMARY KEY (id),
+  KEY idx_project_deletion_project (project_id, status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS admin_notifications (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  type VARCHAR(40) NOT NULL,
+  project_id VARCHAR(64) NOT NULL,
+  project_name VARCHAR(255) NOT NULL,
+  actor_id VARCHAR(64) NULL,
+  actor_name VARCHAR(100) NULL,
+  request_id BIGINT UNSIGNED NULL,
+  created_at DATETIME(3) NOT NULL,
+  PRIMARY KEY (id),
+  KEY idx_admin_notifications_created (created_at),
+  KEY idx_admin_notifications_project (project_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS admin_notification_seen (
+  account_id VARCHAR(64) NOT NULL,
+  seen_at DATETIME(3) NOT NULL,
+  PRIMARY KEY (account_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

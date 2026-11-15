@@ -93,7 +93,7 @@ export function LoginForm({
             </div>
             <div>
               <div className="flex items-center gap-2">
-                <span className="text-base font-bold tracking-tight text-white">EMS Console</span>
+                <span className="text-base font-bold tracking-tight text-white">DTS</span>
                 <span className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-400 uppercase tracking-wider">
                   Enterprise
                 </span>
@@ -180,7 +180,7 @@ export function LoginForm({
               </div>
             </div>
             <div>
-              <span className="text-lg font-bold tracking-tight text-white">EMS Console</span>
+              <span className="text-lg font-bold tracking-tight text-white">DTS</span>
               <p className="text-xs text-slate-400">Energy & Carbon Intelligence</p>
             </div>
           </div>

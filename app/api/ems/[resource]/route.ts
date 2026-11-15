@@ -9,6 +9,16 @@ import { METER_PARAMETERS, readMeterValue } from "@/lib/meter-parameters";
 import { canAccessAdminProject, canManageAccountRole, isAdminRole } from "@/lib/permissions";
 import { ensureAccountProjectsSchema, ensureCustomerAccountsSchema, getServerSession, requirePermission } from "@/lib/server-auth";
 import { emsDb, jsonField, queryRows } from "@/lib/server-db";
+import {
+  addProjectEvent,
+  decideProjectDeletion,
+  ensureProjectEventsSchema,
+  listNotifications,
+  markNotificationsSeen,
+  pendingDeletionsByProject,
+  ProjectEventError,
+  requestProjectDeletion,
+} from "@/lib/server-project-events";
 
 type Params = { params: Promise<{ resource: string }> };
 type Row = Record<string, any>;
@@ -28,6 +38,8 @@ const RESOURCE_NAMES = new Set([
   "project-settings",
   "project-telemetry",
   "project-managers",
+  "notifications",
+  "project-deletions",
 ]);
 
 /** Lỗi nghiệp vụ: thông điệp được trả nguyên văn cho người dùng với HTTP 400. */
@@ -42,7 +54,7 @@ function forbidden(message = "Không có quyền thực hiện thao tác này.")
 }
 
 function serverError(error: unknown) {
-  if (error instanceof UserFacingError) {
+  if (error instanceof UserFacingError || error instanceof ProjectEventError) {
     return Response.json({ error: error.message }, { status: 400 });
   }
   const sqlMessage =
@@ -639,6 +651,7 @@ async function getProjects(projectId?: string, allowedProjectIds?: string[]) {
       { id: asString(row.id), username: asString(row.username), email: asString(row.email) },
     ]);
   }
+  const pendingByProject = await pendingDeletionsByProject(ids);
   const typesByProject = new Map<string, string[]>();
   const recipientsByProject = new Map<string, Row[]>();
   for (const row of types) {
@@ -659,6 +672,7 @@ async function getProjects(projectId?: string, allowedProjectIds?: string[]) {
     meterTypes: typesByProject.get(project.id as string) ?? [],
     recipients: recipientsByProject.get(project.id as string) ?? [],
     managers: managersByProject.get(project.id as string) ?? [],
+    pendingDeletion: pendingByProject.get(project.id as string) ?? null,
   }));
 }
 
@@ -1119,6 +1133,7 @@ async function saveResource(resource: string, body: Row) {
     const recipients = Array.isArray(body.recipients) ? body.recipients as Row[] : [];
     const startDate = projectDateForDb(body.startDate);
     if (!startDate) throw new Error("startDate must use YYYY-MM-DD or DD/MM/YYYY format");
+    const [existingProject] = await queryRows<Row>("SELECT id FROM projects WHERE id = ? LIMIT 1", [body.id]);
     await transaction(async (connection) => {
       await connection.execute(
         `INSERT INTO projects (id, initials, accent, name, customer, status, start_date,
@@ -1163,6 +1178,16 @@ async function saveResource(resource: string, body: Row) {
         "INSERT IGNORE INTO account_projects (account_id, project_id) VALUES (?, ?)",
         [session.userId, body.id],
       );
+    }
+    if (!existingProject) {
+      // Thông báo (chuông) cho các quản trị viên: có dự án mới được khởi tạo.
+      await ensureProjectEventsSchema();
+      await addProjectEvent(emsDb, {
+        type: "project_created",
+        projectId: asString(body.id),
+        projectName: asString(body.name) || asString(body.id),
+        actor: session,
+      });
     }
     return getProjects(asString(body.id));
   }
@@ -1438,13 +1463,8 @@ async function deleteResource(resource: string, request: NextRequest) {
     return { ok: true };
   }
   if (resource === "projects") {
-    await ensureAccountProjectsSchema();
-    await transaction(async (connection) => {
-      await connection.execute("DELETE FROM account_projects WHERE project_id = ?", [id]);
-      await connection.execute("UPDATE meter_points SET parent_id = NULL WHERE project_id = ?", [id]);
-      await connection.execute("DELETE FROM projects WHERE id = ?", [id]);
-    });
-    return { ok: true };
+    // Không xoá trực tiếp: DELETE /projects tạo yêu cầu xoá, dự án chỉ bị xoá khi một Admin khác duyệt.
+    throw new UserFacingError("Xoá dự án phải qua yêu cầu và được Admin khác duyệt.");
   }
   const table = tables[resource];
   if (!table) throw new Error(`Delete is not supported for ${resource}`);
@@ -1478,6 +1498,11 @@ export async function GET(request: NextRequest, context: Params) {
   try {
     const resource = await resourceName(context);
     if (!RESOURCE_NAMES.has(resource)) return badRequest("Tài nguyên không hợp lệ.");
+    if (resource === "notifications") {
+      const gate = await requirePermission("viewProjects");
+      if (!gate.ok || !gate.session) return forbidden();
+      return Response.json(await listNotifications(gate.session));
+    }
     if (resource === "project-managers") {
       const gate = await requirePermission("viewProjects");
       const projectId = request.nextUrl.searchParams.get("projectId") ?? "";
@@ -1498,6 +1523,21 @@ export async function POST(request: NextRequest, context: Params) {
       if (!gate.ok) return forbidden("Chỉ Quản trị viên được quản lý người dùng.");
     }
     const body = (await request.json()) as Row;
+    if (resource === "notifications") {
+      const gate = await requirePermission("viewProjects");
+      if (!gate.ok || !gate.session) return forbidden();
+      await markNotificationsSeen(gate.session);
+      return Response.json(await listNotifications(gate.session));
+    }
+    if (resource === "project-deletions") {
+      const gate = await requirePermission("viewProjects");
+      if (!gate.ok || !gate.session) return forbidden();
+      const decision = asString(body.decision);
+      if (decision !== "approve" && decision !== "reject" && decision !== "cancel") {
+        return badRequest("Quyết định không hợp lệ.");
+      }
+      return Response.json(await decideProjectDeletion(gate.session, Number(body.requestId), decision));
+    }
     return Response.json(await saveResource(resource, body));
   } catch (error) {
     return serverError(error);
@@ -1517,6 +1557,12 @@ export async function DELETE(request: NextRequest, context: Params) {
       if (target && !canManageAccountRole(gate.session, { id, role: asString(target.role) })) {
         return forbidden("Chỉ người có cấp cao hơn mới được xoá tài khoản này.");
       }
+    }
+    if (resource === "projects") {
+      const gate = await requirePermission("manageProjects");
+      const id = request.nextUrl.searchParams.get("id") ?? "";
+      if (!gate.ok || !gate.session || !canAccessAdminProject(gate.session, id)) return forbidden();
+      return Response.json({ pending: true, ...(await requestProjectDeletion(gate.session, id)) });
     }
     return Response.json(await deleteResource(resource, request));
   } catch (error) {

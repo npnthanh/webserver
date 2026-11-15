@@ -32,6 +32,8 @@ export type Project = {
   recipients?: AlertRecipient[];
   /** Kỹ thuật phụ trách: các tài khoản Manage được giao dự án (chỉ đọc, server trả về). */
   managers?: { id: string; username: string; email: string }[];
+  /** Yêu cầu xoá đang chờ Admin khác duyệt (null nếu không có). */
+  pendingDeletion?: { requestId: number; requestedByName: string } | null;
 };
 
 export function resolveMeterTypes(project?: Pick<Project, "meterTypes"> | null): MeterType[] {
@@ -94,10 +96,14 @@ export async function upsertProject(project: Project) {
   return saved;
 }
 
+/**
+ * Gửi yêu cầu xoá dự án. Dự án KHÔNG bị xoá ngay: một Admin khác phải duyệt trong chuông thông báo.
+ * Trả về danh sách dự án mới nhất (dự án vẫn còn, kèm pendingDeletion).
+ */
 export async function removeProject(id: string) {
   await dbFetch("projects", { method: "DELETE", query: { id } });
-  const next = loadProjects().filter((item) => item.id !== id);
-  projectsCache = next;
+  emitDbChange("notifications");
+  const next = await hydrateProjects();
   emitDbChange("projects");
   return next;
 }

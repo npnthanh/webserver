@@ -185,14 +185,14 @@ function SidebarBody({
         <div className={`flex items-center gap-3 ${collapsed ? "justify-center" : ""}`}>
           <div
             className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-emerald-600 text-white shadow-sm shadow-emerald-700/20"
-            title="EMS Console"
+            title="DTS"
           >
             <EnergyLogoIcon className="h-5 w-5" />
           </div>
           {!collapsed && (
             <div className="min-w-0">
               <span className="text-base font-bold tracking-tight text-slate-900 leading-none">
-                EMS Console
+                DTS
               </span>
               <p className="mt-1 text-[11px] font-medium tracking-wide text-slate-400 truncate">
                 {config?.module === "project-info"

@@ -2,6 +2,7 @@
 
 import { useAuth } from "@/components/auth/useAuth";
 import { useSidebar } from "@/components/layout/SidebarContext";
+import { NotificationBell } from "@/components/layout/NotificationBell";
 
 export function Header() {
   const { session } = useAuth();
@@ -51,24 +52,8 @@ export function Header() {
 
       {/* Right Actions & Status */}
       <div className="flex shrink-0 items-center gap-2 sm:gap-3.5">
-        {/* Live System Indicator */}
-        <div className="hidden sm:inline-flex items-center gap-2 rounded-full border border-emerald-200/80 bg-emerald-50/70 px-3 py-1 text-xs font-medium text-emerald-700">
-          <span className="relative flex h-2 w-2">
-            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
-            <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-500" />
-          </span>
-          <span>Hệ thống trực tuyến</span>
-        </div>
-
-        {/* Action Icons */}
-        <button
-          type="button"
-          className="relative flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 hover:text-slate-800 transition-colors"
-          aria-label="Thông báo"
-        >
-          <BellIcon className="h-4 w-4" />
-          <span className="absolute top-1.5 right-1.5 h-1.5 w-1.5 rounded-full bg-emerald-500" />
-        </button>
+        {/* Thông báo: dự án khởi tạo / yêu cầu xoá cần Admin khác duyệt / dự án đã xoá */}
+        {session?.portal === "admin" ? <NotificationBell /> : null}
 
         <div className="h-4 w-px bg-slate-200 hidden sm:block" />
 
@@ -122,15 +107,6 @@ function SearchIcon({ className }: { className?: string }) {
     <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
       <circle cx="11" cy="11" r="8" />
       <path d="m21 21-4.3-4.3" />
-    </svg>
-  );
-}
-
-function BellIcon({ className }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9" />
-      <path d="M10.3 21a1.94 1.94 0 0 0 3.4 0" />
     </svg>
   );
 }

@@ -40,7 +40,6 @@ const PAGE_SIZE = 10;
 export function ProjectList() {
   const { session } = useAuth();
   const canManageProjects = hasPermission(session, "manageProjects");
-  const canManageDevices = hasPermission(session, "manageDevices");
   const [items, setItems] = useState<Project[]>([]);
   const [telemetry, setTelemetry] = useState<Record<string, ProjectTelemetry>>({});
   const [searchQuery, setSearchQuery] = useState("");
@@ -51,6 +50,16 @@ export function ProjectList() {
   const [copiedId, setCopiedId] = useState("");
   const [projectToDelete, setProjectToDelete] = useState<Project | null>(null);
   const [deleteError, setDeleteError] = useState("");
+  const [requestNotice, setRequestNotice] = useState("");
+
+  // Dự án bị xoá / yêu cầu xoá thay đổi (duyệt từ chuông thông báo): tải lại danh sách.
+  useEffect(() => {
+    const onChanged = () => {
+      void hydrateProjects().then((projects) => setItems(projects));
+    };
+    window.addEventListener("ems-projects-changed", onChanged);
+    return () => window.removeEventListener("ems-projects-changed", onChanged);
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -112,6 +121,8 @@ export function ProjectList() {
     setDeleteError("");
     try {
       setItems(await removeProject(projectToDelete.id));
+      setRequestNotice(`Đã gửi yêu cầu xoá dự án "${projectToDelete.name}". Dự án chỉ bị xoá khi một Admin khác duyệt trong mục Thông báo.`);
+      window.setTimeout(() => setRequestNotice(""), 6000);
       setProjectToDelete(null);
     } catch (error) {
       setDeleteError(error instanceof Error ? error.message : "Không xóa được dự án.");
@@ -129,15 +140,6 @@ export function ProjectList() {
         </div>
 
         <div className="flex flex-wrap items-center gap-2.5 sm:gap-3">
-          {canManageDevices ? (
-            <Link
-              href="/thiet-bi"
-              className="inline-flex h-10 items-center gap-2 rounded-xl border border-slate-200 bg-white px-3.5 sm:px-4 text-xs font-semibold text-slate-700 hover:bg-slate-50 shadow-xs transition-colors"
-            >
-              <DeviceIcon className="h-4 w-4 text-slate-500" />
-              Thư viện thiết bị
-            </Link>
-          ) : null}
           {canManageProjects ? (
             <Link
               href="/tao-du-an"
@@ -331,6 +333,14 @@ export function ProjectList() {
                           <span className={`h-1.5 w-1.5 rounded-full ${statusMeta[project.status].dot}`} />
                           {statusMeta[project.status].label}
                         </span>
+                        {project.pendingDeletion ? (
+                          <span
+                            className="mt-1 block text-[10px] font-semibold text-rose-600"
+                            title={`${project.pendingDeletion.requestedByName} đã yêu cầu xoá, đang chờ Admin khác duyệt`}
+                          >
+                            Chờ duyệt xoá
+                          </span>
+                        ) : null}
                       </td>
 
                       {/* Actions */}
@@ -356,8 +366,9 @@ export function ProjectList() {
                               setDeleteError("");
                               setProjectToDelete(project);
                             }}
-                            className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-400 hover:border-rose-200 hover:bg-rose-50 hover:text-rose-600 transition-colors"
-                            title="Xóa dự án"
+                            disabled={Boolean(project.pendingDeletion)}
+                            className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-400 hover:border-rose-200 hover:bg-rose-50 hover:text-rose-600 transition-colors disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-white disabled:hover:text-slate-400 disabled:hover:border-slate-200"
+                            title={project.pendingDeletion ? "Đã có yêu cầu xoá, đang chờ Admin khác duyệt" : "Gửi yêu cầu xoá dự án"}
                           >
                             <TrashIcon className="h-3.5 w-3.5" />
                           </button>
@@ -387,18 +398,24 @@ export function ProjectList() {
 
       <ConfirmDialog
         open={Boolean(projectToDelete)}
-        title="Xác nhận xóa dự án"
+        title="Gửi yêu cầu xoá dự án"
         description={
           deleteError ||
-          `Bạn có chắc chắn muốn xóa dự án "${projectToDelete?.name}" (${projectToDelete?.id}) không? Điểm đo và cấu hình của dự án này cũng sẽ bị xóa.`
+          `Gửi yêu cầu xoá dự án "${projectToDelete?.name}" (${projectToDelete?.id})? Dự án chỉ bị xoá khi một Admin khác duyệt. Khi đã duyệt, điểm đo và cấu hình của dự án cũng bị xoá.`
         }
-        confirmText="Xác nhận xóa"
+        confirmText="Gửi yêu cầu xoá"
         onConfirm={() => void confirmDelete()}
         onCancel={() => {
           setProjectToDelete(null);
           setDeleteError("");
         }}
       />
+
+      {requestNotice ? (
+        <div className="fixed bottom-8 right-8 z-50 max-w-sm rounded-xl bg-slate-900 px-4 py-3 text-xs font-medium text-white shadow-2xl">
+          {requestNotice}
+        </div>
+      ) : null}
 
       {/* Copy Alert Toast */}
       {copiedId && (
@@ -563,15 +580,6 @@ function ActivityIcon({ className }: { className?: string }) {
   );
 }
 
-function DeviceIcon({ className }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-      <rect x="4" y="5" width="16" height="12" rx="2" />
-      <path d="M8 21h8M12 17v4" />
-      <path d="M8 9h.01M12 9h.01M16 9h.01" strokeWidth="2.4" />
-    </svg>
-  );
-}
 
 function EyeSmallIcon({ className }: { className?: string }) {
   return (

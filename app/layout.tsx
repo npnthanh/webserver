@@ -9,7 +9,7 @@ const inter = Inter({
 });
 
 export const metadata: Metadata = {
-  title: "EMS Console",
+  title: "DTS",
   description: "Hệ thống giám sát và quản lý năng lượng công nghiệp",
 };
 
