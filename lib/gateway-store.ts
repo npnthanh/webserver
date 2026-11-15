@@ -1124,12 +1124,16 @@ export async function getGatewayConsole(input: { from?: string; to?: string; gat
         `SELECT * FROM gateway_logs WHERE ${where} ORDER BY id DESC LIMIT 100`,
         params,
       ),
-      safeQuery<RowDataPacket>(
-        `SELECT * FROM gateway_thresholds
-          WHERE (? = '' OR gateway_id = '' OR gateway_id = ?)
-          ORDER BY id`,
-        [input.gatewayId ?? "", input.gatewayId ?? ""],
-      ),
+      // Không so sánh tham số với chuỗi literal (`? = ''`): trên MariaDB của Hostinger hai vế mang
+      // collation khác nhau và báo ER_CANT_AGGREGATE_2COLLATIONS.
+      input.gatewayId
+        ? safeQuery<RowDataPacket>(
+            `SELECT * FROM gateway_thresholds
+              WHERE gateway_id = '' OR gateway_id = ?
+              ORDER BY id`,
+            [input.gatewayId],
+          )
+        : safeQuery<RowDataPacket>("SELECT * FROM gateway_thresholds ORDER BY id"),
     ]);
 
   const mappedGateways = gateways.length
@@ -2297,19 +2301,20 @@ export async function getProjectGatewayEnergySlots(
 
 async function meterIsRegistered(packet: NormalizedPacket) {
   const serial = packet.meterId.trim();
-  const category = packet.meterModel.trim();
   if (!serial) return false;
+  // Ghép tiền tố "SN:" ở JS thay vì CONCAT('SN: ', ?) để tránh lỗi trộn collation trên MariaDB.
+  const variants = [serial, `SN: ${serial}`, `SN:${serial}`];
   const rows = await queryRows<RowDataPacket>(
     `SELECT 1 AS ok
        FROM devices d
-      WHERE TRIM(d.serial_number) IN (?, CONCAT('SN: ', ?), CONCAT('SN:', ?))
+      WHERE TRIM(d.serial_number) IN (?, ?, ?)
          OR EXISTS (
            SELECT 1
              FROM meter_points mp
-            WHERE TRIM(mp.serial_number) IN (?, CONCAT('SN: ', ?), CONCAT('SN:', ?))
+            WHERE TRIM(mp.serial_number) IN (?, ?, ?)
          )
       LIMIT 1`,
-    [serial, serial, serial, serial, serial, serial],
+    [...variants, ...variants],
   );
   return rows.length > 0;
 }

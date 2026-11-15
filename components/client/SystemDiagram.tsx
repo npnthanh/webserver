@@ -69,11 +69,12 @@ const nodeTypes: NodeTypes = {
   source: SourceNode,
 };
 
-/** Dây dẫn sơ đồ đơn tuyến: vàng khi có dữ liệu, xám nét đứt khi mất kết nối. */
+/** Dây dẫn sơ đồ đơn tuyến: luôn nét liền; vàng khi có dữ liệu, xám khi mất kết nối. */
 const edgeStyle = { stroke: "#facc15", strokeWidth: 3 };
-const offlineEdgeStyle = { stroke: "#475569", strokeWidth: 3, strokeDasharray: "5 4" };
+const offlineEdgeStyle = { stroke: "#475569", strokeWidth: 3 };
 
 const SOURCE_NODE_ID = "__grid_source__";
+const DEFAULT_GRID_LABEL = "LƯỚI ĐIỆN 22kV";
 const SOURCE_W = 440;
 const NODE_W = 264;
 const H_GAP = 56;
@@ -201,6 +202,7 @@ function nodeDataForMeter(
     metricKeys,
     metrics: live.metrics,
     sampleAt: sample?.at ? formatStoredVietnam(sample.at) ?? sample.at : undefined,
+    lineLive: isSampleOnline(sample?.at),
   };
 }
 
@@ -264,6 +266,7 @@ function buildSourceNodeData(
 
   return {
     title: `Trạm biến áp & Tủ tổng ${projectName}`,
+    gridLabel: displays[SOURCE_NODE_ID]?.title?.trim() || DEFAULT_GRID_LABEL,
     subtitle:
       energy === "Điện"
         ? "Sơ đồ đơn tuyến hệ thống phân phối & đo đếm điện năng"
@@ -637,8 +640,18 @@ function SystemDiagramInner() {
         );
       },
       refreshLive,
+      renameSource: (label: string) => {
+        const title = label.trim();
+        setDisplays((current) => {
+          const next = { ...current };
+          if (title && title !== DEFAULT_GRID_LABEL) next[SOURCE_NODE_ID] = { ...current[SOURCE_NODE_ID], title };
+          else delete next[SOURCE_NODE_ID];
+          saveDiagramDisplays(projectId, energy, next);
+          return next;
+        });
+      },
     }),
-    [setNodes, refreshLive],
+    [setNodes, refreshLive, projectId, energy],
   );
 
   const updateSelectedDisplay = useCallback(
@@ -946,22 +959,6 @@ function SystemDiagramInner() {
                   <p className="flex items-center gap-2 truncate">
                     <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[#4ade80]" />
                     <span className="truncate">SƠ ĐỒ ĐƠN TUYẾN · {projectName.toUpperCase()}</span>
-                  </p>
-                </Panel>
-
-                <Panel
-                  position="bottom-left"
-                  className="m-2 rounded-md border border-slate-700 bg-[#0b1220]/90 px-2.5 py-1.5 font-mono text-[10px] text-slate-300 sm:m-3"
-                >
-                  <p className="flex items-center gap-1.5">
-                    <span className="inline-block h-2.5 w-2.5 rounded-[1px] bg-[#ef4444]" /> Máy cắt đóng (có dữ liệu)
-                  </p>
-                  <p className="mt-0.5 flex items-center gap-1.5">
-                    <span className="inline-block h-2.5 w-2.5 rounded-[1px] bg-[#22c55e]" /> Máy cắt cắt / mất kết nối
-                  </p>
-                  <p className="mt-0.5 flex items-center gap-1.5">
-                    <span className="inline-block h-[3px] w-3 bg-[#facc15]" /> Dây có điện ·{" "}
-                    <span className="inline-block h-[3px] w-3 border-t-2 border-dashed border-slate-500" /> Mất kết nối
                   </p>
                 </Panel>
 

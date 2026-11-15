@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { cookies } from "next/headers";
 import { queryRows } from "@/lib/server-db";
+import { ensureAccountProjectsSchema } from "@/lib/server-auth";
 
 const SESSION_COOKIE = "ems-session";
 
@@ -31,6 +32,16 @@ export async function GET() {
     if (!session) {
       cookieStore.delete(SESSION_COOKIE);
       return Response.json({ session: null });
+    }
+    // Tài khoản Manage chỉ thấy các dự án được giao: client lọc theo managedProjectIds,
+    // nên phiên khôi phục sau khi tải lại trang phải mang đủ danh sách này như lúc đăng nhập.
+    if (session.portal === "admin") {
+      await ensureAccountProjectsSchema();
+      const projectRows = await queryRows<{ projectId: string }>(
+        "SELECT project_id AS projectId FROM account_projects WHERE account_id = ? ORDER BY project_id",
+        [String(session.userId)],
+      );
+      session.managedProjectIds = projectRows.map((item) => String(item.projectId));
     }
     return Response.json({ session });
   } catch (error) {

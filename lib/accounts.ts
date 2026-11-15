@@ -11,6 +11,8 @@ export type Account = {
   createdAt: string;
   projectIds?: string[];
   password?: string;
+  /** Bắt buộc khi đổi mật khẩu của tài khoản đã có; server kiểm tra trước khi đổi. */
+  currentPassword?: string;
 };
 
 export const ACCOUNT_ROLES: AccountRole[] = ["Admin", "Manage"];

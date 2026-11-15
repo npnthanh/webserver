@@ -19,6 +19,9 @@ import {
   type ProjectStatus,
 } from "@/lib/projects";
 import { ensureCustomerAccount } from "@/lib/customer-accounts";
+import { useAuth } from "@/components/auth/useAuth";
+import { hasPermission } from "@/lib/permissions";
+import { loadProjectManagers, saveProjectManagers, type ProjectManager } from "@/lib/project-managers";
 import {
   loadMeterTypeDefs,
   hydrateMeterTypeDefs,
@@ -75,6 +78,38 @@ export function AddProjectForm({ initialProject }: { initialProject?: Project })
   const [error, setError] = useState("");
   const [meterTypeToDelete, setMeterTypeToDelete] = useState<MeterTypeDef | null>(null);
   const [recipientToDelete, setRecipientToDelete] = useState<AlertRecipient | null>(null);
+  const { session } = useAuth();
+  const canAssignManagers = hasPermission(session, "manageUsers");
+  const [managers, setManagers] = useState<ProjectManager[] | null>(null);
+  const [managerIds, setManagerIds] = useState<string[]>([]);
+  const [managersError, setManagersError] = useState("");
+  const editingProjectId = initialProject?.id;
+
+  const adminUserId = session?.portal === "admin" ? session.userId : null;
+
+  useEffect(() => {
+    // Phụ thuộc theo userId (không theo object session) để không nạp lại và xoá lựa chọn đang sửa.
+    if (!adminUserId) return;
+    // Dự án mới chưa có mã trong DB: chỉ cần danh sách tài khoản Manage, chưa ai được giao.
+    const projectId = editingProjectId ?? "__new__";
+    let active = true;
+    loadProjectManagers(projectId)
+      .then((rows) => {
+        if (!active) return;
+        setManagers(rows);
+        setManagerIds(rows.filter((row) => row.assigned).map((row) => row.id));
+      })
+      .catch((err) => {
+        if (active) setManagersError(err instanceof Error ? err.message : "Không tải được danh sách người phụ trách.");
+      });
+    return () => {
+      active = false;
+    };
+  }, [adminUserId, editingProjectId]);
+
+  function toggleManager(id: string) {
+    setManagerIds((current) => (current.includes(id) ? current.filter((item) => item !== id) : [...current, id]));
+  }
 
   function handleLogoChange(file?: File) {
     if (!file) return;
@@ -215,6 +250,7 @@ export function AddProjectForm({ initialProject }: { initialProject?: Project })
         recipients: cleanedRecipients,
       });
       if (!initialProject) ensureCustomerAccount({ id: projectCode, customer: customerName });
+      if (canAssignManagers && managers) await saveProjectManagers(projectCode, managerIds);
       router.push("/");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Không thể lưu dự án vào database.");
@@ -597,6 +633,75 @@ export function AddProjectForm({ initialProject }: { initialProject?: Project })
             ))}
           </div>
         </section>
+
+        {initialProject || canAssignManagers ? (
+          <section className="rounded-xl border border-slate-200 bg-white p-6 shadow-[0_1px_2px_rgba(16,24,40,0.04)] lg:p-8">
+            <div className="mb-5">
+              <h2 className="text-[15px] font-semibold text-slate-800">Tài khoản phụ trách</h2>
+              <p className="mt-1 text-sm text-slate-500">
+                {canAssignManagers
+                  ? "Chọn các tài khoản Manage được quản trị dự án này. Tài khoản Admin luôn xem được mọi dự án."
+                  : "Các tài khoản Manage đang phụ trách dự án này. Chỉ Quản trị viên được thay đổi."}
+              </p>
+            </div>
+
+            {managersError ? (
+              <p className="text-sm text-red-500">{managersError}</p>
+            ) : managers === null ? (
+              <p className="text-sm text-slate-400">Đang tải danh sách…</p>
+            ) : canAssignManagers ? (
+              managers.length === 0 ? (
+                <p className="text-sm text-slate-500">
+                  Chưa có tài khoản Manage nào.{" "}
+                  <Link href="/tai-khoan/them-moi" className="font-semibold text-emerald-700 hover:underline">
+                    Thêm tài khoản
+                  </Link>
+                </p>
+              ) : (
+                <div className="grid gap-2 sm:grid-cols-2">
+                  {managers.map((item) => {
+                    const checked = managerIds.includes(item.id);
+                    return (
+                      <label
+                        key={item.id}
+                        className={`flex cursor-pointer items-center gap-3 rounded-xl border px-4 py-3 transition-colors ${
+                          checked ? "border-emerald-500 bg-emerald-50/70" : "border-slate-200 bg-white hover:bg-slate-50"
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => toggleManager(item.id)}
+                          className="h-4 w-4 accent-emerald-600"
+                        />
+                        <span className="min-w-0">
+                          <span className="block truncate text-sm font-semibold text-slate-800">{item.username}</span>
+                          <span className="block truncate text-xs text-slate-500">{item.email}</span>
+                        </span>
+                      </label>
+                    );
+                  })}
+                </div>
+              )
+            ) : managers.filter((item) => item.assigned).length === 0 ? (
+              <p className="text-sm text-slate-500">Chưa có tài khoản Manage nào phụ trách.</p>
+            ) : (
+              <ul className="flex flex-wrap gap-2">
+                {managers
+                  .filter((item) => item.assigned)
+                  .map((item) => (
+                    <li
+                      key={item.id}
+                      className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-sm text-emerald-800"
+                    >
+                      <span className="font-semibold">{item.username}</span>
+                      <span className="text-emerald-700/80"> · {item.email}</span>
+                    </li>
+                  ))}
+              </ul>
+            )}
+          </section>
+        ) : null}
 
         {error ? <p className="text-sm font-medium text-red-500">{error}</p> : null}
 

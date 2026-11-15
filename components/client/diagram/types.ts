@@ -34,12 +34,16 @@ export type MeterNodeData = {
   metrics: MeterMetric[];
   metricKeys: string[];
   sampleAt?: string;
+  /** Dây nhánh tô vàng khi có bản tin gần đây (cùng điều kiện với đường nối từ thanh cái). */
+  lineLive?: boolean;
   energy: EnergyKind;
   listed?: boolean;
 };
 
 export type SourceNodeData = {
   title: string;
+  /** Nhãn nguồn cấp phía trên (mặc định "LƯỚI ĐIỆN 22kV"), người dùng tự sửa được. */
+  gridLabel: string;
   subtitle: string;
   energy: EnergyKind;
   totalPowerText: string;

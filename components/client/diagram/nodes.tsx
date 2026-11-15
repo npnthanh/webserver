@@ -1,6 +1,7 @@
 "use client";
 
 import { Handle, Position, type NodeProps } from "@xyflow/react";
+import { useState } from "react";
 import { useDiagramActions } from "./context";
 import type {
   JunctionFlowNode,
@@ -15,9 +16,6 @@ import type {
 const LINE_LIVE = "#facc15";
 /** Dây dẫn mất kết nối. */
 const LINE_DEAD = "#475569";
-/** Quy ước SCADA của sơ đồ mẫu: ĐỎ = máy cắt đóng, XANH = máy cắt cắt / không có tải. */
-const BREAKER_CLOSED = "#ef4444";
-const BREAKER_OPEN = "#22c55e";
 const EQUIPMENT = "#fb923c";
 const VALUE_TEXT = "text-[#4ade80]";
 
@@ -27,28 +25,61 @@ const statusText: Record<MeterStatus, string> = {
   offline: "text-slate-400",
 };
 
-/** Ký hiệu máy cắt dạng ô vuông như sơ đồ SCADA. */
-function BreakerSquare({ closed, title }: { closed: boolean; title: string }) {
+/** Dây dẫn đứng, luôn nét liền: vàng khi có dữ liệu, xám khi mất kết nối. */
+function VLine({ live, height }: { live: boolean; height: number }) {
+  return <span className="block w-[3px]" style={{ height, background: live ? LINE_LIVE : LINE_DEAD }} />;
+}
+
+/** Nhãn nguồn cấp sửa trực tiếp trên sơ đồ: bấm vào chữ (hoặc biểu tượng bút) để sửa, Enter để lưu, Esc để huỷ. */
+function EditableGridLabel({ value }: { value: string }) {
+  const { renameSource } = useDiagramActions();
+  const [draft, setDraft] = useState<string | null>(null);
+
+  if (draft !== null) {
+    const commit = () => {
+      renameSource(draft);
+      setDraft(null);
+    };
+    return (
+      <input
+        autoFocus
+        value={draft}
+        maxLength={60}
+        onChange={(event) => setDraft(event.target.value)}
+        onBlur={commit}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") commit();
+          if (event.key === "Escape") setDraft(null);
+        }}
+        className="nodrag nopan w-[180px] rounded border border-[#fb923c]/60 bg-[#0b1220] px-1 py-0.5 font-mono text-[10.5px] font-bold outline-none"
+        style={{ color: EQUIPMENT }}
+        aria-label="Nhãn nguồn cấp"
+      />
+    );
+  }
+
   return (
-    <span
-      className="block h-[18px] w-[18px] rounded-[2px] border border-black/40 shadow-[0_0_6px_rgba(0,0,0,0.35)]"
-      style={{ backgroundColor: closed ? BREAKER_CLOSED : BREAKER_OPEN }}
-      title={title}
-    />
+    <button
+      type="button"
+      onClick={(event) => {
+        event.stopPropagation();
+        setDraft(value);
+      }}
+      className="nodrag nopan group flex items-center gap-1 rounded px-0.5 text-left font-bold hover:bg-white/5"
+      style={{ color: EQUIPMENT }}
+      title="Bấm để sửa nhãn"
+    >
+      {value}
+      <PencilIcon className="h-3 w-3 opacity-40 group-hover:opacity-100" />
+    </button>
   );
 }
 
-function VLine({ live, height }: { live: boolean; height: number }) {
+function PencilIcon({ className }: { className?: string }) {
   return (
-    <span
-      className="block w-[3px]"
-      style={{
-        height,
-        background: live
-          ? LINE_LIVE
-          : `repeating-linear-gradient(to bottom, ${LINE_DEAD} 0 5px, transparent 5px 9px)`,
-      }}
-    />
+    <svg viewBox="0 0 24 24" className={className} fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
+      <path d="M4 20h4L19 9l-4-4L4 16v4z" strokeLinejoin="round" />
+    </svg>
   );
 }
 
@@ -74,46 +105,20 @@ export function SourceNode({ data }: NodeProps<SourceFlowNode>) {
               />
             </svg>
             <div className="pb-0.5 font-mono text-[10.5px] leading-[1.35]">
-              <p className="font-bold" style={{ color: EQUIPMENT }}>
-                LƯỚI ĐIỆN 22kV
-              </p>
+              <EditableGridLabel value={data.gridLabel} />
               <p className={VALUE_TEXT}>f: {data.freqText}</p>
               <p className={isOnline ? VALUE_TEXT : "text-slate-400"}>{isOnline ? "Đóng điện" : "Standby"}</p>
             </div>
           </div>
-          <VLine live={isOnline} height={14} />
-          <BreakerSquare closed={isOnline} title="Máy cắt trung thế" />
-          <VLine live={isOnline} height={10} />
-          {/* Máy biến áp 2 cuộn dây */}
-          <div className="relative flex flex-col items-center">
-            <svg viewBox="0 0 40 46" className="h-[46px] w-[40px]" fill="none" aria-hidden>
-              <circle cx="20" cy="15" r="11" stroke="#ef4444" strokeWidth="2.2" />
-              <circle cx="20" cy="31" r="11" stroke="#ef4444" strokeWidth="2.2" />
-            </svg>
-            <span
-              className="absolute left-[48px] top-[15px] whitespace-nowrap font-mono text-[10px] font-bold"
-              style={{ color: EQUIPMENT }}
-            >
-              MBA 22/0,4kV
-            </span>
-          </div>
-          <VLine live={isOnline} height={10} />
-          <BreakerSquare closed={isOnline} title="Máy cắt tổng ACB" />
-          <VLine live={isOnline} height={14} />
+          {/* Đường dây từ nguồn xuống thanh cái: chỉ một nét liền (giữ nguyên chiều cao bố cục cũ). */}
+          <VLine live={isOnline} height={130} />
         </div>
       ) : null}
 
       {/* Thanh cái tổng */}
       <div className="relative w-full">
-        <div className="mb-1 flex flex-wrap items-end justify-between gap-x-3 gap-y-0.5 px-1 font-mono text-[10.5px]">
-          <span className="font-bold" style={{ color: LINE_LIVE }}>
-            {isElectric ? "THANH CÁI TỔNG MSB · 0,4kV" : `TRỤC CẤP ${data.energy.toUpperCase()} CHÍNH`}
-          </span>
-          {isElectric ? (
-            <span className={VALUE_TEXT}>
-              ΣP: {data.totalPowerText} · U: {data.voltageText}
-            </span>
-          ) : null}
+        {/* Bộ đếm nằm nổi phía trên mép phải thanh cái để đường dây từ nguồn chạm thẳng vào thanh cái. */}
+        <div className="absolute bottom-full right-0 mb-1 flex items-end px-1 font-mono text-[10.5px]">
           <span className="flex items-center gap-2 text-[10px] font-semibold">
             <span className="text-[#4ade80]" title="Điểm đo bình thường">
               ● {data.normalCount}
@@ -134,7 +139,7 @@ export function SourceNode({ data }: NodeProps<SourceFlowNode>) {
             type="source"
             position={Position.Bottom}
             id={feeder.id === "bus-out" ? "bus-out" : `bus-${feeder.id}`}
-            className="!-bottom-1 !h-2 !w-2 !min-h-0 !min-w-0 !border-0 !bg-transparent"
+            className="!bottom-0 !h-0 !w-2 !min-h-0 !min-w-0 !border-0 !bg-transparent"
             style={{ left: feeder.x }}
           />
         ))}
@@ -154,16 +159,11 @@ export function MeterNode({ id, data, selected }: NodeProps<MeterFlowNode>) {
         type="target"
         position={Position.Top}
         id="parent"
-        className="!-top-1 !h-2 !w-2 !min-h-0 !min-w-0 !border-0 !bg-transparent"
+        className="!top-0 !h-0 !w-2 !min-h-0 !min-w-0 !border-0 !bg-transparent"
         title="Nối từ Thanh cái / Điểm cha"
       />
 
-      <VLine live={live} height={22} />
-      <BreakerSquare
-        closed={isOnline}
-        title={isOnline ? "Máy cắt nhánh: ĐÓNG (đang có dữ liệu)" : "Máy cắt nhánh: CẮT / mất kết nối"}
-      />
-      <VLine live={live} height={22} />
+      <VLine live={data.lineLive ?? live} height={62} />
 
       {/* Thiết bị / phụ tải + nhãn thông số kiểu SCADA */}
       <div
@@ -234,13 +234,13 @@ export function MeterNode({ id, data, selected }: NodeProps<MeterFlowNode>) {
         ) : null}
       </div>
 
-      <VLine live={live} height={18} />
+      <VLine live={data.lineLive ?? live} height={18} />
 
       <Handle
         type="source"
         position={Position.Bottom}
         id="child"
-        className="!-bottom-1 !h-2 !w-2 !min-h-0 !min-w-0 !border-0 !bg-transparent"
+        className="!bottom-0 !h-0 !w-2 !min-h-0 !min-w-0 !border-0 !bg-transparent"
         title="Kéo xuống để gắn điểm con"
       />
     </div>

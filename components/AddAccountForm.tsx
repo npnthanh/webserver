@@ -33,6 +33,8 @@ export function AddAccountForm() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectSearch, setProjectSearch] = useState("");
   const [password, setPassword] = useState("");
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
   const [createdAt, setCreatedAt] = useState(todayLabel());
   const [isEdit, setIsEdit] = useState(false);
   const [existing, setExisting] = useState<Account | null>(null);
@@ -75,6 +77,8 @@ export function AddAccountForm() {
       setSelectedProjectIds(found.projectIds ?? []);
       setCreatedAt(found.createdAt);
       setPassword("");
+      setCurrentPassword("");
+      setConfirmPassword("");
     });
     return () => {
       active = false;
@@ -118,10 +122,31 @@ export function AddAccountForm() {
     const mail = email.trim();
     if (!name || !mail) return;
 
+    const nextPassword = password.trim();
+    // Đổi mật khẩu (chế độ sửa): điền một ô thì phải điền đủ cả ba ô.
+    const changingPassword = isEdit && Boolean(currentPassword || password || confirmPassword);
+    if (changingPassword) {
+      if (!currentPassword || !nextPassword || !confirmPassword) {
+        setError("Để đổi mật khẩu, vui lòng nhập đủ mật khẩu cũ, mật khẩu mới và xác nhận mật khẩu mới.");
+        return;
+      }
+      if (nextPassword.length < 6) {
+        setError("Mật khẩu mới phải có ít nhất 6 ký tự.");
+        return;
+      }
+      if (nextPassword !== confirmPassword.trim()) {
+        setError("Xác nhận mật khẩu mới không khớp.");
+        return;
+      }
+      if (nextPassword === currentPassword) {
+        setError("Mật khẩu mới phải khác mật khẩu cũ.");
+        return;
+      }
+    }
+
     setError("");
     setSaving(true);
     try {
-      const nextPassword = password.trim();
       await upsertAccount({
         id: editingId && isEdit ? editingId : `acc-${Date.now()}`,
         username: name,
@@ -129,7 +154,8 @@ export function AddAccountForm() {
         role,
         projectIds: role === "Admin" ? [] : selectedProjectIds,
         createdAt: isEdit && existing ? createdAt : todayLabel(),
-        password: isEdit ? nextPassword || undefined : nextPassword || DEFAULT_PASSWORD,
+        password: isEdit ? (changingPassword ? nextPassword : undefined) : nextPassword || DEFAULT_PASSWORD,
+        currentPassword: changingPassword ? currentPassword : undefined,
       });
       router.push("/tai-khoan");
     } catch (err) {
@@ -221,17 +247,64 @@ export function AddAccountForm() {
               <ChevronIcon className="pointer-events-none absolute top-1/2 right-3 h-4 w-4 -translate-y-1/2 text-slate-400" />
             </div>
           </Field>
-          <Field label={isEdit ? "MẬT KHẨU MỚI (TÙY CHỌN)" : "MẬT KHẨU"}>
-            <input
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              placeholder={isEdit ? "Để trống nếu giữ mật khẩu hiện tại" : "Nhập mật khẩu"}
-              className="input"
-              required={!isEdit}
-            />
-          </Field>
+          {!isEdit ? (
+            <Field label="MẬT KHẨU">
+              <input
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="Nhập mật khẩu"
+                className="input"
+                autoComplete="new-password"
+                required
+              />
+            </Field>
+          ) : null}
         </div>
+
+        {isEdit ? (
+          <div className="mt-6 border-t border-slate-100 pt-6">
+            <h3 className="text-[14px] font-semibold text-slate-800">Đổi mật khẩu</h3>
+            <p className="mt-0.5 text-xs text-slate-500">
+              Để trống cả ba ô nếu giữ nguyên mật khẩu hiện tại.
+            </p>
+            <div className="mt-4 grid gap-4 sm:grid-cols-3">
+              <Field label="MẬT KHẨU CŨ">
+                <input
+                  type="password"
+                  value={currentPassword}
+                  onChange={(e) => setCurrentPassword(e.target.value)}
+                  placeholder="Nhập mật khẩu hiện tại"
+                  className="input"
+                  autoComplete="current-password"
+                />
+              </Field>
+              <Field label="MẬT KHẨU MỚI">
+                <input
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="Ít nhất 6 ký tự"
+                  className="input"
+                  autoComplete="new-password"
+                />
+              </Field>
+              <Field label="XÁC NHẬN MẬT KHẨU MỚI">
+                <input
+                  type="password"
+                  value={confirmPassword}
+                  onChange={(e) => setConfirmPassword(e.target.value)}
+                  placeholder="Nhập lại mật khẩu mới"
+                  className="input"
+                  autoComplete="new-password"
+                />
+              </Field>
+            </div>
+            {confirmPassword && password.trim() !== confirmPassword.trim() ? (
+              <p className="mt-2 text-xs font-medium text-rose-600">Xác nhận mật khẩu mới không khớp.</p>
+            ) : null}
+          </div>
+        ) : null}
 
         {/* Danh sách các dự án / khách hàng được quản trị */}
         <div className="mt-6 border-t border-slate-100 pt-6">

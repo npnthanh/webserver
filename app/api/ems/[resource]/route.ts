@@ -1,11 +1,12 @@
-import type { PoolConnection } from "mysql2/promise";
+import { createHash } from "node:crypto";
+import type { PoolConnection, RowDataPacket } from "mysql2/promise";
 import { NextRequest } from "next/server";
 import { normalizeAccountRole } from "@/lib/accounts";
 import { normalizeAlertConfig } from "@/lib/alert-config";
 import { alertCategory } from "@/lib/alert-events";
 import { getProjectGatewayLatest, getProjectsListTelemetry } from "@/lib/gateway-store";
 import { METER_PARAMETERS, readMeterValue } from "@/lib/meter-parameters";
-import { isAdminRole } from "@/lib/permissions";
+import { canAccessAdminProject, isAdminRole } from "@/lib/permissions";
 import { ensureAccountProjectsSchema, ensureCustomerAccountsSchema, getServerSession, requirePermission } from "@/lib/server-auth";
 import { emsDb, jsonField, queryRows } from "@/lib/server-db";
 
@@ -26,6 +27,7 @@ const RESOURCE_NAMES = new Set([
   "diagram-states",
   "project-settings",
   "project-telemetry",
+  "project-managers",
 ]);
 
 /** Lỗi nghiệp vụ: thông điệp được trả nguyên văn cho người dùng với HTTP 400. */
@@ -559,6 +561,27 @@ async function getAccounts() {
   });
 }
 
+/** Tài khoản Manage và việc có được giao dự án này hay không (Admin luôn thấy mọi dự án nên không liệt kê). */
+async function getProjectManagers(projectId: string) {
+  await ensureAccountProjectsSchema();
+  const rows = await queryRows<Row>(
+    `SELECT a.id, a.username, a.email, a.role,
+            CASE WHEN ap.project_id IS NULL THEN 0 ELSE 1 END AS assigned
+       FROM accounts a
+       LEFT JOIN account_projects ap ON ap.account_id = a.id AND ap.project_id = ?
+      ORDER BY a.username, a.id`,
+    [projectId],
+  );
+  return rows
+    .filter((row) => normalizeAccountRole(asString(row.role)) === "Manage")
+    .map((row) => ({
+      id: asString(row.id),
+      username: asString(row.username),
+      email: asString(row.email),
+      assigned: Number(row.assigned) === 1,
+    }));
+}
+
 async function getProjects(projectId?: string, allowedProjectIds?: string[]) {
   if (allowedProjectIds && allowedProjectIds.length === 0) return [];
   const clauses: string[] = [];
@@ -672,6 +695,10 @@ async function getResource(resource: string, request: NextRequest) {
     return getProjects(projectId, allowedProjectIds);
   }
   if (resource === "project-telemetry") return getProjectsListTelemetry();
+  if (resource === "project-managers") {
+    if (!projectId) throw new UserFacingError("Thiếu mã dự án.");
+    return getProjectManagers(projectId);
+  }
   if (resource === "devices") {
     await ensureDeviceColumns();
     const rows = await queryRows<Row>(
@@ -963,13 +990,28 @@ async function saveResource(resource: string, body: Row) {
         const rawPassword = asString(item.password).trim();
         const insertPassword = rawPassword || "123456";
         const role = normalizeAccountRole(asString(item.role));
+        if (rawPassword) {
+          // Đổi mật khẩu tài khoản đã có: bắt buộc đúng mật khẩu hiện tại (so sánh hash ở Node, không so chuỗi trong SQL).
+          const [found] = await connection.execute<RowDataPacket[]>(
+            "SELECT password_hash AS passwordHash FROM accounts WHERE id = ? LIMIT 1",
+            [item.id],
+          );
+          const currentHash = found[0] ? asString(found[0].passwordHash).toLowerCase() : null;
+          if (currentHash) {
+            const currentPassword = asString(item.currentPassword);
+            if (!currentPassword) throw new UserFacingError("Vui lòng nhập mật khẩu hiện tại.");
+            const provided = createHash("sha256").update(currentPassword, "utf8").digest("hex");
+            if (provided !== currentHash) throw new UserFacingError("Mật khẩu hiện tại không đúng.");
+          }
+        }
+        // Đổi mật khẩu khi có nhập: cờ số thay cho `? = ''` (tránh lỗi trộn collation trên MariaDB Hostinger).
         await connection.execute(
           `INSERT INTO accounts (id, username, email, role, password_hash, created_at)
            VALUES (?, ?, ?, ?, SHA2(?, 256), STR_TO_DATE(?, '%d/%m/%Y'))
            ON DUPLICATE KEY UPDATE username=VALUES(username), email=VALUES(email),
              role=VALUES(role), created_at=VALUES(created_at),
-             password_hash=IF(? = '', password_hash, SHA2(?, 256))`,
-          [item.id, item.username, item.email, role, insertPassword, item.createdAt, rawPassword, rawPassword],
+             password_hash=IF(? = 1, SHA2(?, 256), password_hash)`,
+          [item.id, item.username, item.email, role, insertPassword, item.createdAt, rawPassword ? 1 : 0, rawPassword],
         );
         if (role === "Admin" || Array.isArray(item.projectIds)) {
           await connection.execute("DELETE FROM account_projects WHERE account_id = ?", [item.id]);
@@ -989,6 +1031,32 @@ async function saveResource(resource: string, body: Row) {
     });
     return getAccounts();
   }
+  if (resource === "project-managers") {
+    await ensureAccountProjectsSchema();
+    const projectId = asString(body.projectId).trim();
+    if (!projectId) throw new UserFacingError("Thiếu mã dự án.");
+    const requested = new Set(
+      (Array.isArray(body.accountIds) ? body.accountIds : []).map((id: unknown) => asString(id).trim()).filter(Boolean),
+    );
+    const managerIds = (await getProjectManagers(projectId)).map((item) => item.id);
+    await transaction(async (connection) => {
+      // Chỉ thay phần gán của các tài khoản Manage cho đúng dự án này, không đụng tới dự án khác.
+      for (const accountId of managerIds) {
+        if (requested.has(accountId)) {
+          await connection.execute(
+            "INSERT IGNORE INTO account_projects (account_id, project_id) VALUES (?, ?)",
+            [accountId, projectId],
+          );
+        } else {
+          await connection.execute(
+            "DELETE FROM account_projects WHERE account_id = ? AND project_id = ?",
+            [accountId, projectId],
+          );
+        }
+      }
+    });
+    return getProjectManagers(projectId);
+  }
   if (resource === "customer-accounts") {
     await ensureCustomerAccountsSchema();
     const rawPassword = asString(body.password).trim();
@@ -999,8 +1067,8 @@ async function saveResource(resource: string, body: Row) {
        VALUES (?, ?, ?, ?, ?, ?, SHA2(?, 256))
        ON DUPLICATE KEY UPDATE username=VALUES(username), email=VALUES(email),
          display_name=VALUES(display_name), role=VALUES(role), project_id=VALUES(project_id),
-         password_hash=IF(? = '', password_hash, SHA2(?, 256))`,
-      [body.id, body.username, body.email, body.displayName, role, body.projectId, insertPassword, rawPassword, rawPassword],
+         password_hash=IF(? = 1, SHA2(?, 256), password_hash)`,
+      [body.id, body.username, body.email, body.displayName, role, body.projectId, insertPassword, rawPassword ? 1 : 0, rawPassword],
     );
     return getResource(resource, new NextRequest("http://localhost/api/ems/customer-accounts"));
   }
@@ -1372,6 +1440,11 @@ export async function GET(request: NextRequest, context: Params) {
   try {
     const resource = await resourceName(context);
     if (!RESOURCE_NAMES.has(resource)) return badRequest("Tài nguyên không hợp lệ.");
+    if (resource === "project-managers") {
+      const gate = await requirePermission("viewProjects");
+      const projectId = request.nextUrl.searchParams.get("projectId") ?? "";
+      if (!gate.ok || !canAccessAdminProject(gate.session, projectId)) return forbidden();
+    }
     return Response.json(await getResource(resource, request));
   } catch (error) {
     return serverError(error);
@@ -1382,7 +1455,7 @@ export async function POST(request: NextRequest, context: Params) {
   try {
     const resource = await resourceName(context);
     if (!RESOURCE_NAMES.has(resource)) return badRequest("Tài nguyên không hợp lệ.");
-    if (resource === "accounts") {
+    if (resource === "accounts" || resource === "project-managers") {
       const gate = await requirePermission("manageUsers");
       if (!gate.ok) return forbidden("Chỉ Quản trị viên được quản lý người dùng.");
     }
