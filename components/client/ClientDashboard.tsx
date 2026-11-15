@@ -257,32 +257,22 @@ export function ClientDashboard({ project }: { project: Project }) {
           }
         }
 
+        // Chỉ đếm điểm đo của chính dự án này. Dự án chưa có điểm đo => 0 (không lấy thư viện thiết bị chung
+        // của cả hệ thống). Điểm đo chưa có bản tin nào (chưa gán đồng hồ / gateway chưa gửi) => ngoại tuyến.
         const counts = { normal: 0, warning: 0, offline: 0 };
-        if (meters.length > 0) {
-          const nowMs = Date.now();
-          for (const meter of meters) {
-            const sample = latestList.find((s) => s.meterPointId === meter.id);
-            const linkedDev = meter.deviceId ? devices.find((d) => d.id === meter.deviceId) : undefined;
-            const sampleMs = sample?.at
-              ? Date.parse(`${sample.at.replace(" ", "T")}Z`)
-              : Number.NaN;
-            const isTimedOut = Number.isFinite(sampleMs) ? nowMs - sampleMs > timeoutMs : linkedDev?.status === "offline";
-            if (isTimedOut || linkedDev?.status === "offline") {
-              counts.offline += 1;
-            } else if (warningPointIds.has(meter.id) || linkedDev?.status === "maintenance") {
-              counts.warning += 1;
-            } else {
-              counts.normal += 1;
-            }
-          }
-        } else {
-          const deviceIds = new Set(meters.map((meter) => meter.deviceId).filter(Boolean));
-          const projectDevices = devices.filter((device) => deviceIds.has(device.id));
-          const sourceDevices = projectDevices.length ? projectDevices : devices;
-          for (const device of sourceDevices) {
-            if (device.status === "offline") counts.offline += 1;
-            else if (device.status === "maintenance") counts.warning += 1;
-            else counts.normal += 1;
+        const nowMs = Date.now();
+        for (const meter of meters) {
+          const sample = latestList.find((s) => s.meterPointId === meter.id);
+          const linkedDev = meter.deviceId ? devices.find((d) => d.id === meter.deviceId) : undefined;
+          const sampleMs = sample?.at ? Date.parse(`${sample.at.replace(" ", "T")}Z`) : Number.NaN;
+          const isOffline =
+            !Number.isFinite(sampleMs) || nowMs - sampleMs > timeoutMs || linkedDev?.status === "offline";
+          if (isOffline) {
+            counts.offline += 1;
+          } else if (warningPointIds.has(meter.id) || linkedDev?.status === "maintenance") {
+            counts.warning += 1;
+          } else {
+            counts.normal += 1;
           }
         }
 
