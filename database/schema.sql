@@ -12,6 +12,8 @@ CREATE TABLE IF NOT EXISTS accounts (
   id VARCHAR(64) NOT NULL,
   username VARCHAR(100) NOT NULL,
   email VARCHAR(255) NOT NULL,
+  full_name VARCHAR(150) NULL,
+  phone VARCHAR(40) NULL,
   role VARCHAR(80) NOT NULL,
   password_hash CHAR(64) NOT NULL,
   created_at DATE NOT NULL,
@@ -215,6 +217,7 @@ CREATE TABLE IF NOT EXISTS alert_recipients (
   name VARCHAR(150) NOT NULL,
   email VARCHAR(255) NOT NULL,
   phone VARCHAR(40) NOT NULL,
+  channels VARCHAR(100) NULL,
   PRIMARY KEY (id),
   KEY idx_alert_recipients_project (project_id),
   CONSTRAINT fk_alert_recipients_project

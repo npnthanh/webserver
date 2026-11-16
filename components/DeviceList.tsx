@@ -57,13 +57,6 @@ export function DeviceList() {
   const start = (currentPage - 1) * PAGE_SIZE;
   const rows = filtered.slice(start, start + PAGE_SIZE);
 
-  const stats = useMemo(() => {
-    const mapped = devices.filter((d) => (d.registers?.length ?? 0) > 0).length;
-    const withImage = devices.filter((d) => Boolean(d.image)).length;
-    const brandsCount = new Set(devices.map((d) => d.brand)).size;
-    return { total: devices.length, mapped, withImage, brandsCount };
-  }, [devices]);
-
   async function removeDevice(id: string) {
     setDeleteError("");
     try {
@@ -78,19 +71,9 @@ export function DeviceList() {
     <div className="mx-auto max-w-[1400px] p-4 sm:p-6 lg:p-8 font-sans">
       {/* Header */}
       <div className="mb-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div>
-          <div className="flex flex-wrap items-center gap-2.5 sm:gap-3">
-            <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-slate-900">
-              Thư viện loại đồng hồ
-            </h1>
-            <span className="rounded-full bg-slate-100 px-2.5 py-0.5 text-xs font-semibold text-slate-600">
-              {devices.length} models
-            </span>
-          </div>
-          <p className="mt-1 text-xs text-slate-500">
-            Cấu hình danh mục loại đồng hồ, địa chỉ thanh ghi nhận dữ liệu từ gateway dùng chung cho toàn hệ thống.
-          </p>
-        </div>
+        <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-slate-900">
+          Thư viện loại đồng hồ
+        </h1>
         <Link
           href="/thiet-bi/them-moi"
           className="inline-flex h-10 items-center justify-center gap-2 rounded-xl bg-emerald-600 px-4 text-xs font-semibold text-white shadow-sm hover:bg-emerald-700 transition-colors shrink-0"
@@ -104,32 +87,8 @@ export function DeviceList() {
       <div className="mb-6 sm:mb-8 grid gap-3 sm:gap-4 grid-cols-1 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard
           label="TỔNG LOẠI ĐỒNG HỒ"
-          value={String(stats.total)}
-          hint="Catalog tiêu chuẩn"
+          value={String(devices.length)}
           icon={<BoxIcon className="h-5 w-5 text-slate-700" />}
-          iconWrap="bg-slate-100"
-        />
-        <StatCard
-          label="ĐÃ CẤU HÌNH THANH GHI"
-          value={String(stats.mapped)}
-          valueClass="text-emerald-700"
-          hint="Sẵn sàng đọc Modbus/MQTT"
-          icon={<CheckIcon className="h-5 w-5 text-emerald-600" />}
-          iconWrap="bg-emerald-50"
-        />
-        <StatCard
-          label="CÓ ẢNH NHẬN DIỆN"
-          value={String(stats.withImage)}
-          valueClass="text-cyan-700"
-          hint="Hỗ trợ hiển thị trực quan"
-          icon={<CameraIcon className="h-5 w-5 text-cyan-600" />}
-          iconWrap="bg-cyan-50"
-        />
-        <StatCard
-          label="THƯƠNG HIỆU HỖ TRỢ"
-          value={String(stats.brandsCount)}
-          hint="Hãng sản xuất thiết bị"
-          icon={<TagIcon className="h-5 w-5 text-slate-600" />}
           iconWrap="bg-slate-100"
         />
       </div>
@@ -187,22 +146,19 @@ export function DeviceList() {
 
         {view === "list" ? (
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[960px] text-left text-xs">
+            <table className="w-full min-w-[560px] text-left text-xs">
               <thead>
                 <tr className="border-b border-slate-100 bg-slate-50/60 text-[11px] font-semibold tracking-wider text-slate-400 uppercase">
                   <th className="px-5 py-3">Tên Model & Chủng loại</th>
                   <th className="px-5 py-3">Thương hiệu</th>
                   <th className="px-5 py-3">Phân loại</th>
-                  <th className="px-5 py-3">Dự án đang gắn</th>
-                  <th className="px-5 py-3">Giao thức</th>
-                  <th className="px-5 py-3">Hàm dữ liệu</th>
                   <th className="px-5 py-3 text-right">Thao tác</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {rows.length === 0 ? (
                   <tr>
-                    <td colSpan={7} className="px-5 py-12 text-center text-slate-400">
+                    <td colSpan={4} className="px-5 py-12 text-center text-slate-400">
                       Không tìm thấy loại đồng hồ nào phù hợp.
                     </td>
                   </tr>
@@ -224,16 +180,9 @@ export function DeviceList() {
                                 <Icon className="h-4 w-4" />
                               )}
                             </span>
-                            <div>
-                              <span className="block font-semibold text-slate-900">
-                                {device.name}
-                              </span>
-                              <span className="block font-mono text-[11px] text-slate-400">
-                                {device.brandModel}
-                                {device.category ? ` · ${device.category}` : ""}
-                                {device.sn ? ` · ${device.sn}` : ""}
-                              </span>
-                            </div>
+                            <span className="block font-semibold text-slate-900">
+                              {device.name}
+                            </span>
                           </div>
                         </td>
                         <td className="px-5 py-3.5 font-medium text-slate-700">
@@ -243,38 +192,6 @@ export function DeviceList() {
                           <span className="inline-flex rounded-full bg-slate-100 px-2.5 py-0.5 text-[11px] font-semibold text-slate-600 border border-slate-200/60">
                             {device.type}
                           </span>
-                        </td>
-                        <td className="px-5 py-3.5">
-                          {linked.length > 0 ? (
-                            <div className="flex flex-col gap-1">
-                              {linked.map((link) => (
-                                <Link
-                                  key={link.meterId}
-                                  href={`/chinh-sua-du-an/${encodeURIComponent(link.projectId)}`}
-                                  className="text-[11px] font-semibold text-emerald-700 hover:underline"
-                                  title={`Điểm đo: ${link.meterName}`}
-                                >
-                                  {link.projectName}
-                                  <span className="font-normal text-slate-500"> · {link.meterName}</span>
-                                </Link>
-                              ))}
-                            </div>
-                          ) : (
-                            <span className="text-slate-400">Chưa gắn dự án</span>
-                          )}
-                        </td>
-                        <td className="px-5 py-3.5 text-slate-600 font-mono text-[11px]">
-                          {device.protocol || "—"}
-                        </td>
-                        <td className="px-5 py-3.5">
-                          {(device.registers?.length ?? 0) > 0 ? (
-                            <span className="inline-flex items-center gap-1.5 text-emerald-700 font-medium">
-                              <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
-                              {device.registers?.length} điểm đo
-                            </span>
-                          ) : (
-                            <span className="text-slate-400">Chưa cấu hình</span>
-                          )}
                         </td>
                         <td className="px-5 py-3.5 text-right">
                           <div className="flex justify-end gap-1">
@@ -329,22 +246,9 @@ export function DeviceList() {
                         {device.name}
                       </p>
                       <p className="text-[11px] text-slate-400">{device.brand}</p>
-                      <p className="mt-1 text-xs text-slate-600 font-mono">
-                        {device.protocol || "Chưa chọn giao thức"}
-                      </p>
-                      <p className="mt-1 truncate text-[11px] text-slate-500">
-                        {(device.projects?.length ?? 0) > 0
-                          ? `Dự án: ${device.projects!.map((link) => link.projectName).join(", ")}`
-                          : "Chưa gắn dự án"}
-                      </p>
-                      <div className="mt-2.5 flex items-center justify-between gap-2 border-t border-slate-100 pt-2 text-[11px]">
+                      <div className="mt-2.5 border-t border-slate-100 pt-2 text-[11px]">
                         <span className="rounded-full bg-slate-100 px-2 py-0.5 font-medium text-slate-600">
                           {device.type}
-                        </span>
-                        <span className="text-slate-500 font-medium">
-                          {(device.registers?.length ?? 0) > 0
-                            ? `${device.registers?.length} điểm dữ liệu`
-                            : "Chưa cấu hình"}
                         </span>
                       </div>
                     </div>
@@ -366,15 +270,6 @@ export function DeviceList() {
             totalPages={totalPages}
             onChange={setPage}
           />
-        </div>
-
-        {/* Subtle Tip Banner */}
-        <div className="flex items-start gap-2.5 border-t border-emerald-100 bg-emerald-50/40 px-5 py-3 text-xs text-emerald-800">
-          <InfoIcon className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
-          <p>
-            <strong className="font-semibold">Mẹo vận hành:</strong> Đây là danh mục loại thiết bị dùng chung cho toàn hệ thống.
-            Khi thêm điểm đo trong từng dự án, bạn chỉ cần chọn loại đồng hồ tương ứng mà không cần khai báo lại thanh ghi Modbus.
-          </p>
         </div>
       </section>
 
@@ -575,32 +470,6 @@ function BoxIcon({ className }: { className?: string }) {
   );
 }
 
-function CheckIcon({ className }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <polyline points="20 6 9 17 4 12" />
-    </svg>
-  );
-}
-
-function CameraIcon({ className }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z" />
-      <circle cx="12" cy="13" r="3" />
-    </svg>
-  );
-}
-
-function TagIcon({ className }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M12 2H2v10l9.29 9.29c.94.94 2.48.94 3.42 0l6.58-6.58c.94-.94.94-2.48 0-3.42L12 2Z" />
-      <path d="M7 7h.01" />
-    </svg>
-  );
-}
-
 function FilterIcon({ className }: { className?: string }) {
   return (
     <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
@@ -641,15 +510,6 @@ function TrashIcon({ className }: { className?: string }) {
   return (
     <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
       <path d="M3 6h18M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" />
-    </svg>
-  );
-}
-
-function InfoIcon({ className }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-      <circle cx="12" cy="12" r="10" />
-      <path d="M12 16v-4M12 8h.01" />
     </svg>
   );
 }

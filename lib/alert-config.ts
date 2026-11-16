@@ -46,11 +46,12 @@ export type NotificationChannelsConfig = {
   emailRecipient: string;
 };
 
+/** Không còn dữ liệu mẫu: kênh gửi thật cấu hình ở Cấu hình → Cấu hình thông báo. */
 export const DEFAULT_NOTIFICATION_CHANNELS: NotificationChannelsConfig = {
-  zaloEnabled: true,
-  zaloRecipient: "Zalo OA / Nhóm kỹ thuật vận hành",
-  telegramEnabled: true,
-  telegramChatId: "@ems_alert_bot",
+  zaloEnabled: false,
+  zaloRecipient: "",
+  telegramEnabled: false,
+  telegramChatId: "",
   emailEnabled: false,
   emailRecipient: "",
 };

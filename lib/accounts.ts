@@ -6,6 +6,9 @@ export type AccountRole = "Admin" | "Manage";
 export type Account = {
   id: string;
   username: string;
+  /** Họ tên và SĐT: tự điền vào thông tin liên hệ của dự án khi tài khoản được giao quản lý. */
+  fullName?: string;
+  phone?: string;
   email: string;
   role: AccountRole;
   createdAt: string;

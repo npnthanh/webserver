@@ -4,6 +4,7 @@ import { normalizeAccountRole } from "@/lib/accounts";
 import type { AuthSession } from "@/lib/auth";
 import { hasPermission, type Permission } from "@/lib/permissions";
 import { emsDb, queryRows } from "@/lib/server-db";
+import { applyDueManagerSchedules } from "@/lib/server-project-manager";
 
 const SESSION_COOKIE = "ems-session";
 
@@ -85,6 +86,8 @@ export async function getServerSession(): Promise<AuthSession | null> {
     let managedProjectIds: string[] | undefined;
     if (row.portal === "admin") {
       await ensureAccountProjectsSchema();
+      // Đến ngày hẹn chuyển giao người quản lý thì áp dụng trước khi tính quyền theo dự án.
+      await applyDueManagerSchedules();
       const projectRows = await queryRows<{ projectId: string }>(
         "SELECT project_id AS projectId FROM account_projects WHERE account_id = ? ORDER BY project_id",
         [userId],

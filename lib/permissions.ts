@@ -93,6 +93,9 @@ export function permissionForPath(pathname: string): Permission | null {
   }
   if (pathname === "/gateway" || pathname.startsWith("/gateway/")) return "manageGateway";
   if (pathname === "/thiet-bi" || pathname.startsWith("/thiet-bi/")) return "manageDevices";
+  // Cấu hình thông báo chứa thông tin đăng nhập dịch vụ gửi tin: chỉ Quản trị viên.
+  if (pathname === "/cau-hinh/thong-bao" || pathname.startsWith("/cau-hinh/thong-bao/")) return "manageUsers";
+  if (pathname === "/cau-hinh" || pathname.startsWith("/cau-hinh/")) return "manageDevices";
   if (pathname === "/he-so-phat-thai" || pathname.startsWith("/he-so-phat-thai/")) {
     return "manageEmissionFactors";
   }

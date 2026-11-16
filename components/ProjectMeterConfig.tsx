@@ -15,7 +15,7 @@ import {
 } from "@/lib/projects";
 import { upsertMeterTypeDef } from "@/lib/meter-types";
 import { projectConfigPath } from "@/lib/project-config";
-import { hydrateClientMeters, orderMetersByTree, type ClientMeter } from "@/lib/client-meters";
+import { hydrateClientMeters, orderMetersByTree, saveClientMeters, type ClientMeter } from "@/lib/client-meters";
 import { hydrateDevices, type CatalogDevice } from "@/lib/devices";
 import { hydrateAlertEvents } from "@/lib/alert-events";
 import { hydrateMeterReadings } from "@/lib/meter-readings";
@@ -94,6 +94,10 @@ export function ProjectMeterConfig({ project }: { project: Project }) {
   const [allPoints, setAllPoints] = useState<MeterPoint[]>([]);
   const [meterDataReady, setMeterDataReady] = useState(false);
   const [alertCount, setAlertCount] = useState(0);
+  const [rawMeters, setRawMeters] = useState<ClientMeter[]>([]);
+  const [reloadTick, setReloadTick] = useState(0);
+  const [pointToDelete, setPointToDelete] = useState<MeterPoint | null>(null);
+  const [deleteError, setDeleteError] = useState("");
 
   useEffect(() => {
     setEnergies(resolveMeterTypes(project));
@@ -108,6 +112,7 @@ export function ProjectMeterConfig({ project }: { project: Project }) {
       hydrateAlertEvents(project.id),
     ]).then(([meters, devices, readings, alerts]) => {
       if (!active) return;
+      setRawMeters(meters);
       setAllPoints(fromDbMeters(meters, devices, readings));
       setMeterDataReady(true);
       setAlertCount(alerts.filter((event) => event.status !== "resolved").length);
@@ -119,7 +124,24 @@ export function ProjectMeterConfig({ project }: { project: Project }) {
     return () => {
       active = false;
     };
-  }, [project.id]);
+  }, [project.id, reloadTick]);
+
+  /** Xóa điểm đo: các điểm đo con chuyển lên làm con của điểm cha trên một cấp (hoặc thành điểm gốc). */
+  async function deletePoint(point: MeterPoint) {
+    const target = rawMeters.find((item) => item.id === point.id);
+    if (!target) return;
+    const next = rawMeters
+      .filter((item) => item.id !== point.id)
+      .map((item) => (item.parentId === point.id ? { ...item, parentId: target.parentId ?? null } : item));
+    setDeleteError("");
+    try {
+      await saveClientMeters(project.id, next);
+      setPointToDelete(null);
+      setReloadTick((tick) => tick + 1);
+    } catch (error) {
+      setDeleteError(error instanceof Error ? error.message : "Không xóa được điểm đo.");
+    }
+  }
 
   function persistEnergies(next: MeterType[]) {
     setEnergies(next);
@@ -147,17 +169,15 @@ export function ProjectMeterConfig({ project }: { project: Project }) {
     [flatPoints],
   );
 
-  const deviceTypes = useMemo(
-    () => Array.from(new Set(flatPoints.map((p) => p.type))).sort(),
-    [flatPoints],
-  );
+  // Loại thiết bị = loại điểm đo (Điện, Nước, Nhiệt, Hơi, ...) đã bật cho dự án.
+  const deviceTypes = energies;
 
   const filteredRoots = useMemo(() => {
     const q = query.trim().toLowerCase();
 
     function match(point: MeterPoint): boolean {
       const energyOk = energies.includes(point.energy);
-      const typeOk = deviceType === "all" || point.type === deviceType;
+      const typeOk = deviceType === "all" || point.energy === deviceType;
       const textOk =
         !q ||
         point.name.toLowerCase().includes(q) ||
@@ -220,42 +240,14 @@ export function ProjectMeterConfig({ project }: { project: Project }) {
           </Link>
         }
       />
-          <div className="mb-5 grid gap-3.5 sm:gap-4 grid-cols-1 sm:grid-cols-2 xl:grid-cols-4">
-            <StatCard
-              label="TỔNG ĐIỂM ĐO"
-              value={String(flatPoints.length)}
-              hint={<span className="text-emerald-600">đồng bộ từ database</span>}
-            />
-            <StatCard
-              label="ĐANG KẾT NỐI"
-              value={String(connectedPoints)}
-              valueClass="text-emerald-600"
-              hint={<span className="text-slate-500">active</span>}
-            />
+          <div className="mb-5 grid gap-3.5 sm:gap-4 grid-cols-1 sm:grid-cols-3">
+            <StatCard label="TỔNG ĐIỂM ĐO" value={String(flatPoints.length)} />
+            <StatCard label="ĐANG KẾT NỐI" value={String(connectedPoints)} valueClass="text-emerald-600" />
             <StatCard
               label="KHÔNG KẾT NỐI"
               value={String(disconnectedPoints)}
               valueClass={disconnectedPoints > 0 ? "text-amber-500" : "text-slate-900"}
-              hint={
-                disconnectedPoints > 0 ? (
-                  <span className="text-amber-600">mất kết nối</span>
-                ) : (
-                  <span className="text-emerald-600">tất cả trực tuyến</span>
-                )
-              }
             />
-            <article className="rounded-xl border border-slate-200 bg-white p-4 shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
-              <p className="text-[11px] font-semibold tracking-wide text-slate-400">
-                BÁO CÁO MỚI NHẤT
-              </p>
-              <button
-                type="button"
-                className="mt-3 inline-flex items-center gap-2 text-sm font-semibold text-emerald-600 hover:text-emerald-700 hover:underline"
-              >
-                <DownloadIcon className="h-4 w-4" />
-                Tải về báo cáo tháng 10
-              </button>
-            </article>
           </div>
 
           <div className="mb-4 flex flex-wrap items-center gap-2">
@@ -330,9 +322,6 @@ export function ProjectMeterConfig({ project }: { project: Project }) {
               </button>
             )}
           </div>
-          <p className="mb-3 text-xs text-slate-400">
-            Các loại điểm đo này sẽ hiển thị trên thanh công cụ trang Sơ đồ của khách.
-          </p>
 
           <div className="mb-4 flex flex-wrap items-center gap-3">
             <label className="relative min-w-[240px] flex-1">
@@ -404,6 +393,10 @@ export function ProjectMeterConfig({ project }: { project: Project }) {
                         hasChildren={hasChildren}
                         isOpen={isOpen}
                         onToggle={() => toggleExpand(point.id)}
+                        onDelete={(target) => {
+                          setDeleteError("");
+                          setPointToDelete(target);
+                        }}
                       />
                     );
                   })}
@@ -460,6 +453,25 @@ export function ProjectMeterConfig({ project }: { project: Project }) {
         }}
         onCancel={() => setEnergyToDelete(null)}
       />
+
+      <ConfirmDialog
+        open={Boolean(pointToDelete)}
+        title="Xác nhận xóa điểm đo"
+        description={
+          deleteError ||
+          `Xóa điểm đo "${pointToDelete?.name}" khỏi dự án?${
+            pointToDelete?.children?.length ? " Các điểm đo con sẽ chuyển lên cấp trên." : ""
+          } Dữ liệu đo đã ghi nhận của đồng hồ không bị xóa.`
+        }
+        confirmText="Xác nhận xóa"
+        onConfirm={() => {
+          if (pointToDelete) void deletePoint(pointToDelete);
+        }}
+        onCancel={() => {
+          setPointToDelete(null);
+          setDeleteError("");
+        }}
+      />
     </div>
   );
 }
@@ -471,6 +483,7 @@ function DeviceRows({
   hasChildren,
   isOpen,
   onToggle,
+  onDelete,
 }: {
   projectId: string;
   point: MeterPoint;
@@ -478,6 +491,7 @@ function DeviceRows({
   hasChildren: boolean;
   isOpen: boolean;
   onToggle: () => void;
+  onDelete: (point: MeterPoint) => void;
 }) {
   const Icon = kindIcons[point.kind];
 
@@ -507,7 +521,7 @@ function DeviceRows({
             </span>
           </div>
         </td>
-        <td className="px-5 py-3.5 text-slate-600">{point.type}</td>
+        <td className="px-5 py-3.5 text-slate-600">{point.energy}</td>
         <td className="px-5 py-3.5">
           <span className="inline-flex items-center gap-2 text-sm font-medium">
             <span
@@ -542,6 +556,15 @@ function DeviceRows({
             >
               <EditIcon className="h-4 w-4" />
             </Link>
+            <button
+              type="button"
+              onClick={() => onDelete(point)}
+              className="flex h-8 w-8 items-center justify-center rounded-md text-slate-400 hover:bg-rose-50 hover:text-rose-600"
+              aria-label="Xóa điểm đo"
+              title="Xóa điểm đo"
+            >
+              <TrashIcon className="h-4 w-4" />
+            </button>
           </div>
         </td>
       </tr>
@@ -556,6 +579,7 @@ function DeviceRows({
             hasChildren={Boolean(child.children?.length)}
             isOpen={false}
             onToggle={() => undefined}
+            onDelete={onDelete}
           />
         ))}
     </>
@@ -573,19 +597,16 @@ function formatValue(value: number, unit: string) {
 function StatCard({
   label,
   value,
-  hint,
   valueClass = "text-slate-900",
 }: {
   label: string;
   value: string;
-  hint: ReactNode;
   valueClass?: string;
 }) {
   return (
     <article className="rounded-xl border border-slate-200 bg-white p-4 shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
       <p className="text-[11px] font-semibold tracking-wide text-slate-400">{label}</p>
       <p className={`mt-2 text-3xl font-bold tracking-tight ${valueClass}`}>{value}</p>
-      <p className="mt-1.5 text-xs font-medium">{hint}</p>
     </article>
   );
 }
@@ -634,13 +655,6 @@ function SearchIcon({ className }: { className?: string }) {
   );
 }
 
-function DownloadIcon({ className }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" aria-hidden>
-      <path d="M12 4v10M8 10l4 4 4-4M5 18h14" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  );
-}
 
 function ChevronIcon({ className }: { className?: string }) {
   return (
@@ -705,6 +719,14 @@ function EditIcon({ className }: { className?: string }) {
     <svg className={className} viewBox="0 0 24 24" fill="none" aria-hidden>
       <path d="M4 17.5V20h2.5L18 8.5 15.5 6 4 17.5Z" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" />
       <path d="M13.8 7.7 16.3 10.2" stroke="currentColor" strokeWidth="1.8" />
+    </svg>
+  );
+}
+
+function TrashIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M3 6h18M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" />
     </svg>
   );
 }

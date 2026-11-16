@@ -19,6 +19,15 @@ const GAS_META: Record<GasKey, { label: string; className: string }> = {
   n2o: { label: "N₂O", className: "bg-violet-50 text-violet-700 border-violet-200/60" },
 };
 
+/** "CO₂" / "co2" / "CO 2" → "co2" để nhận ra khí chuẩn theo tên. */
+function normalizeGasName(value: string) {
+  return value
+    .replace(/₂/g, "2")
+    .replace(/₄/g, "4")
+    .replace(/\s+/g, "")
+    .toLowerCase();
+}
+
 export function EmissionFactors() {
   const [groups, setGroups] = useState<FactorGroup[]>([]);
   const [query, setQuery] = useState("");
@@ -48,19 +57,9 @@ export function EmissionFactors() {
     <div className="mx-auto max-w-[1400px] p-4 sm:p-6 lg:p-8 font-sans">
       {/* Header */}
       <div className="mb-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div>
-          <div className="flex items-center gap-3">
-            <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-slate-900">
-              Quản lý hệ số phát thải
-            </h1>
-            <span className="rounded-full bg-slate-100 px-2.5 py-0.5 text-xs font-semibold text-slate-600">
-              {groups.length} nhóm hệ số
-            </span>
-          </div>
-          <p className="mt-1 text-xs text-slate-500">
-            Thư viện hệ số phát thải phục vụ quy đổi năng lượng và kiểm kê carbon theo tiêu chuẩn GHG Protocol và Bộ TN&MT.
-          </p>
-        </div>
+        <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-slate-900">
+          Quản lý hệ số phát thải
+        </h1>
         <Link
           href="/he-so-phat-thai/them-moi"
           className="inline-flex h-10 items-center justify-center gap-2 rounded-xl bg-emerald-600 px-4 text-xs font-semibold text-white shadow-sm hover:bg-emerald-700 transition-colors shrink-0"
@@ -104,9 +103,14 @@ export function EmissionFactors() {
                 group.gases.map((gas, index) => {
                   const first = index === 0;
                   const last = index === group.gases.length - 1;
-                  const gasMeta = (GAS_META as Record<string, { label: string; className: string }>)[gas.key] ?? {
-                    label: gas.label || String(gas.key || "GAS").toUpperCase(),
-                    className: "bg-slate-50 text-slate-700 border-slate-200/60",
+                  // Hiển thị đúng tên khí đã lưu (VD đổi CO2 → H2O); mã khí (gas.key) giữ nguyên vì nguồn phát thải tham chiếu theo mã.
+                  // Màu chip chọn theo tên đang hiển thị, khí lạ dùng màu trung tính.
+                  const metaTable = GAS_META as Record<string, { label: string; className: string }>;
+                  const savedLabel = gas.label?.trim() || metaTable[gas.key]?.label || String(gas.key || "GAS").toUpperCase();
+                  const knownMeta = metaTable[normalizeGasName(savedLabel)];
+                  const gasMeta = {
+                    label: knownMeta?.label ?? savedLabel,
+                    className: knownMeta?.className ?? "bg-slate-50 text-slate-700 border-slate-200/60",
                   };
                   return (
                     <tr
@@ -204,16 +208,6 @@ export function EmissionFactors() {
           </div>
         </div>
       </section>
-
-      {/* Note Banner */}
-      <div className="mt-5 flex items-start gap-3 rounded-2xl border border-emerald-100 bg-emerald-50/40 p-4 text-xs text-emerald-900">
-        <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-emerald-600 text-[10px] font-bold text-white">
-          i
-        </span>
-        <p className="leading-relaxed">
-          <strong className="font-semibold">Căn cứ tiêu chuẩn:</strong> Hệ số phát thải được phân loại theo các chất khí gây hiệu ứng nhà kính chính (CO₂, CH₄, N₂O) và quy đổi sang tấn CO₂ tương đương ($tCO_2e$) dựa theo GWP (Global Warming Potential) công bố bởi IPCC và quy chuẩn của Bộ Tài nguyên & Môi trường.
-        </p>
-      </div>
     </div>
   );
 }

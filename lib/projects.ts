@@ -8,11 +8,22 @@ export type MeterType = string;
 export const METER_TYPES: MeterType[] = ["Điện", "Nước", "Nhiệt", "Hơi"];
 export const EXTRA_METER_TYPE_SUGGESTIONS: MeterType[] = ["Khí nén"];
 
+export type AlertChannel = "Email" | "SMS" | "Zalo" | "Telegram";
+
+/** Các kênh có thể chọn cho người nhận cảnh báo (chọn nhiều). */
+export const ALERT_CHANNELS: AlertChannel[] = ["Email", "SMS", "Zalo", "Telegram"];
+
 export type AlertRecipient = {
   id: string;
   name: string;
   email: string;
   phone: string;
+  /** Kênh nhận cảnh báo của người này. */
+  channels?: AlertChannel[];
+  /** Telegram: Chat ID (lấy ở Cấu hình thông báo → "Lấy Chat ID"). */
+  telegramChatId?: string;
+  /** Zalo OA: user ID của người đã quan tâm OA. */
+  zaloUserId?: string;
 };
 
 export type Project = {

@@ -37,9 +37,10 @@ export type AlertCategory =
   | "power";
 
 export type DeliveryChannelStatus = {
-  channel: "Zalo" | "Telegram" | "Email";
+  channel: string;
   recipient: string;
   delivered: boolean;
+  error?: string;
 };
 
 export interface AlertItem {
@@ -62,35 +63,6 @@ export interface AlertItem {
   deliveries: DeliveryChannelStatus[];
 }
 
-function buildDeliveryStatuses(
-  notifications: NotificationChannelsConfig,
-  note?: string,
-): DeliveryChannelStatus[] {
-  const failedInNote = note ? /fail|lỗi|thất bại/i.test(note) : false;
-  const list: DeliveryChannelStatus[] = [];
-  if (notifications.zaloEnabled) {
-    list.push({
-      channel: "Zalo",
-      recipient: notifications.zaloRecipient || "Zalo OA",
-      delivered: !failedInNote,
-    });
-  }
-  if (notifications.telegramEnabled) {
-    list.push({
-      channel: "Telegram",
-      recipient: notifications.telegramChatId || "@ems_alert_bot",
-      delivered: !failedInNote,
-    });
-  }
-  if (notifications.emailEnabled && notifications.emailRecipient.trim()) {
-    list.push({
-      channel: "Email",
-      recipient: notifications.emailRecipient.trim(),
-      delivered: !failedInNote,
-    });
-  }
-  return list;
-}
 
 function extractMonthKey(rawAt: string): string {
   const vn = vietnamFromStored(rawAt);
@@ -150,7 +122,8 @@ function dbAlertToItem(event: AlertEvent, config: AlertConfig): AlertItem {
     message:
       event.message ??
       `${paramMeta?.name ?? event.parameter}: giá trị đo ${event.value}${unit ? ` ${unit}` : ""}`,
-    deliveries: buildDeliveryStatuses(config.notifications ?? DEFAULT_NOTIFICATION_CHANNELS, event.note),
+    // Trạng thái gửi thật từ nhật ký gửi thông báo (không còn suy diễn từ cấu hình mẫu).
+    deliveries: event.deliveries ?? [],
   };
 }
 
@@ -254,7 +227,8 @@ export function ClientAlerts({ project }: { project: Project }) {
               severity: rule.severity,
               category: cat,
               message: `${rule.name}: giá trị đo ${actual}${unit ? ` ${unit}` : ""} vượt ngưỡng cài đặt (${thresholdStr}${unit ? ` ${unit}` : ""})`,
-              deliveries: buildDeliveryStatuses(userConfig.notifications),
+              // Cảnh báo tính tại trình duyệt chưa được lưu nên chưa có lần gửi nào.
+              deliveries: [],
             });
           }
         }
@@ -714,9 +688,10 @@ export function ClientAlerts({ project }: { project: Project }) {
                       Chưa cấu hình kênh gửi
                     </span>
                   ) : (
-                    item.deliveries.map((d) => (
+                    item.deliveries.map((d, index) => (
                       <span
-                        key={d.channel}
+                        key={`${d.channel}-${d.recipient}-${index}`}
+                        title={`${d.channel}: ${d.recipient}${d.error ? ` – Lỗi: ${d.error}` : ""}`}
                         className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10.5px] font-semibold ${
                           d.delivered
                             ? d.channel === "Zalo"
@@ -856,10 +831,10 @@ export function ClientAlerts({ project }: { project: Project }) {
                           </span>
                         ) : (
                           <div className="flex flex-wrap items-center gap-1.5">
-                            {item.deliveries.map((d) => (
+                            {item.deliveries.map((d, index) => (
                               <span
-                                key={d.channel}
-                                title={`${d.channel}: ${d.recipient}`}
+                                key={`${d.channel}-${d.recipient}-${index}`}
+                                title={`${d.channel}: ${d.recipient}${d.error ? ` – Lỗi: ${d.error}` : ""}`}
                                 className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[11px] font-semibold ${
                                   d.delivered
                                     ? d.channel === "Zalo"

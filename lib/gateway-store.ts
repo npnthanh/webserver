@@ -19,6 +19,7 @@ import {
   type PacketNumber,
 } from "@/lib/gateway-protocol";
 import type { ProjectGatewaySample } from "@/lib/gateway-series";
+import { resolveMeterNames } from "@/lib/server-meter-catalog";
 
 type ThresholdRow = {
   gateway_id: string;
@@ -52,6 +53,9 @@ export type GatewayDeviceView = {
   packetNumber: string | null;
   meterType: string | null;
   meterModel: string | null;
+  /** Tên loại / model dịch từ mã MT/MM theo trang Cấu hình loại đồng hồ (null nếu chưa cấu hình mã). */
+  meterTypeName?: string | null;
+  meterModelName?: string | null;
   meterId: string | null;
   lastReadingTime: string | null;
   lastIsReplay: boolean | null;
@@ -813,6 +817,12 @@ async function ensureUpstreamHistoryBackfill(base: string) {
   return upstreamBackfillInFlight;
 }
 
+/** Đồng bộ trạng thái + gói tin mới nhất từ server upstream (dùng cho bộ lập lịch nền). */
+export async function runUpstreamSync() {
+  await ensureGatewaySchema();
+  await syncFromUpstreamGateway();
+}
+
 async function syncFromUpstreamGateway() {
   const base = upstreamBaseUrl();
   if (!base) return;
@@ -1136,14 +1146,23 @@ export async function getGatewayConsole(input: { from?: string; to?: string; gat
         : safeQuery<RowDataPacket>("SELECT * FROM gateway_thresholds ORDER BY id"),
     ]);
 
-  const mappedGateways = gateways.length
+  const baseGateways = gateways.length
     ? gateways.map(mapDevice)
     : Array.isArray(cachedUpstreamConsole?.gateways)
       ? cachedUpstreamConsole.gateways
       : [];
+  const mappedGateways = await Promise.all(
+    baseGateways.map(async (gateway) => ({
+      ...gateway,
+      ...(await resolveMeterNames(gateway.meterType, gateway.meterModel)),
+    })),
+  );
+  // Chỉ mượn gói tin upstream khi xem tổng quan (không lọc). Khi lọc theo thời gian/gateway mà không có
+  // gói nào thì trả rỗng, tránh hiển thị gói của thời điểm khác như thể thuộc khoảng đang xem.
+  const isFiltered = Boolean(input.from || input.to || input.gatewayId);
   const packetViews = packets.length
     ? packets.map(mapPacket)
-    : Array.isArray(cachedUpstreamConsole?.packets)
+    : !isFiltered && Array.isArray(cachedUpstreamConsole?.packets)
       ? cachedUpstreamConsole.packets.slice(0, 100)
       : [];
   const parameters = new Set<string>();
@@ -2304,19 +2323,16 @@ async function meterIsRegistered(packet: NormalizedPacket) {
   if (!serial) return false;
   // Ghép tiền tố "SN:" ở JS thay vì CONCAT('SN: ', ?) để tránh lỗi trộn collation trên MariaDB.
   const variants = [serial, `SN: ${serial}`, `SN:${serial}`];
+  // Hai EXISTS độc lập: trước đây truy vấn bắt đầu FROM devices nên khi bảng devices rỗng thì
+  // serial chỉ khai báo ở điểm đo (meter_points) cũng bị coi là chưa có.
   const rows = await queryRows<RowDataPacket>(
-    `SELECT 1 AS ok
-       FROM devices d
-      WHERE TRIM(d.serial_number) IN (?, ?, ?)
-         OR EXISTS (
-           SELECT 1
-             FROM meter_points mp
-            WHERE TRIM(mp.serial_number) IN (?, ?, ?)
-         )
-      LIMIT 1`,
+    `SELECT (
+       EXISTS (SELECT 1 FROM devices d WHERE TRIM(d.serial_number) IN (?, ?, ?))
+       OR EXISTS (SELECT 1 FROM meter_points mp WHERE TRIM(mp.serial_number) IN (?, ?, ?))
+     ) AS ok`,
     [...variants, ...variants],
   );
-  return rows.length > 0;
+  return Number(rows[0]?.ok ?? 0) === 1;
 }
 
 function modelCodeForCategory(category: string) {

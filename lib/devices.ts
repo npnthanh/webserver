@@ -41,6 +41,8 @@ export type CatalogDevice = {
   image?: string;
   extraFields?: DeviceExtraField[];
   registers?: DeviceRegister[];
+  /** Model trong trang Cấu hình loại đồng hồ (loại, thương hiệu, tên model, giao thức lấy từ đây). */
+  modelId?: string | null;
   /** Chỉ đọc: các dự án/điểm đo đang gắn đồng hồ này (server tính). */
   projects?: DeviceProjectLink[];
 };

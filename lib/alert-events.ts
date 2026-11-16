@@ -20,6 +20,8 @@ export type AlertEvent = {
   pointCode?: string;
   pointName?: string;
   utility?: string;
+  /** Kết quả gửi thông báo thật (notification_log), server trả kèm. */
+  deliveries?: { channel: string; recipient: string; delivered: boolean; error?: string }[];
 };
 
 const cache: Record<string, AlertEvent[]> = {};

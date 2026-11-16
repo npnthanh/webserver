@@ -2,13 +2,42 @@ import { createHash } from "node:crypto";
 import type { PoolConnection, RowDataPacket } from "mysql2/promise";
 import { NextRequest } from "next/server";
 import { normalizeAccountRole } from "@/lib/accounts";
-import { normalizeAlertConfig } from "@/lib/alert-config";
-import { alertCategory } from "@/lib/alert-events";
-import { getProjectGatewayLatest, getProjectsListTelemetry } from "@/lib/gateway-store";
-import { METER_PARAMETERS, readMeterValue } from "@/lib/meter-parameters";
+import { getProjectsListTelemetry } from "@/lib/gateway-store";
 import { canAccessAdminProject, canManageAccountRole, isAdminRole } from "@/lib/permissions";
 import { ensureAccountProjectsSchema, ensureCustomerAccountsSchema, getServerSession, requirePermission } from "@/lib/server-auth";
 import { emsDb, jsonField, queryRows } from "@/lib/server-db";
+import {
+  ensureNotifierSchema,
+  getMaskedSettings,
+  listDeliveries,
+  listTelegramChats,
+  saveSettings as saveNotificationSettings,
+  sendTestNotification,
+  type NotificationChannel,
+} from "@/lib/server-notifier";
+import {
+  ensureProjectSettingsTable,
+  evaluateProjectAlerts,
+  resetAlertEvalThrottle,
+} from "@/lib/server-alert-engine";
+import {
+  ensureProjectManagerSchema,
+  getProjectManagerState,
+  setProjectManager,
+  syncProjectContact,
+} from "@/lib/server-project-manager";
+import { vietnamNow } from "@/lib/vietnam-time";
+import {
+  CatalogUserError,
+  assertTypeCodeAvailable,
+  assertTypeDeletable,
+  deleteMeterModel,
+  ensureMeterCatalogSchema,
+  invalidateCatalogCache,
+  listMeterModels,
+  parseTypeCode,
+  saveMeterModel,
+} from "@/lib/server-meter-catalog";
 import {
   addProjectEvent,
   decideProjectDeletion,
@@ -29,6 +58,7 @@ const RESOURCE_NAMES = new Set([
   "projects",
   "devices",
   "meter-types",
+  "meter-models",
   "client-meters",
   "emission-factors",
   "ghg-sources",
@@ -38,6 +68,9 @@ const RESOURCE_NAMES = new Set([
   "project-settings",
   "project-telemetry",
   "project-managers",
+  "notification-settings",
+  "notification-test",
+  "telegram-chats",
   "notifications",
   "project-deletions",
 ]);
@@ -54,7 +87,7 @@ function forbidden(message = "Không có quyền thực hiện thao tác này.")
 }
 
 function serverError(error: unknown) {
-  if (error instanceof UserFacingError || error instanceof ProjectEventError) {
+  if (error instanceof UserFacingError || error instanceof ProjectEventError || error instanceof CatalogUserError) {
     return Response.json({ error: error.message }, { status: 400 });
   }
   const sqlMessage =
@@ -91,323 +124,7 @@ function serverError(error: unknown) {
 
 let deviceColumnsReady: Promise<void> | null = null;
 let ghgColumnsReady: Promise<void> | null = null;
-let projectSettingsReady: Promise<void> | null = null;
 let diagramDisplaysReady: Promise<void> | null = null;
-const lastAlertEvalAt = new Map<string, number>();
-
-const GAP_SCAN_LIMIT = 500;
-
-/** Xóa các cặp sự kiện OFF/ONL của điểm đo không còn ứng với khoảng gián đoạn thực tế nào. */
-async function reconcileConnectivityEvents(
-  projectId: string,
-  pointId: string,
-  shortPoint: string,
-  validGapKeys: Set<string>,
-) {
-  const rows = await queryRows<Row>(
-    `SELECT id FROM alert_events
-      WHERE project_id = ? AND meter_point_id = ?
-        AND (id LIKE ? OR id LIKE ?)
-        AND occurred_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 13 DAY)`,
-    [projectId, pointId, `OFF-${shortPoint}-%`, `ONL-${shortPoint}-%`],
-  ).catch(() => [] as Row[]);
-  const stale = rows
-    .map((row) => asString(row.id))
-    .filter((id) => {
-      const key = id.slice(id.lastIndexOf("-") + 1);
-      return key && !validGapKeys.has(key);
-    });
-  if (stale.length === 0) return;
-  await emsDb
-    .query(`DELETE FROM alert_events WHERE id IN (${stale.map(() => "?").join(",")})`, stale)
-    .catch(() => undefined);
-}
-
-let alertCategoryFixReady: Promise<void> | null = null;
-
-/** Sửa một lần các cảnh báo ngưỡng (VD: Van) từng bị lưu nhầm category "connectivity". */
-function fixMisclassifiedAlertCategories() {
-  alertCategoryFixReady ??= (async () => {
-    const rows = await queryRows<Row>(
-      `SELECT DISTINCT parameter_name AS parameter FROM alert_events
-        WHERE category = 'connectivity' AND parameter_name NOT IN ('Mất kết nối', 'Kết nối trở lại')`,
-    );
-    for (const row of rows) {
-      const parameter = asString(row.parameter);
-      await emsDb.execute(
-        `UPDATE alert_events SET category = ?
-          WHERE category = 'connectivity' AND parameter_name = ?`,
-        [alertCategory(parameter).slice(0, 40), parameter],
-      );
-    }
-  })().catch((error) => {
-    alertCategoryFixReady = null;
-    console.error("fixMisclassifiedAlertCategories failed", error);
-  });
-  return alertCategoryFixReady;
-}
-
-async function evaluateProjectAlerts(targetProjectId?: string) {
-  try {
-    await ensureProjectSettingsTable();
-    await fixMisclassifiedAlertCategories();
-    let projectIds: string[] = [];
-    if (targetProjectId) {
-      projectIds = [targetProjectId];
-    } else {
-      const projRows = await queryRows<Row>("SELECT id FROM projects LIMIT 20").catch(() => [] as Row[]);
-      projectIds = projRows.map((r) => asString(r.id)).filter(Boolean);
-    }
-
-    const nowMs = Date.now();
-    for (const pid of projectIds) {
-      const lastEval = lastAlertEvalAt.get(pid) ?? 0;
-      if (nowMs - lastEval < 4000) continue;
-      lastAlertEvalAt.set(pid, nowMs);
-
-      const [settingsRows, meterRows, latestSamples] = await Promise.all([
-        queryRows<Row>(
-          "SELECT payload FROM project_settings WHERE project_id = ? ORDER BY updated_at DESC LIMIT 1",
-          [pid],
-        ).catch(() => [] as Row[]),
-        queryRows<Row>(
-          `SELECT mp.id, mp.name, mp.code, mp.utility,
-                  COALESCE(NULLIF(TRIM(mp.serial_number), ''), TRIM(d.serial_number)) AS serialNumber,
-                  d.id AS deviceId, d.status AS deviceStatus
-             FROM meter_points mp
-             LEFT JOIN devices d ON d.id = mp.device_id
-            WHERE mp.project_id = ?`,
-          [pid],
-        ).catch(() => [] as Row[]),
-        getProjectGatewayLatest(pid).catch(() => []),
-      ]);
-
-      const payload = jsonField<Record<string, unknown>>(settingsRows[0]?.payload, {});
-      const projectConfig = (payload.projectConfig ?? {}) as Record<string, unknown>;
-      const adminAlertConfig = (payload.alertConfig ?? {}) as Record<string, unknown>;
-      const timeoutMinutes = Math.max(
-        1,
-        Number(projectConfig.onlineTimeout ?? adminAlertConfig.commLossMinutes ?? 10) || 10,
-      );
-      const timeoutSeconds = Math.round(timeoutMinutes * 60);
-
-      const alertCfg = normalizeAlertConfig(payload.alertsConfig, payload.alertConfig);
-      const allRules = Object.values(alertCfg.rulesByGroup ?? {})
-        .flat()
-        .filter((r) => r.enabled && r.parameterKey);
-
-      // 1. Đánh giá ngưỡng thông số đo từ mẫu mới nhất của các điểm đo thuộc dự án
-      for (const sample of latestSamples) {
-        const meter = meterRows.find((m) => asString(m.id) === sample.meterPointId);
-        const pointName = asString(meter?.name) || sample.meterPointId;
-        const hourKey = sample.at.replace(/\D/g, "").slice(0, 10) || "0000000000";
-        const shortPoint = sample.meterPointId.replace(/[^a-zA-Z0-9]/g, "").slice(-14) || "pt";
-
-        for (const rule of allRules) {
-          if (rule.meterPointId && rule.meterPointId !== sample.meterPointId) continue;
-          const actual = readMeterValue(sample.values, rule.parameterKey);
-          if (actual === null || !Number.isFinite(actual)) continue;
-
-          const minNum = rule.minValue.trim() !== "" ? Number(rule.minValue) : null;
-          const maxNum = rule.maxValue.trim() !== "" ? Number(rule.maxValue) : null;
-          const belowMin = minNum !== null && Number.isFinite(minNum) && actual < minNum;
-          const aboveMax = maxNum !== null && Number.isFinite(maxNum) && actual > maxNum;
-          if (!belowMin && !aboveMax) continue;
-
-          const shortParam = rule.parameterKey.replace(/[^a-zA-Z0-9_]/g, "").slice(0, 16) || "param";
-          const eventId = `THR-${shortPoint}-${shortParam}-${hourKey}`.slice(0, 64);
-          const thresholdVal = belowMin ? minNum : maxNum;
-          const paramMeta = METER_PARAMETERS.find((p) => p.key === rule.parameterKey);
-          const unit = (rule.unit || paramMeta?.unit || "").slice(0, 40);
-          const category = alertCategory(
-            rule.parameterKey,
-            rule.groupId === "imbalance"
-              ? "unbalance"
-              : rule.groupId === "harmonics"
-                ? "harmonics"
-                : undefined,
-          ).slice(0, 40);
-          const boundText = belowMin ? `< Min ${minNum}` : `> Max ${maxNum}`;
-          const message = `${rule.name || paramMeta?.name || rule.parameterKey}: giá trị đo ${actual}${unit ? ` ${unit}` : ""} vượt ngưỡng cài đặt (${boundText}${unit ? ` ${unit}` : ""}) tại ${pointName}`.slice(
-            0,
-            500,
-          );
-
-          await emsDb
-            .execute(
-              `INSERT INTO alert_events
-                 (id, project_id, meter_point_id, occurred_at, parameter_name, value, unit, severity, status, category, message, threshold_value)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
-               ON DUPLICATE KEY UPDATE
-                 occurred_at = VALUES(occurred_at),
-                 value = VALUES(value),
-                 unit = VALUES(unit),
-                 severity = VALUES(severity),
-                 category = VALUES(category),
-                 message = VALUES(message),
-                 threshold_value = VALUES(threshold_value)`,
-              [
-                eventId,
-                pid,
-                sample.meterPointId,
-                sample.at,
-                rule.parameterKey,
-                actual,
-                unit,
-                rule.severity || "warning",
-                category,
-                message,
-                thresholdVal,
-              ],
-            )
-            .catch(() => undefined);
-        }
-      }
-
-      // 2. Đánh giá cảnh báo Mất kết nối (quá timeout cài đặt) & Kết nối trở lại cho từng node
-      for (const meter of meterRows) {
-        const pointId = asString(meter.id);
-        const pointName = asString(meter.name) || pointId;
-        const rawSerial = asString(meter.serialNumber).replace(/^SN:\s*/i, "").trim();
-        if (!rawSerial) continue;
-        const shortPoint = pointId.replace(/[^a-zA-Z0-9]/g, "").slice(-14) || "pt";
-
-        // 2a. Rà soát các khoảng gián đoạn lịch sử trong 14 ngày gần nhất vượt quá timeoutSeconds
-        const gapRows = await queryRows<Row>(
-          `SELECT DATE_FORMAT(DATE_ADD(prev_at, INTERVAL ? SECOND), '%Y-%m-%d %H:%i:%s') AS offlineAt,
-                  DATE_FORMAT(received_at, '%Y-%m-%d %H:%i:%s') AS onlineAt,
-                  TIMESTAMPDIFF(SECOND, prev_at, received_at) AS gapSec,
-                  DATE_FORMAT(prev_at, '%Y%m%d%H%i%s') AS stampKey
-             FROM (
-               SELECT received_at,
-                      LAG(received_at) OVER (ORDER BY received_at ASC, id ASC) AS prev_at
-                 FROM gateway_samples
-                WHERE meter_id = ?
-                  AND received_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 14 DAY)
-             ) seq
-            WHERE prev_at IS NOT NULL
-              AND TIMESTAMPDIFF(SECOND, prev_at, received_at) > ?
-            ORDER BY received_at DESC
-            LIMIT ${GAP_SCAN_LIMIT}`,
-          [timeoutSeconds, rawSerial, timeoutSeconds],
-        ).catch(() => null);
-
-        const validGapKeys = new Set<string>();
-        for (const gap of gapRows ?? []) {
-          const stampKey = asString(gap.stampKey);
-          const offlineAt = asString(gap.offlineAt);
-          const onlineAt = asString(gap.onlineAt);
-          if (!stampKey || !offlineAt || !onlineAt) continue;
-          validGapKeys.add(stampKey);
-
-          const gapMinutes = Math.max(1, Math.round((asNumber(gap.gapSec) / 60) * 10) / 10);
-          const offId = `OFF-${shortPoint}-${stampKey}`.slice(0, 64);
-          const onlId = `ONL-${shortPoint}-${stampKey}`.slice(0, 64);
-          const offMsg = `Node ${pointName} (SN: ${rawSerial}) mất kết nối quá timeout cài đặt ${timeoutMinutes} phút (không có dữ liệu từ Gateway trong ${gapMinutes} phút)`.slice(
-            0,
-            500,
-          );
-          const onlMsg = `Node ${pointName} (SN: ${rawSerial}) đã kết nối trở lại sau ${gapMinutes} phút mất kết nối`.slice(
-            0,
-            500,
-          );
-
-          await emsDb
-            .execute(
-              `INSERT INTO alert_events
-                 (id, project_id, meter_point_id, occurred_at, parameter_name, value, unit, severity, status, category, message, threshold_value)
-               VALUES (?, ?, ?, ?, 'Mất kết nối', ?, 'phút', 'critical', 'resolved', 'connectivity', ?, ?)
-               ON DUPLICATE KEY UPDATE
-                 value = VALUES(value),
-                 status = IF(status = 'acknowledged', 'acknowledged', 'resolved'),
-                 message = VALUES(message),
-                 threshold_value = VALUES(threshold_value)`,
-              [offId, pid, pointId, offlineAt, gapMinutes, offMsg, timeoutMinutes],
-            )
-            .catch(() => undefined);
-
-          await emsDb
-            .execute(
-              `INSERT INTO alert_events
-                 (id, project_id, meter_point_id, occurred_at, parameter_name, value, unit, severity, status, category, message, threshold_value)
-               VALUES (?, ?, ?, ?, 'Kết nối trở lại', ?, 'phút', 'info', 'resolved', 'connectivity', ?, ?)
-               ON DUPLICATE KEY UPDATE
-                 value = VALUES(value),
-                 message = VALUES(message),
-                 threshold_value = VALUES(threshold_value)`,
-              [onlId, pid, pointId, onlineAt, gapMinutes, onlMsg, timeoutMinutes],
-            )
-            .catch(() => undefined);
-        }
-
-        // 2b. Kiểm tra trạng thái hiện tại so với bản tin cuối cùng từ Gateway
-        const latestRows = await queryRows<Row>(
-          `SELECT DATE_FORMAT(received_at, '%Y-%m-%d %H:%i:%s') AS lastAt,
-                  DATE_FORMAT(DATE_ADD(received_at, INTERVAL ? SECOND), '%Y-%m-%d %H:%i:%s') AS offlineAt,
-                  TIMESTAMPDIFF(SECOND, received_at, UTC_TIMESTAMP()) AS idleSec,
-                  DATE_FORMAT(received_at, '%Y%m%d%H%i%s') AS stampKey
-             FROM gateway_samples
-            WHERE meter_id = ?
-            ORDER BY received_at DESC, id DESC
-            LIMIT 1`,
-          [timeoutSeconds, rawSerial],
-        ).catch(() => [] as Row[]);
-
-        const latestRow = latestRows[0];
-        if (!latestRow) continue;
-        const idleSec = asNumber(latestRow.idleSec);
-        const stampKey = asString(latestRow.stampKey);
-        const offlineAt = asString(latestRow.offlineAt);
-
-        // 2c. Dọn cảnh báo kết nối "ma": dữ liệu của khoảng gián đoạn đã được gateway gửi bù (RE=1)
-        //     hoặc đồng bộ từ server upstream, nên khoảng mất kết nối đó thực tế không còn tồn tại.
-        if (gapRows && gapRows.length < GAP_SCAN_LIMIT) {
-          if (idleSec > timeoutSeconds && stampKey) validGapKeys.add(stampKey);
-          await reconcileConnectivityEvents(pid, pointId, shortPoint, validGapKeys);
-        }
-        const deviceId = asString(meter.deviceId);
-        const deviceStatus = asString(meter.deviceStatus);
-
-        if (idleSec > timeoutSeconds && stampKey && offlineAt) {
-          const idleMinutes = Math.max(1, Math.round((idleSec / 60) * 10) / 10);
-          const offId = `OFF-${shortPoint}-${stampKey}`.slice(0, 64);
-          const offMsg = `Node ${pointName} (SN: ${rawSerial}) đang mất kết nối quá timeout cài đặt ${timeoutMinutes} phút (${idleMinutes} phút chưa có dữ liệu từ Gateway)`.slice(
-            0,
-            500,
-          );
-          await emsDb
-            .execute(
-              `INSERT INTO alert_events
-                 (id, project_id, meter_point_id, occurred_at, parameter_name, value, unit, severity, status, category, message, threshold_value)
-               VALUES (?, ?, ?, ?, 'Mất kết nối', ?, 'phút', 'critical', 'active', 'connectivity', ?, ?)
-               ON DUPLICATE KEY UPDATE
-                 value = VALUES(value),
-                 status = IF(status = 'acknowledged', 'acknowledged', 'active'),
-                 message = VALUES(message),
-                 threshold_value = VALUES(threshold_value)`,
-              [offId, pid, pointId, offlineAt, idleMinutes, offMsg, timeoutMinutes],
-            )
-            .catch(() => undefined);
-
-          if (deviceId && deviceStatus !== "offline") {
-            await emsDb
-              .execute("UPDATE devices SET status = 'offline' WHERE id = ?", [deviceId])
-              .catch(() => undefined);
-          }
-        } else if (idleSec >= 0 && idleSec <= timeoutSeconds) {
-          if (deviceId && deviceStatus === "offline") {
-            await emsDb
-              .execute("UPDATE devices SET status = 'online' WHERE id = ?", [deviceId])
-              .catch(() => undefined);
-          }
-        }
-      }
-    }
-  } catch (error) {
-    console.error("evaluateProjectAlerts failed", error);
-  }
-}
-
 function ensureDiagramDisplaysColumn() {
   if (!diagramDisplaysReady) {
     diagramDisplaysReady = emsDb
@@ -418,55 +135,30 @@ function ensureDiagramDisplaysColumn() {
   return diagramDisplaysReady;
 }
 
+let recipientChannelsReady: Promise<void> | null = null;
+
+/** Kênh nhận cảnh báo của từng người nhận (VD "Email,SMS,Zalo"). */
+function ensureRecipientChannelsColumn() {
+  recipientChannelsReady ??= emsDb
+    .query("ALTER TABLE alert_recipients ADD COLUMN channels VARCHAR(100) NULL")
+    .then(() => undefined)
+    .catch(() => undefined);
+  return recipientChannelsReady;
+}
+
+const RECIPIENT_CHANNELS = new Set(["Email", "SMS", "Zalo", "Telegram"]);
+
+function cleanChannels(value: unknown) {
+  const list = Array.isArray(value) ? value : typeof value === "string" ? value.split(",") : [];
+  return Array.from(new Set(list.map((item) => asString(item).trim()).filter((item) => RECIPIENT_CHANNELS.has(item))));
+}
+
 function ensureDeviceColumns() {
   deviceColumnsReady ??= emsDb
     .execute("ALTER TABLE devices MODIFY COLUMN image MEDIUMTEXT NULL")
     .then(() => undefined)
     .catch(() => undefined);
   return deviceColumnsReady;
-}
-
-function ensureProjectSettingsTable() {
-  if (!projectSettingsReady) {
-    projectSettingsReady = migrateProjectSettings().catch((error) => {
-      projectSettingsReady = null;
-      console.error("project_settings migrate failed", error);
-      throw error;
-    });
-  }
-  return projectSettingsReady;
-}
-
-async function migrateProjectSettings() {
-  await emsDb.query(
-    `CREATE TABLE IF NOT EXISTS project_settings (
-       project_id VARCHAR(64) NOT NULL,
-       payload JSON NOT NULL,
-       updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-       PRIMARY KEY (project_id)
-     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
-  );
-  await emsDb
-    .query(
-      `ALTER TABLE project_settings
-         ADD COLUMN updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`,
-    )
-    .catch(() => undefined);
-  await emsDb.query("ALTER TABLE project_settings ADD PRIMARY KEY (project_id)").catch(() => undefined);
-  await emsDb
-    .query(
-      `UPDATE project_settings
-          SET payload = JSON_SET(
-                payload,
-                '$.costConfig.electricity.prices.normal', '1.833',
-                '$.costConfig.electricity.prices.off', '1.190',
-                '$.costConfig.electricity.prices.peak', '3.398'
-              )
-        WHERE JSON_UNQUOTE(JSON_EXTRACT(payload, '$.costConfig.electricity.prices.normal')) = '1'
-          AND JSON_UNQUOTE(JSON_EXTRACT(payload, '$.costConfig.electricity.prices.off')) = '1'
-          AND JSON_UNQUOTE(JSON_EXTRACT(payload, '$.costConfig.electricity.prices.peak')) = '1'`,
-    )
-    .catch(() => undefined);
 }
 
 function ensureGhgColumns() {
@@ -547,9 +239,10 @@ async function resourceName(context: Params) {
 
 async function getAccounts() {
   await ensureAccountProjectsSchema();
+  await ensureProjectManagerSchema();
   const [accounts, mappings] = await Promise.all([
     queryRows<Row>(
-      `SELECT id, username, email, role, DATE_FORMAT(created_at, '%d/%m/%Y') AS createdAt
+      `SELECT id, username, email, full_name AS fullName, phone, role, DATE_FORMAT(created_at, '%d/%m/%Y') AS createdAt
          FROM accounts ORDER BY created_at DESC, id`,
     ),
     queryRows<Row>(
@@ -567,6 +260,8 @@ async function getAccounts() {
     const role = normalizeAccountRole(asString(row.role));
     return {
       ...row,
+      fullName: asString(row.fullName),
+      phone: asString(row.phone),
       role,
       projectIds: role === "Admin" ? [] : (projectsByAccount.get(id) ?? []),
     };
@@ -626,8 +321,11 @@ async function getProjects(projectId?: string, allowedProjectIds?: string[]) {
       ORDER BY project_id, meter_type_name`,
     ids,
   );
+  await ensureRecipientChannelsColumn();
+  await ensureNotifierSchema();
   const recipients = await queryRows<Row>(
-    `SELECT id, project_id AS projectId, name, email, phone
+    `SELECT id, project_id AS projectId, name, email, phone, channels,
+            telegram_chat_id AS telegramChatId, zalo_user_id AS zaloUserId
        FROM alert_recipients WHERE project_id IN (${placeholders})
       ORDER BY project_id, id`,
     ids,
@@ -665,6 +363,13 @@ async function getProjects(projectId?: string, allowedProjectIds?: string[]) {
       name: row.name,
       email: row.email,
       phone: row.phone,
+      telegramChatId: asString(row.telegramChatId),
+      zaloUserId: asString(row.zaloUserId),
+      // Dữ liệu cũ chưa có kênh: mặc định theo thông tin đã nhập (có email → Email, có SĐT → SMS).
+      channels:
+        row.channels == null
+          ? [...(asString(row.email) ? ["Email"] : []), ...(asString(row.phone) ? ["SMS"] : [])]
+          : cleanChannels(row.channels),
     }]);
   }
   return projects.map((project) => ({
@@ -731,14 +436,16 @@ async function getResource(resource: string, request: NextRequest) {
   if (resource === "project-telemetry") return getProjectsListTelemetry();
   if (resource === "project-managers") {
     if (!projectId) throw new UserFacingError("Thiếu mã dự án.");
-    return getProjectManagers(projectId);
+    await ensureAccountProjectsSchema();
+    return getProjectManagerState(projectId);
   }
   if (resource === "devices") {
     await ensureDeviceColumns();
+    await ensureMeterCatalogSchema();
     const rows = await queryRows<Row>(
       `SELECT id, name, serial_number AS sn, brand_model AS brandModel, brand,
               device_type AS type, category, kind, status, last_sync_label AS lastSync,
-              protocol, notes, image, extra_fields AS extraFields, registers
+              protocol, notes, image, extra_fields AS extraFields, registers, model_id AS modelId
          FROM devices ORDER BY id`,
     );
     const links = await deviceProjectLinks();
@@ -750,7 +457,18 @@ async function getResource(resource: string, request: NextRequest) {
     }));
   }
   if (resource === "meter-types") {
-    return queryRows<Row>("SELECT name, description, icon, builtin FROM meter_types ORDER BY builtin DESC, name");
+    await ensureMeterCatalogSchema();
+    const rows = await queryRows<Row>(
+      "SELECT name, description, icon, builtin, gateway_code AS gatewayCode FROM meter_types ORDER BY builtin DESC, name",
+    );
+    return rows.map((row) => ({
+      ...row,
+      builtin: Boolean(Number(row.builtin)),
+      gatewayCode: row.gatewayCode == null ? null : Number(row.gatewayCode),
+    }));
+  }
+  if (resource === "meter-models") {
+    return listMeterModels();
   }
   if (resource === "client-meters") {
     if (!projectId) throw new Error("projectId is required");
@@ -939,7 +657,11 @@ async function getResource(resource: string, request: NextRequest) {
       // Bảng gateway_alarms chưa khởi tạo hoặc truy vấn phụ lỗi thì vẫn trả về mappedEvents
     }
 
-    return mappedEvents;
+    // Trạng thái gửi thông báo thật (notification_log) thay cho dữ liệu mẫu.
+    const deliveries = await listDeliveries(
+      mappedEvents.map((event) => asString(event.id)).filter(Boolean),
+    ).catch(() => new Map());
+    return mappedEvents.map((event) => ({ ...event, deliveries: deliveries.get(asString(event.id)) ?? [] }));
   }
   if (resource === "meter-readings") {
     const meterPointId = request.nextUrl.searchParams.get("meterPointId") || undefined;
@@ -1018,8 +740,17 @@ async function transaction<T>(work: (connection: PoolConnection) => Promise<T>) 
 async function saveResource(resource: string, body: Row) {
   if (resource === "accounts") {
     await ensureAccountProjectsSchema();
+    await ensureProjectManagerSchema();
     const items = Array.isArray(body.items) ? body.items : [body];
     const session = await getServerSession();
+    // Dự án của từng tài khoản trước khi lưu: để áp quy tắc "mỗi dự án một người quản lý" cho dự án mới giao.
+    const previousProjects = new Map<string, Set<string>>();
+    for (const item of items as Row[]) {
+      const rows = await queryRows<Row>("SELECT project_id AS projectId FROM account_projects WHERE account_id = ?", [
+        asString(item.id),
+      ]);
+      previousProjects.set(asString(item.id), new Set(rows.map((row) => asString(row.projectId))));
+    }
     await transaction(async (connection) => {
       for (const item of items as Row[]) {
         const rawPassword = asString(item.password).trim();
@@ -1065,6 +796,21 @@ async function saveResource(resource: string, body: Row) {
              password_hash=IF(? = 1, SHA2(?, 256), password_hash)`,
           [item.id, item.username, item.email, role, insertPassword, item.createdAt, rawPassword ? 1 : 0, rawPassword],
         );
+        // Họ tên / SĐT chỉ cập nhật khi client gửi trường đó (lưu hàng loạt từ luồng cũ không làm mất dữ liệu).
+        const hasFullName = Object.prototype.hasOwnProperty.call(item, "fullName");
+        const hasPhone = Object.prototype.hasOwnProperty.call(item, "phone");
+        if (hasFullName || hasPhone) {
+          await connection.execute(
+            `UPDATE accounts SET full_name = IF(? = 1, ?, full_name), phone = IF(? = 1, ?, phone) WHERE id = ?`,
+            [
+              hasFullName ? 1 : 0,
+              asString(item.fullName).trim() || null,
+              hasPhone ? 1 : 0,
+              asString(item.phone).trim() || null,
+              item.id,
+            ],
+          );
+        }
         if (role === "Admin" || Array.isArray(item.projectIds)) {
           await connection.execute("DELETE FROM account_projects WHERE account_id = ?", [item.id]);
         }
@@ -1081,7 +827,35 @@ async function saveResource(resource: string, body: Row) {
         }
       }
     });
+    // Mỗi dự án một người quản lý: dự án vừa giao cho tài khoản Manage này thì gỡ người cũ;
+    // dự án bị bỏ khỏi tài khoản thì cập nhật lại thông tin liên hệ.
+    const today = vietnamNow().date;
+    for (const item of items as Row[]) {
+      const accountId = asString(item.id);
+      const role = normalizeAccountRole(asString(item.role));
+      const before = previousProjects.get(accountId) ?? new Set<string>();
+      const after = new Set(
+        role === "Manage" && Array.isArray(item.projectIds)
+          ? (item.projectIds as unknown[]).map((pid) => asString(pid).trim()).filter(Boolean)
+          : role === "Admin"
+            ? []
+            : [...before],
+      );
+      for (const pid of after) {
+        if (!before.has(pid)) await setProjectManager(pid, accountId, today);
+        else await syncProjectContact(pid);
+      }
+      for (const pid of before) {
+        if (!after.has(pid)) await syncProjectContact(pid);
+      }
+    }
     return getAccounts();
+  }
+  if (resource === "project-managers" && !Array.isArray(body.accountIds)) {
+    await ensureAccountProjectsSchema();
+    const projectId = asString(body.projectId).trim();
+    if (!projectId) throw new UserFacingError("Thiếu mã dự án.");
+    return setProjectManager(projectId, asString(body.accountId).trim() || null, asString(body.startDate));
   }
   if (resource === "project-managers") {
     await ensureAccountProjectsSchema();
@@ -1131,6 +905,8 @@ async function saveResource(resource: string, body: Row) {
     }
     const meterTypes = Array.isArray(body.meterTypes) ? body.meterTypes.filter(Boolean) as string[] : [];
     const recipients = Array.isArray(body.recipients) ? body.recipients as Row[] : [];
+    await ensureRecipientChannelsColumn();
+    await ensureNotifierSchema();
     const startDate = projectDateForDb(body.startDate);
     if (!startDate) throw new Error("startDate must use YYYY-MM-DD or DD/MM/YYYY format");
     const [existingProject] = await queryRows<Row>("SELECT id FROM projects WHERE id = ? LIMIT 1", [body.id]);
@@ -1165,20 +941,37 @@ async function saveResource(resource: string, body: Row) {
       for (const recipient of recipients) {
         if (!recipient.name && !recipient.email && !recipient.phone) continue;
         await connection.execute(
-          `INSERT INTO alert_recipients (id, project_id, name, email, phone)
-           VALUES (?, ?, ?, ?, ?)`,
-          [recipientKey(recipient.id), body.id, recipient.name || "", recipient.email || "", recipient.phone || ""],
+          `INSERT INTO alert_recipients (id, project_id, name, email, phone, channels, telegram_chat_id, zalo_user_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            recipientKey(recipient.id),
+            body.id,
+            recipient.name || "",
+            recipient.email || "",
+            recipient.phone || "",
+            cleanChannels(recipient.channels).join(","),
+            asString(recipient.telegramChatId).trim().slice(0, 64) || null,
+            asString(recipient.zaloUserId).trim().slice(0, 64) || null,
+          ],
         );
       }
     });
     const session = await getServerSession();
     if (session?.portal === "admin" && !isAdminRole(session)) {
       await ensureAccountProjectsSchema();
-      await emsDb.execute(
-        "INSERT IGNORE INTO account_projects (account_id, project_id) VALUES (?, ?)",
-        [session.userId, body.id],
-      );
+      if (!existingProject) {
+        // Tài khoản Manage tự tạo dự án thì là người quản lý dự án đó.
+        await setProjectManager(asString(body.id), session.userId, vietnamNow().date);
+      } else {
+        await emsDb.execute(
+          "INSERT IGNORE INTO account_projects (account_id, project_id) VALUES (?, ?)",
+          [session.userId, body.id],
+        );
+      }
     }
+    // Thông tin liên hệ luôn theo người quản lý (nếu dự án đã có người quản lý).
+    await ensureAccountProjectsSchema();
+    await syncProjectContact(asString(body.id), undefined, { keepIfNone: true });
     if (!existingProject) {
       // Thông báo (chuông) cho các quản trị viên: có dự án mới được khởi tạo.
       await ensureProjectEventsSchema();
@@ -1193,6 +986,7 @@ async function saveResource(resource: string, body: Row) {
   }
   if (resource === "devices") {
     await ensureDeviceColumns();
+    await ensureMeterCatalogSchema();
     if (Array.isArray(body.items)) {
       for (const item of body.items as Row[]) await saveResource(resource, item);
       return getResource(resource, new NextRequest("http://localhost/api/ems/devices"));
@@ -1200,25 +994,32 @@ async function saveResource(resource: string, body: Row) {
     await emsDb.execute(
       `INSERT INTO devices
         (id, name, serial_number, brand_model, brand, device_type, category, kind, status,
-         last_sync_label, protocol, notes, image, extra_fields, registers)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         last_sync_label, protocol, notes, image, extra_fields, registers, model_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON DUPLICATE KEY UPDATE name=VALUES(name), serial_number=VALUES(serial_number),
          brand_model=VALUES(brand_model), brand=VALUES(brand), device_type=VALUES(device_type),
          category=VALUES(category), kind=VALUES(kind), status=VALUES(status),
          last_sync_label=VALUES(last_sync_label), protocol=VALUES(protocol), notes=VALUES(notes),
-         image=VALUES(image), extra_fields=VALUES(extra_fields), registers=VALUES(registers)`,
+         image=VALUES(image), extra_fields=VALUES(extra_fields), registers=VALUES(registers),
+         model_id=VALUES(model_id)`,
       [body.id, body.name, body.sn, body.brandModel, body.brand, body.type, body.category || null,
         body.kind, body.status, body.lastSync, body.protocol || null, body.notes || null,
         body.image || null,
         body.extraFields ? JSON.stringify(body.extraFields) : null,
-        body.registers ? JSON.stringify(body.registers) : null],
+        body.registers ? JSON.stringify(body.registers) : null,
+        asString(body.modelId) || null],
     );
     return getResource(resource, new NextRequest("http://localhost/api/ems/devices"));
   }
   if (resource === "meter-types") {
+    await ensureMeterCatalogSchema();
     const previousName = asString(body.previousName);
     const name = asString(body.name).trim();
     if (!name) throw new Error("Tên loại điểm đo không được để trống.");
+    // Chỉ cập nhật mã nhận dạng khi client gửi trường gatewayCode (các luồng cũ không gửi → giữ nguyên).
+    const hasGatewayCode = Object.prototype.hasOwnProperty.call(body, "gatewayCode");
+    const gatewayCode = hasGatewayCode ? parseTypeCode(body.gatewayCode) : null;
+    if (hasGatewayCode) await assertTypeCodeAvailable(previousName || name, gatewayCode);
     await transaction(async (connection) => {
       if (previousName && previousName !== name) {
         await connection.execute(
@@ -1228,6 +1029,12 @@ async function saveResource(resource: string, body: Row) {
           [name, previousName],
         );
         await connection.execute("UPDATE project_meter_types SET meter_type_name = ? WHERE meter_type_name = ?", [name, previousName]);
+        await connection.execute("UPDATE meter_models SET meter_type_name = ? WHERE meter_type_name = ?", [name, previousName]);
+        await connection.execute("UPDATE devices SET device_type = ? WHERE device_type = ?", [name, previousName]);
+        await connection.execute(
+          "UPDATE meter_types SET gateway_code = (SELECT code FROM (SELECT gateway_code AS code FROM meter_types WHERE name = ?) prev) WHERE name = ?",
+          [previousName, name],
+        );
         await connection.execute("DELETE FROM meter_types WHERE name = ? AND builtin = 0", [previousName]);
       } else {
         await connection.execute(
@@ -1236,7 +1043,11 @@ async function saveResource(resource: string, body: Row) {
           [name, body.description || "Loại điểm đo tùy chỉnh", body.icon || "generic", body.builtin ? 1 : 0],
         );
       }
+      if (hasGatewayCode) {
+        await connection.execute("UPDATE meter_types SET gateway_code = ? WHERE name = ?", [gatewayCode, name]);
+      }
     });
+    invalidateCatalogCache();
     return getResource(resource, new NextRequest("http://localhost/api/ems/meter-types"));
   }
   if (resource === "client-meters") {
@@ -1437,7 +1248,7 @@ async function saveResource(resource: string, body: Row) {
        ON DUPLICATE KEY UPDATE payload = VALUES(payload), updated_at = CURRENT_TIMESTAMP`,
       [projectId, payload],
     );
-    lastAlertEvalAt.delete(projectId);
+    resetAlertEvalThrottle(projectId);
     void evaluateProjectAlerts(projectId);
     return getResource(resource, new NextRequest(`http://localhost/api/ems/project-settings?projectId=${encodeURIComponent(projectId)}`));
   }
@@ -1469,6 +1280,14 @@ async function deleteResource(resource: string, request: NextRequest) {
   const table = tables[resource];
   if (!table) throw new Error(`Delete is not supported for ${resource}`);
   const key = resource === "emission-factors" ? "id" : resource === "meter-types" ? "name" : "id";
+  if (resource === "meter-types") {
+    const [typeRow] = await queryRows<Row>("SELECT builtin FROM meter_types WHERE name = ? LIMIT 1", [id]);
+    if (typeRow && Number(typeRow.builtin)) {
+      throw new UserFacingError("Không thể xóa loại đồng hồ mặc định (chỉ sửa mô tả và mã nhận dạng).");
+    }
+    await assertTypeDeletable(id);
+    invalidateCatalogCache();
+  }
   if (resource === "devices") {
     await ensureDeviceColumns();
     const linked = (await deviceProjectLinks()).get(id) ?? [];
@@ -1481,7 +1300,9 @@ async function deleteResource(resource: string, request: NextRequest) {
   }
   if (resource === "accounts") {
     await ensureAccountProjectsSchema();
+    const ownProjects = await queryRows<Row>("SELECT project_id AS projectId FROM account_projects WHERE account_id = ?", [id]);
     await emsDb.execute("DELETE FROM account_projects WHERE account_id = ?", [id]);
+    for (const row of ownProjects) await syncProjectContact(asString(row.projectId));
     await emsDb.execute("DELETE FROM auth_sessions WHERE portal = 'admin' AND user_id = ?", [id]);
   }
   if (resource === "customer-accounts") {
@@ -1503,6 +1324,19 @@ export async function GET(request: NextRequest, context: Params) {
       if (!gate.ok || !gate.session) return forbidden();
       return Response.json(await listNotifications(gate.session));
     }
+    if (resource === "notification-settings" || resource === "telegram-chats" || resource === "notification-test") {
+      const gate = await requirePermission("manageUsers");
+      if (!gate.ok) return forbidden("Chỉ Quản trị viên được cấu hình thông báo.");
+      if (resource === "notification-settings") return Response.json(await getMaskedSettings());
+      if (resource === "telegram-chats") {
+        try {
+          return Response.json(await listTelegramChats());
+        } catch (error) {
+          return badRequest(error instanceof Error ? error.message : "Không lấy được danh sách Telegram.");
+        }
+      }
+      return badRequest("Dùng POST để gửi thử.");
+    }
     if (resource === "project-managers") {
       const gate = await requirePermission("viewProjects");
       const projectId = request.nextUrl.searchParams.get("projectId") ?? "";
@@ -1523,6 +1357,21 @@ export async function POST(request: NextRequest, context: Params) {
       if (!gate.ok) return forbidden("Chỉ Quản trị viên được quản lý người dùng.");
     }
     const body = (await request.json()) as Row;
+    if (resource === "notification-settings" || resource === "notification-test" || resource === "telegram-chats") {
+      const gate = await requirePermission("manageUsers");
+      if (!gate.ok) return forbidden("Chỉ Quản trị viên được cấu hình thông báo.");
+      if (resource === "notification-settings") return Response.json(await saveNotificationSettings(body));
+      if (resource === "notification-test") {
+        const channel = asString(body.channel) as NotificationChannel;
+        if (!["Email", "SMS", "Zalo", "Telegram"].includes(channel)) return badRequest("Kênh không hợp lệ.");
+        try {
+          return Response.json(await sendTestNotification(channel, asString(body.target)));
+        } catch (error) {
+          return badRequest(error instanceof Error ? error.message : "Gửi thử thất bại.");
+        }
+      }
+      return badRequest("Dùng GET để lấy danh sách Telegram.");
+    }
     if (resource === "notifications") {
       const gate = await requirePermission("viewProjects");
       if (!gate.ok || !gate.session) return forbidden();
@@ -1537,6 +1386,11 @@ export async function POST(request: NextRequest, context: Params) {
         return badRequest("Quyết định không hợp lệ.");
       }
       return Response.json(await decideProjectDeletion(gate.session, Number(body.requestId), decision));
+    }
+    if (resource === "meter-models") {
+      const gate = await requirePermission("manageDevices");
+      if (!gate.ok) return forbidden("Bạn không có quyền cấu hình loại đồng hồ.");
+      return Response.json(await saveMeterModel(body));
     }
     return Response.json(await saveResource(resource, body));
   } catch (error) {
@@ -1563,6 +1417,11 @@ export async function DELETE(request: NextRequest, context: Params) {
       const id = request.nextUrl.searchParams.get("id") ?? "";
       if (!gate.ok || !gate.session || !canAccessAdminProject(gate.session, id)) return forbidden();
       return Response.json({ pending: true, ...(await requestProjectDeletion(gate.session, id)) });
+    }
+    if (resource === "meter-models") {
+      const gate = await requirePermission("manageDevices");
+      if (!gate.ok) return forbidden("Bạn không có quyền cấu hình loại đồng hồ.");
+      return Response.json(await deleteMeterModel(request.nextUrl.searchParams.get("id") ?? ""));
     }
     return Response.json(await deleteResource(resource, request));
   } catch (error) {

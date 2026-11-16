@@ -53,6 +53,29 @@ const navGroups: {
       },
     ],
   },
+  {
+    group: "CẤU HÌNH",
+    items: [
+      {
+        href: "/cau-hinh/loai-diem-do",
+        label: "Loại điểm đo",
+        icon: EditProjectIcon,
+        permission: "manageDevices",
+      },
+      {
+        href: "/cau-hinh/loai-dong-ho",
+        label: "Cấu hình loại đồng hồ",
+        icon: MeterConfigIcon,
+        permission: "manageDevices",
+      },
+      {
+        href: "/cau-hinh/thong-bao",
+        label: "Cấu hình thông báo",
+        icon: AlertConfigIcon,
+        permission: "manageUsers",
+      },
+    ],
+  },
 ];
 
 const configItems: { module: ProjectConfigModule; label: string; icon: typeof ChartIcon }[] = [

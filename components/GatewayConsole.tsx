@@ -17,6 +17,8 @@ type GatewayDeviceView = {
   packetNumber: string | null;
   meterType: string | null;
   meterModel: string | null;
+  meterTypeName?: string | null;
+  meterModelName?: string | null;
   meterId: string | null;
   lastReadingTime: string | null;
   lastIsReplay: boolean | null;
@@ -160,19 +162,9 @@ export function GatewayConsole() {
   return (
     <div className="mx-auto max-w-[1400px] p-4 sm:p-6 lg:p-8 font-sans">
       <div className="mb-6 flex flex-wrap items-center justify-between gap-4">
-        <div>
-          <div className="flex items-center gap-3">
-            <h1 className="text-xl font-bold tracking-tight text-slate-900 sm:text-2xl">
-              Quản lý Gateway
-            </h1>
-            <span className="rounded-full bg-slate-100 px-2.5 py-0.5 text-xs font-semibold text-slate-600">
-              {summary.total} thiết bị
-            </span>
-          </div>
-          <p className="mt-1 text-xs text-slate-500">
-            Theo dõi trạng thái kết nối thiết bị Gateway tại nhà máy và cấu hình mạng truyền dữ liệu từ xa.
-          </p>
-        </div>
+        <h1 className="text-xl font-bold tracking-tight text-slate-900 sm:text-2xl">
+          Quản lý Gateway
+        </h1>
         <button
           type="button"
           onClick={() => void load()}
@@ -188,27 +180,18 @@ export function GatewayConsole() {
       {data && (
         <>
           <section className="mb-6 grid gap-3 sm:grid-cols-3">
-            <StatCard label="TỔNG GATEWAY" value={summary.total} hint="Thiết bị đã kết nối hệ thống" />
-            <StatCard
-              label="ĐANG TRỰC TUYẾN"
-              value={summary.online}
-              valueClass="text-emerald-700"
-              hint="Đang gửi dữ liệu định kỳ"
-            />
+            <StatCard label="TỔNG GATEWAY" value={summary.total} />
+            <StatCard label="ĐANG TRỰC TUYẾN" value={summary.online} valueClass="text-emerald-700" />
             <StatCard
               label="MẤT KẾT NỐI"
               value={summary.offline}
               valueClass={summary.offline > 0 ? "text-amber-600" : "text-slate-700"}
-              hint="Tạm ngưng hoặc chưa đồng bộ"
             />
           </section>
 
           <section className="grid gap-6 xl:grid-cols-[minmax(0,1.25fr)_minmax(0,1fr)]">
             <div className="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm">
-              <h2 className="mb-1 text-sm font-bold text-slate-900">Danh sách thiết bị Gateway</h2>
-              <p className="mb-4 text-xs text-slate-500">
-                Chọn một Gateway bên dưới để xem trạng thái hoặc thay đổi cấu hình từ xa.
-              </p>
+              <h2 className="mb-4 text-sm font-bold text-slate-900">Danh sách thiết bị Gateway</h2>
 
               {data.gateways.length === 0 ? (
                 <Empty text="Chưa có thiết bị Gateway nào kết nối lên hệ thống." />
@@ -265,12 +248,12 @@ export function GatewayConsole() {
                           <Field
                             label="Đồng hồ đang đọc"
                             value={
-                              device.meterModel
-                                ? `${device.meterModel}${device.meterId ? ` (SN: ${device.meterId})` : ""}`
+                              device.meterModelName || device.meterModel
+                                ? `${device.meterModelName || device.meterModel}${device.meterId ? ` (SN: ${device.meterId})` : ""}`
                                 : null
                             }
                           />
-                          <Field label="Loại năng lượng" value={meterTypeText(device.meterType)} />
+                          <Field label="Loại năng lượng" value={device.meterTypeName || meterTypeText(device.meterType)} />
                           <Field label="Chu kỳ gửi dữ liệu" value={`${device.timeUpdate} giây`} />
                           <Field
                             label="Nhiệt độ / Độ ẩm tủ"
@@ -299,9 +282,6 @@ export function GatewayConsole() {
 
             <div className="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm">
               <h2 className="text-sm font-bold text-slate-900">Cấu hình từ xa cho Gateway</h2>
-              <p className="mt-1 text-xs leading-5 text-slate-500">
-                Thiết lập thông tin Wifi và chu kỳ đọc dữ liệu phản hồi về cho Gateway khi thiết bị kết nối.
-              </p>
 
               <div className="mt-4 grid gap-3.5">
                 <TextField label="Mã Gateway (GID)" value={draftId} onChange={setDraftId} placeholder="VD: 1" />

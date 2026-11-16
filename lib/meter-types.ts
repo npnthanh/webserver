@@ -7,6 +7,8 @@ export type MeterTypeDef = {
   description: string;
   icon: MeterTypeIconId;
   builtin: boolean;
+  /** Mã nhận dạng loại (MT) gateway gửi lên, cấu hình ở trang Cấu hình loại đồng hồ. */
+  gatewayCode?: number | null;
 };
 
 let meterTypeCache: MeterTypeDef[] = [];
@@ -135,4 +137,37 @@ export function removeMeterTypeDef(name: string) {
   const next = defs.filter((item) => item.name !== name);
   saveMeterTypeDefs(next);
   return next;
+}
+
+/** Lưu một loại đồng hồ từ trang Cấu hình loại đồng hồ (kèm mã nhận dạng MT). */
+export async function saveMeterTypeConfig(input: {
+  name: string;
+  description: string;
+  gatewayCode: number | null;
+  previousName?: string;
+}) {
+  const name = input.name.trim();
+  if (!name) throw new Error("Vui lòng nhập tên loại đồng hồ.");
+  const existing = loadMeterTypeDefs().find((item) => item.name === (input.previousName || name));
+  const defs = await dbFetch<MeterTypeDef[]>("meter-types", {
+    method: "POST",
+    body: JSON.stringify({
+      name,
+      previousName: input.previousName && input.previousName !== name ? input.previousName : undefined,
+      description: input.description.trim() || existing?.description || "Loại đồng hồ tùy chỉnh",
+      icon: existing?.icon ?? inferMeterTypeIcon(name),
+      builtin: existing?.builtin ?? false,
+      gatewayCode: input.gatewayCode,
+    }),
+  });
+  meterTypeCache = defs;
+  emitDbChange("meter-types");
+  return defs;
+}
+
+export async function deleteMeterTypeConfig(name: string) {
+  await dbFetch("meter-types", { method: "DELETE", query: { id: name } });
+  meterTypeCache = loadMeterTypeDefs().filter((item) => item.name !== name);
+  emitDbChange("meter-types");
+  return meterTypeCache;
 }

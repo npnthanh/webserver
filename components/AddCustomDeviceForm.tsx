@@ -6,14 +6,13 @@ import { CustomSelect } from "@/components/ui/CustomSelect";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { METER_MODEL_BY_CODE } from "@/lib/gateway-protocol";
 import { METER_PARAMETERS } from "@/lib/meter-parameters";
+import { hydrateMeterModels, type MeterModelDef } from "@/lib/meter-catalog";
+import { hydrateMeterTypeDefs, type MeterTypeDef } from "@/lib/meter-types";
 import {
   hydrateDevices,
   kindFromDeviceType,
-  loadDevices,
   todaySyncLabel,
-  typeLabelFromDeviceType,
   upsertDevice,
   type DeviceExtraField,
   type DeviceRegister,
@@ -22,10 +21,7 @@ import {
 type ExtraField = DeviceExtraField;
 type RegisterRow = DeviceRegister;
 
-const protocols = ["Modbus TCP", "Modbus RTU", "M-Bus", "BACnet", "MQTT"];
 const dataTypes = ["UINT16", "UINT32", "INT32", "FLOAT32", "FLOAT64"];
-const builtinCategories = Array.from(new Set(Object.values(METER_MODEL_BY_CODE)));
-const CUSTOM_CATEGORY = "__custom__";
 
 function defaultPm2230Registers(): RegisterRow[] {
   const coreKeys = ["EPaed", "Papt", "Qrpt", "Sapt", "VLNavg", "VLLavg", "Iavg", "PFt", "F", "THDVln", "THDCa"];
@@ -53,15 +49,16 @@ export function AddCustomDeviceForm() {
   const searchParams = useSearchParams();
   const editingId = searchParams.get("id");
 
+  // Loại đồng hồ → Thương hiệu → Tên model: lấy từ trang Cấu hình loại đồng hồ.
+  const [meterTypes, setMeterTypes] = useState<MeterTypeDef[]>([]);
+  const [catalog, setCatalog] = useState<MeterModelDef[]>([]);
+  const [meterType, setMeterType] = useState("");
   const [brand, setBrand] = useState("");
-  const [model, setModel] = useState("");
-  const [deviceType, setDeviceType] = useState("");
-  const [category, setCategory] = useState("");
-  const [customCategory, setCustomCategory] = useState(false);
-  const [knownCategories, setKnownCategories] = useState<string[]>(builtinCategories);
+  const [modelId, setModelId] = useState("");
+  const [legacyLabel, setLegacyLabel] = useState("");
   const [serial, setSerial] = useState("");
   const [error, setError] = useState("");
-  const [protocol, setProtocol] = useState(protocols[0]);
+  // Không còn ô sửa ảnh / ghi chú: giữ nguyên giá trị đã lưu của đồng hồ cũ khi cập nhật.
   const [notes, setNotes] = useState("");
   const [preview, setPreview] = useState<string | null>(null);
   const [isEdit, setIsEdit] = useState(false);
@@ -74,12 +71,11 @@ export function AddCustomDeviceForm() {
 
   useEffect(() => {
     let active = true;
-    void hydrateDevices().then((devices) => {
+    void Promise.all([hydrateDevices(), hydrateMeterModels({ force: true }), hydrateMeterTypeDefs()]).then(
+      ([devices, models, types]) => {
       if (!active) return;
-      const fromCatalog = devices
-        .map((item) => item.category?.trim() ?? "")
-        .filter((item): item is string => Boolean(item));
-      setKnownCategories(Array.from(new Set([...builtinCategories, ...fromCatalog])));
+      setCatalog(models);
+      setMeterTypes(types);
       if (!editingId) {
         setIsEdit(false);
         return;
@@ -90,21 +86,48 @@ export function AddCustomDeviceForm() {
         return;
       }
       setIsEdit(true);
-      setBrand(existing.brand);
-      setModel(existing.brandModel.replace(`${existing.brand} `, "").trim() || existing.name);
-      setProtocol(existing.protocol || protocols[0]);
-      setDeviceType(existing.type);
-      setCategory(existing.category ?? "");
+      const linkedModel =
+        models.find((item) => item.id === existing.modelId) ??
+        models.find(
+          (item) =>
+            item.brand.toLowerCase() === existing.brand.toLowerCase() &&
+            item.modelName.toLowerCase() === existing.name.toLowerCase(),
+        );
+      if (linkedModel) {
+        setMeterType(linkedModel.meterType);
+        setBrand(linkedModel.brand);
+        setModelId(linkedModel.id);
+      } else {
+        setLegacyLabel(`${existing.brandModel || existing.name}${existing.category ? ` · ${existing.category}` : ""}`);
+      }
       setSerial(existing.sn);
       setNotes(existing.notes ?? "");
       setPreview(existing.image ?? null);
       setExtraFields(existing.extraFields ?? []);
       setRows(existing.registers?.length ? existing.registers : emptyRegisterRows());
-    });
+      },
+    );
     return () => {
       active = false;
     };
   }, [editingId]);
+
+  const typeOptions = useMemo(() => {
+    const withModels = new Set(catalog.map((item) => item.meterType));
+    return meterTypes.filter((item) => withModels.has(item.name));
+  }, [catalog, meterTypes]);
+  const brandOptions = useMemo(
+    () =>
+      Array.from(new Set(catalog.filter((item) => item.meterType === meterType).map((item) => item.brand))).sort(
+        (a, b) => a.localeCompare(b, "vi"),
+      ),
+    [catalog, meterType],
+  );
+  const modelOptions = useMemo(
+    () => catalog.filter((item) => item.meterType === meterType && item.brand === brand),
+    [brand, catalog, meterType],
+  );
+  const selectedModel = catalog.find((item) => item.id === modelId) ?? null;
 
   function addExtraField() {
     setExtraFields((current) => [
@@ -133,15 +156,9 @@ export function AddCustomDeviceForm() {
   }
 
   async function handleSubmit() {
-    const brandName = brand.trim() || "Custom";
-    const modelName = model.trim() || "Device";
-    const brandModel = modelName.toLowerCase().startsWith(brandName.toLowerCase())
-      ? modelName
-      : `${brandName} ${modelName}`;
     const serialNumber = serial.trim();
-    const categoryName = category.trim();
-    if (!categoryName || !serialNumber) {
-      setError("Vui lòng chọn Category và nhập Serial.");
+    if (!selectedModel || !serialNumber) {
+      setError("Vui lòng chọn loại đồng hồ, thương hiệu, tên model và nhập Serial.");
       return;
     }
     setError("");
@@ -150,16 +167,17 @@ export function AddCustomDeviceForm() {
     try {
       await upsertDevice({
         id,
-        name: modelName,
+        name: selectedModel.modelName,
         sn: serialNumber,
-        category: categoryName,
-        brandModel,
-        brand: brandName,
-        type: typeLabelFromDeviceType(deviceType),
-        kind: kindFromDeviceType(deviceType || modelName),
+        category: selectedModel.modelName,
+        brandModel: `${selectedModel.brand} ${selectedModel.modelName}`,
+        brand: selectedModel.brand,
+        type: selectedModel.meterType,
+        kind: kindFromDeviceType(selectedModel.meterType),
         status: "active",
         lastSync: todaySyncLabel(),
-        protocol,
+        protocol: selectedModel.protocol ?? undefined,
+        modelId: selectedModel.id,
         notes: notes.trim(),
         image: preview ?? undefined,
         extraFields,
@@ -198,9 +216,6 @@ export function AddCustomDeviceForm() {
           <h1 className="text-2xl font-bold tracking-tight text-slate-900">
             {isEdit ? "Cập nhật loại đồng hồ" : "Thêm loại đồng hồ"}
           </h1>
-          <p className="mt-1 text-sm text-slate-500">
-            Cấu hình chung cho loại đồng hồ nhận dữ liệu từ gateway, dùng lại cho nhiều dự án.
-          </p>
         </div>
       </div>
 
@@ -220,56 +235,95 @@ export function AddCustomDeviceForm() {
         </div>
 
         <div className="grid gap-4 sm:grid-cols-2">
-          <Field label="1. Category (Loại đồng hồ hỗ trợ)">
+          {catalog.length === 0 ? (
+            <div className="sm:col-span-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+              Chưa có model đồng hồ nào.{" "}
+              <Link href="/cau-hinh/loai-dong-ho" className="font-semibold text-emerald-700 hover:underline">
+                Mở Cấu hình loại đồng hồ
+              </Link>{" "}
+              để thêm loại, thương hiệu và model trước.
+            </div>
+          ) : null}
+          {legacyLabel && !selectedModel ? (
+            <div className="sm:col-span-2 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-600">
+              Đồng hồ này đang lưu theo kiểu cũ: <span className="font-semibold">{legacyLabel}</span>. Hãy chọn lại
+              loại, thương hiệu và model từ danh mục cấu hình.
+            </div>
+          ) : null}
+          <Field label="1. Loại đồng hồ">
             <CustomSelect
-              value={customCategory ? CUSTOM_CATEGORY : category}
+              value={meterType}
               onChange={(e) => {
-                const nextCat = e.target.value;
-                if (nextCat === CUSTOM_CATEGORY) {
-                  setCustomCategory(true);
-                  setCategory("");
-                  return;
-                }
-                setCustomCategory(false);
-                setCategory(nextCat);
-                if (nextCat === "PM2230") {
-                  if (!brand.trim()) setBrand("Schneider Electric");
-                  if (!model.trim()) setModel("PM2230");
-                  if (!deviceType.trim()) setDeviceType("Đồng hồ điện 3 pha");
-                  if (rows.length === 1 && !rows[0].address.trim() && !rows[0].name.trim()) {
-                    setRows(defaultPm2230Registers());
-                  }
-                }
+                setMeterType(e.target.value);
+                setBrand("");
+                setModelId("");
               }}
               className="input"
               required
             >
               <option value="">Chọn loại đồng hồ</option>
-              {knownCategories.map((item) => (
+              {typeOptions.map((item) => (
+                <option key={item.name} value={item.name}>
+                  {item.name}
+                </option>
+              ))}
+            </CustomSelect>
+          </Field>
+          <Field label="2. Thương hiệu / Nhà sản xuất">
+            <CustomSelect
+              value={brand}
+              onChange={(e) => {
+                setBrand(e.target.value);
+                setModelId("");
+              }}
+              className="input"
+              disabled={!meterType}
+              required
+            >
+              <option value="">Chọn thương hiệu</option>
+              {brandOptions.map((item) => (
                 <option key={item} value={item}>
                   {item}
                 </option>
               ))}
-              {category && !customCategory && !knownCategories.includes(category) ? (
-                <option value={category}>{category}</option>
-              ) : null}
-              <option value={CUSTOM_CATEGORY}>+ Loại khác (nhập tay)…</option>
             </CustomSelect>
-            {customCategory ? (
-              <input
-                value={category}
-                onChange={(e) => setCategory(e.target.value)}
-                className="input mt-2"
-                placeholder="VD: PM2120, MFM384…"
-                autoFocus
-                required
-              />
-            ) : null}
-            <p className="mt-1.5 text-[11px] text-slate-400">
-              Dữ liệu gateway được ghép theo Serial (MID). Category dùng để phân loại và hiển thị.
-            </p>
           </Field>
-          <Field label="2. Serial">
+          <Field label="3. Tên model">
+            <CustomSelect
+              value={modelId}
+              onChange={(e) => {
+                const nextId = e.target.value;
+                setModelId(nextId);
+                const next = catalog.find((item) => item.id === nextId);
+                if (
+                  next &&
+                  /pm2230/i.test(next.modelName) &&
+                  rows.length === 1 &&
+                  !rows[0].address.trim() &&
+                  !rows[0].name.trim()
+                ) {
+                  setRows(defaultPm2230Registers());
+                }
+              }}
+              className="input"
+              disabled={!brand}
+              required
+            >
+              <option value="">Chọn tên model</option>
+              {modelOptions.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.modelName}
+                </option>
+              ))}
+            </CustomSelect>
+            {selectedModel ? (
+              <p className="mt-1.5 text-[11px] text-slate-400">
+                Giao thức: {selectedModel.protocol || "—"}
+                {selectedModel.modelCode != null ? ` · Mã model (MM): ${selectedModel.modelCode}` : ""}
+              </p>
+            ) : null}
+          </Field>
+          <Field label="4. Serial">
             <input
               value={serial}
               onChange={(e) => setSerial(e.target.value)}
@@ -277,41 +331,6 @@ export function AddCustomDeviceForm() {
               className="input"
               required
             />
-          </Field>
-          <Field label="Thương hiệu / Nhà sản xuất">
-            <input
-              value={brand}
-              onChange={(e) => setBrand(e.target.value)}
-              placeholder="VD: Schneider Electric"
-              className="input"
-            />
-          </Field>
-          <Field label="Tên Model">
-            <input
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              placeholder="VD: PowerLogic PM2230"
-              className="input"
-            />
-          </Field>
-          <Field label="Loại thiết bị">
-            <input
-              value={deviceType}
-              onChange={(e) => setDeviceType(e.target.value)}
-              placeholder="VD: Đồng hồ điện 3 pha, cảm biến lưu lượng, inverter..."
-              className="input"
-            />
-          </Field>
-          <Field label="Giao thức kết nối">
-            <CustomSelect
-              value={protocol}
-              onChange={(e) => setProtocol(e.target.value)}
-              className="input"
-            >
-              {protocols.map((item) => (
-                <option key={item}>{item}</option>
-              ))}
-            </CustomSelect>
           </Field>
           {extraFields.map((field) => (
             <div key={field.id} className="sm:col-span-2 grid grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)_auto] items-end gap-2">
@@ -372,16 +391,14 @@ export function AddCustomDeviceForm() {
             + THÊM DÒNG
           </button>
         </div>
-        <p className="mb-4 text-sm text-slate-500">
-          Khai báo thanh ghi/điểm dữ liệu để hệ thống đọc từ gateway. Cấu hình này dùng chung cho mọi dự án gắn loại đồng hồ này.
-        </p>
 
         <div className="overflow-x-auto">
           <table className="w-full min-w-[700px] text-left text-sm">
             <thead>
               <tr className="border-b border-slate-100 text-[11px] font-semibold tracking-wide text-slate-400">
-                <th className="px-2 py-2">ĐỊA CHỈ (HEX/DEC)</th>
-                <th className="px-2 py-2">TÊN THÔNG SỐ</th>
+                {/* Dữ liệu lưu giữ nguyên: cột "Tên" ở trường address (VD: EPaed), "Mô tả" ở trường name. */}
+                <th className="px-2 py-2">TÊN</th>
+                <th className="px-2 py-2">MÔ TẢ</th>
                 <th className="px-2 py-2">KIỂU DỮ LIỆU</th>
                 <th className="px-2 py-2">HỆ SỐ NHÂN</th>
                 <th className="w-12 px-2 py-2 text-right">THAO TÁC</th>
@@ -394,6 +411,8 @@ export function AddCustomDeviceForm() {
                     <input
                       value={row.address}
                       onChange={(e) => updateRow(row.id, "address", e.target.value)}
+                      placeholder="VD: EPaed"
+                      aria-label="Tên"
                       className="input h-9"
                     />
                   </td>
@@ -401,6 +420,8 @@ export function AddCustomDeviceForm() {
                     <input
                       value={row.name}
                       onChange={(e) => updateRow(row.id, "name", e.target.value)}
+                      placeholder="VD: Điện năng tác dụng nhận (kWh)"
+                      aria-label="Mô tả"
                       className="input h-9"
                     />
                   </td>
@@ -440,54 +461,6 @@ export function AddCustomDeviceForm() {
           </table>
         </div>
       </section>
-
-      <div className="grid gap-5 lg:grid-cols-[240px_minmax(0,1fr)]">
-        <section className="rounded-xl border border-slate-200 bg-white p-5 shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
-          <label className="flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-slate-300 bg-slate-50 px-4 py-8 text-center hover:border-emerald-500 hover:bg-emerald-50/30 transition-colors">
-            {preview ? (
-              <img
-                src={preview}
-                alt="Ảnh thiết bị"
-                className="mb-3 h-24 w-24 rounded-lg object-cover"
-              />
-            ) : (
-              <CameraIcon className="mb-3 h-8 w-8 text-slate-400" />
-            )}
-            <span className="text-xs font-bold tracking-wide text-slate-600">
-              ẢNH ĐỒNG HỒ
-            </span>
-            <input
-              type="file"
-              accept="image/*"
-              className="hidden"
-              onChange={(e) => {
-                const file = e.target.files?.[0];
-                if (!file) return;
-                const reader = new FileReader();
-                reader.onload = () => setPreview(String(reader.result ?? ""));
-                reader.readAsDataURL(file);
-              }}
-            />
-          </label>
-          <p className="mt-3 text-center text-xs leading-5 text-slate-400">
-            Ảnh mẫu của loại đồng hồ để dễ nhận diện. Không phải ảnh hiện trường của một dự án.
-          </p>
-        </section>
-
-        <section className="rounded-xl border border-slate-200 bg-white p-5 shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
-          <h2 className="mb-3 flex items-center gap-2 text-sm font-bold tracking-wide text-slate-700 uppercase">
-            <DocIcon className="h-4 w-4 text-emerald-600" />
-            Ghi chú & mô tả
-          </h2>
-          <textarea
-            value={notes}
-            onChange={(e) => setNotes(e.target.value)}
-            rows={7}
-            placeholder="Ghi chú kỹ thuật của loại đồng hồ: đơn vị, cách đọc thanh ghi, lưu ý khi kết nối gateway..."
-            className="w-full resize-none rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm text-slate-800 outline-none placeholder:text-slate-400 focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/15 transition-all"
-          />
-        </section>
-      </div>
 
       <div className="sticky bottom-0 -mx-6 mt-1 flex items-center justify-between gap-3 border-t border-slate-200 bg-[#f3f5f8]/95 px-6 py-4 backdrop-blur lg:-mx-8 lg:px-8">
         <p className="flex items-center gap-2 text-xs text-slate-500">
@@ -589,15 +562,6 @@ function TrashIcon({ className }: { className?: string }) {
   return (
     <svg className={className} viewBox="0 0 24 24" fill="none" aria-hidden>
       <path d="M5 7h14M10 7V5h4v2M8 7l.8 12h6.4L16 7" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  );
-}
-
-function CameraIcon({ className }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" aria-hidden>
-      <path d="M4 8.5h3l1.5-2h7l1.5 2h3A1.5 1.5 0 0 1 21.5 10v8A1.5 1.5 0 0 1 20 19.5H4A1.5 1.5 0 0 1 2.5 18v-8A1.5 1.5 0 0 1 4 8.5Z" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" />
-      <circle cx="12" cy="14" r="3.2" stroke="currentColor" strokeWidth="1.8" />
     </svg>
   );
 }

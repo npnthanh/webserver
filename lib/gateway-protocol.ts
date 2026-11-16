@@ -54,7 +54,8 @@ export type NormalizedPacket = {
   gatewayId: string;
   gatewayTemperature: string | null;
   gatewayHumidity: string | null;
-  meterType: "E" | "W" | "P" | "F";
+  /** Chữ cái loại cũ (E/W/P/F) cho mã 1–4, hoặc chính mã số (VD "5") cho loại cấu hình thêm. */
+  meterType: string;
   meterTypeCode: number | null;
   meterModel: string;
   meterModelCode: number | null;
@@ -392,9 +393,12 @@ function parseInternet(value: unknown): "W" | "S" | null {
   return null;
 }
 
-function parseMeterType(value: unknown): "E" | "W" | "P" | "F" | null {
+function parseMeterType(value: unknown): string | null {
   const code = numericCode(value);
   if (code != null && METER_TYPE_BY_CODE[code]) return METER_TYPE_BY_CODE[code];
+  // Mã loại do người dùng cấu hình thêm (trang Cấu hình loại đồng hồ): giữ nguyên chữ số, tên được dịch khi hiển thị.
+  // Giới hạn 1–9 vì cột gateway_*.meter_type là CHAR(1).
+  if (code != null && Number.isInteger(code) && code >= 1 && code <= 9) return String(code);
   const text = String(value ?? "").trim().toLowerCase();
   if (text === "e" || text === "electric" || text === "electricity" || text === "electricity meter") return "E";
   if (text === "w" || text === "water" || text === "water meter") return "W";

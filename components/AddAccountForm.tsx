@@ -27,6 +27,8 @@ export function AddAccountForm() {
   const editingId = searchParams.get("id");
 
   const [username, setUsername] = useState("");
+  const [fullName, setFullName] = useState("");
+  const [phone, setPhone] = useState("");
   const [email, setEmail] = useState("");
   const [role, setRole] = useState<AccountRole>("Manage");
   const [selectedProjectIds, setSelectedProjectIds] = useState<string[]>([]);
@@ -82,6 +84,8 @@ export function AddAccountForm() {
       setIsEdit(true);
       setExisting(found);
       setUsername(found.username);
+      setFullName(found.fullName ?? "");
+      setPhone(found.phone ?? "");
       setEmail(found.email);
       setRole(normalizeAccountRole(found.role));
       setSelectedProjectIds(found.projectIds ?? []);
@@ -166,6 +170,8 @@ export function AddAccountForm() {
       await upsertAccount({
         id: editingId && isEdit ? editingId : `acc-${Date.now()}`,
         username: name,
+        fullName: fullName.trim(),
+        phone: phone.trim(),
         email: mail,
         role,
         projectIds: role === "Admin" ? [] : selectedProjectIds,
@@ -246,6 +252,25 @@ export function AddAccountForm() {
               placeholder="Ví dụ: admin@ems-precision.com"
               className="input"
               required
+            />
+          </Field>
+          <Field label="HỌ TÊN">
+            <input
+              value={fullName}
+              onChange={(e) => setFullName(e.target.value)}
+              placeholder="Ví dụ: Nguyễn Văn A"
+              maxLength={150}
+              className="input"
+            />
+          </Field>
+          <Field label="SỐ ĐIỆN THOẠI">
+            <input
+              type="tel"
+              value={phone}
+              onChange={(e) => setPhone(e.target.value)}
+              placeholder="Ví dụ: 0901 234 567"
+              maxLength={40}
+              className="input"
             />
           </Field>
           <Field label="VAI TRÒ PHÂN CẤP">

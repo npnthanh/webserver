@@ -21,11 +21,16 @@ type GasRow = {
   unit: string;
 };
 
-const defaultRows: GasRow[] = [
-  { id: "row-co2", key: "co2", label: "CO2", value: "74 100", unit: "kg CO2/TJ" },
-  { id: "row-ch4", key: "ch4", label: "CH4", value: "3", unit: "kg CH4/TJ" },
-  { id: "row-n2o", key: "n2o", label: "N2O", value: "0,6", unit: "kg N2O/TJ" },
-];
+/** Một dòng trống: người dùng nhập gì thì lưu đúng như vậy, thêm dòng bằng nút "Thêm thành phần". */
+function emptyRow(): GasRow {
+  return {
+    id: `row-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    key: "",
+    label: "",
+    value: "",
+    unit: "",
+  };
+}
 
 function rowsFromGroup(group: FactorGroup): GasRow[] {
   return group.gases.map((gas, index) => ({
@@ -52,7 +57,7 @@ export function AddEmissionFactorForm() {
 
   const [name, setName] = useState("");
   const [source, setSource] = useState("");
-  const [rows, setRows] = useState<GasRow[]>(defaultRows);
+  const [rows, setRows] = useState<GasRow[]>(() => [emptyRow()]);
   const [isEdit, setIsEdit] = useState(false);
   const [rowToDelete, setRowToDelete] = useState<GasRow | null>(null);
 
@@ -72,7 +77,8 @@ export function AddEmissionFactorForm() {
       setIsEdit(true);
       setName(existing.name);
       setSource(existing.source);
-      setRows(rowsFromGroup(existing));
+      const existingRows = rowsFromGroup(existing);
+      setRows(existingRows.length ? existingRows : [emptyRow()]);
     });
     return () => {
       active = false;
@@ -86,17 +92,7 @@ export function AddEmissionFactorForm() {
   }
 
   function addRow() {
-    const newId = `row-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-    setRows((current) => [
-      ...current,
-      {
-        id: newId,
-        key: "",
-        label: "",
-        value: "",
-        unit: "kg/TJ",
-      },
-    ]);
+    setRows((current) => [...current, emptyRow()]);
   }
 
   function removeRow(id: string) {
@@ -113,21 +109,26 @@ export function AddEmissionFactorForm() {
       return;
     }
 
+    const usedKeys = new Set<string>();
     upsertFactorGroup({
       id: editingId && isEdit ? editingId : `ef-${Date.now()}`,
       name: trimmed,
       source: source.trim(),
       gases: validRows.map((row, idx) => {
-        const cleanLabel = row.label.trim();
-        const cleanKey =
+        const cleanLabel = row.label.trim().slice(0, 20);
+        // Mã khí: tối đa 10 ký tự (cột gas_key) và không trùng giữa các dòng, nếu trùng thì thêm số thứ tự.
+        let cleanKey = (
           (row.key && row.key.trim()) ||
           cleanLabel.toLowerCase().replace(/[^a-z0-9]/g, "") ||
-          `gas_${idx + 1}`;
+          `gas${idx + 1}`
+        ).slice(0, 10);
+        if (usedKeys.has(cleanKey)) cleanKey = `${cleanKey.slice(0, 7)}_${idx + 1}`;
+        usedKeys.add(cleanKey);
         return {
           key: cleanKey,
           label: cleanLabel,
           value: parseFactorNumber(row.value),
-          unit: row.unit.trim() || "kg/TJ",
+          unit: row.unit.trim(),
         };
       }),
     });
@@ -232,6 +233,7 @@ export function AddEmissionFactorForm() {
                       value={row.label}
                       onChange={(e) => updateRow(row.id, { label: e.target.value })}
                       placeholder="VD: CO2, CH4, N2O, SF6..."
+                      maxLength={20}
                       className="input font-semibold text-slate-800"
                       required
                     />
