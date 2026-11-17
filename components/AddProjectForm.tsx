@@ -239,7 +239,12 @@ export function AddProjectForm({ initialProject }: { initialProject?: Project })
       ) {
         await saveProjectManager(projectCode, managerId || null, startDate);
       }
-      router.push("/");
+      if (initialProject) {
+        router.push(`/sua-du-an/${encodeURIComponent(initialProject.id)}`);
+        router.refresh();
+      } else {
+        router.push("/");
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Không thể lưu dự án vào database.");
     }
@@ -251,11 +256,6 @@ export function AddProjectForm({ initialProject }: { initialProject?: Project })
         <h1 className="text-2xl font-bold tracking-tight text-slate-900">
           {initialProject ? "Sửa thông tin dự án" : "Tạo dự án mới"}
         </h1>
-        <p className="mt-1 text-sm text-slate-500">
-          {initialProject
-            ? "Cập nhật thông tin khách hàng, loại điểm đo và người nhận thông báo cảnh báo."
-            : "Cấu hình thông tin khách hàng, loại điểm đo và người nhận thông báo cảnh báo."}
-        </p>
       </div>
 
       <form
@@ -428,7 +428,6 @@ export function AddProjectForm({ initialProject }: { initialProject?: Project })
           <div className="mb-5 flex flex-wrap items-start justify-between gap-3">
             <div>
               <h2 className="text-[15px] font-semibold text-slate-800">Loại điểm đo</h2>
-              <p className="mt-1 text-sm text-slate-500">Chọn các loại năng lượng sẽ được giám sát trong dự án này.</p>
             </div>
           </div>
 
@@ -480,9 +479,6 @@ export function AddProjectForm({ initialProject }: { initialProject?: Project })
           <div className="mb-5 flex flex-wrap items-start justify-between gap-3">
             <div>
               <h2 className="text-[15px] font-semibold text-slate-800">Người nhận thông báo cảnh báo</h2>
-              <p className="mt-1 text-sm text-slate-500">
-                Danh sách email và số điện thoại nhận cảnh báo khi hệ thống vượt ngưỡng.
-              </p>
             </div>
             <button
               type="button"
@@ -534,7 +530,7 @@ export function AddProjectForm({ initialProject }: { initialProject?: Project })
                         current.length === 1 ? [nextRecipient()] : current.filter((row) => row.id !== item.id),
                       )
                     }
-                    className="flex h-10 w-10 items-center justify-center rounded-lg text-slate-400 hover:bg-red-50 hover:text-red-500"
+                    className="flex h-10 w-10 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-400 transition-colors hover:border-rose-200 hover:bg-rose-50 hover:text-rose-600"
                     aria-label="Xóa người nhận"
                   >
                     <TrashIcon className="h-4 w-4" />
@@ -607,7 +603,7 @@ export function AddProjectForm({ initialProject }: { initialProject?: Project })
 
         <div className="flex flex-wrap justify-end gap-3">
           <Link
-            href="/"
+            href={initialProject ? `/sua-du-an/${encodeURIComponent(initialProject.id)}` : "/"}
             className="inline-flex h-10 items-center rounded-xl border border-slate-200 bg-white px-4 text-sm font-semibold text-slate-600 hover:bg-slate-50 transition-colors shadow-xs"
           >
             Hủy
@@ -651,7 +647,7 @@ function Field({ label, children }: { label?: string; children: ReactNode }) {
   );
 }
 
-function MeterTypeIcon({
+export function MeterTypeIcon({
   type,
   className,
 }: {
@@ -729,8 +725,8 @@ function ChevronIcon({ className }: { className?: string }) {
 
 function TrashIcon({ className }: { className?: string }) {
   return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" aria-hidden>
-      <path d="M5 7h14M9 7V5h6v2M8 7l.8 12h6.4L16 7" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M3 6h18M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" />
     </svg>
   );
 }

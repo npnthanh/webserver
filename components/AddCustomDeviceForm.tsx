@@ -318,7 +318,7 @@ export function AddCustomDeviceForm() {
             </CustomSelect>
             {selectedModel ? (
               <p className="mt-1.5 text-[11px] text-slate-400">
-                Giao thức: {selectedModel.protocol || "—"}
+                Protocol Version: {selectedModel.protocol || "—"}
                 {selectedModel.modelCode != null ? ` · Mã model (MM): ${selectedModel.modelCode}` : ""}
               </p>
             ) : null}

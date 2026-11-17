@@ -354,7 +354,7 @@ export function ProjectList() {
                             <EyeSmallIcon className="h-4 w-4" />
                           </Link>
                           <Link
-                            href={`/sua-du-an/${project.id}`}
+                            href={`/sua-du-an/${project.id}/chinh-sua`}
                             className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-500 hover:bg-slate-50 hover:text-slate-800 transition-colors"
                             title="Sửa thông tin dự án"
                           >

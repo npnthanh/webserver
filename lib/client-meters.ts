@@ -51,12 +51,13 @@ export function loadClientMeters(projectId: string): ClientMeter[] {
 }
 
 export async function saveClientMeters(projectId: string, meters: ClientMeter[]) {
-  meterCache[projectId] = meters;
-  emitDbChange("client-meters");
+  // Chỉ cập nhật cache khi server chấp nhận (VD bị từ chối vì trùng serial với dự án khác).
   await dbFetch("client-meters", {
     method: "POST",
     body: JSON.stringify({ projectId, meters }),
   });
+  meterCache[projectId] = meters;
+  emitDbChange("client-meters");
 }
 
 export function hydrateClientMeters(projectId: string) {

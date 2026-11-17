@@ -132,10 +132,10 @@ export async function loadProjectGatewayEnergySlots(
 
 export async function loadProjectGatewaySamples(
   projectId: string,
-  range?: { from?: string; to?: string; limit?: number },
+  range?: { from?: string; to?: string; limit?: number; after?: string },
 ): Promise<ProjectGatewaySample[]> {
   const key = `${projectId}:${range?.from ?? ""}:${range?.to ?? ""}:${range?.limit ?? ""}`;
-  const fallback = lastGoodSamples.get(key) ?? [];
+  const fallback = range?.after ? [] : lastGoodSamples.get(key) ?? [];
   try {
     const params = new URLSearchParams({ projectId });
     if (range?.from && range.to) {
@@ -143,10 +143,13 @@ export async function loadProjectGatewaySamples(
       params.set("to", range.to);
     }
     if (range?.limit) params.set("limit", String(range.limit));
+    // Chỉ lấy mẫu mới hơn mốc này (biểu đồ tự làm mới).
+    if (range?.after) params.set("after", range.after);
     const response = await fetch(`/api/gateway/series?${params}`, { cache: "no-store" });
     if (!response.ok) return fallback;
     const body = (await response.json()) as ProjectGatewaySample[];
     const rows = Array.isArray(body) ? body : [];
+    if (range?.after) return rows;
     if (rows.length > 0) {
       lastGoodSamples.set(key, rows);
       return rows;

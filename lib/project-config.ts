@@ -4,7 +4,7 @@ export function matchProjectConfig(pathname: string): {
   projectId: string;
   module: ProjectConfigModule;
 } | null {
-  const projectInfoMatch = pathname.match(/^\/sua-du-an\/([^/]+)\/?$/);
+  const projectInfoMatch = pathname.match(/^\/sua-du-an\/([^/]+)(?:\/chinh-sua)?\/?$/);
   if (projectInfoMatch) return { projectId: projectInfoMatch[1], module: "project-info" };
 
   const match = pathname.match(/^\/chinh-sua-du-an\/([^/]+)(?:\/([^/]+))?/);

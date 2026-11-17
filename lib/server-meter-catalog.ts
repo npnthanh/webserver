@@ -9,6 +9,7 @@ type Row = Record<string, unknown>;
 export class CatalogUserError extends Error {}
 
 const SEED_VERSION = "2026-11-16-meter-catalog";
+const POINT_DEVICE_VERSION = "2026-11-17-meter-point-devices";
 
 /** Mã nhận dạng loại (MT) mặc định theo yêu cầu: 1 điện, 2 nước, 3 hơi, 4 nhiệt. */
 const DEFAULT_TYPE_CODES: Record<string, number> = { "Điện": 1, "Nước": 2, "Hơi": 3, "Nhiệt": 4 };
@@ -64,6 +65,13 @@ export function ensureMeterCatalogSchema() {
       await seedCatalog();
       await emsDb.execute("INSERT IGNORE INTO schema_migrations (version) VALUES (?)", [SEED_VERSION]);
     }
+    const linked = await queryRows("SELECT version FROM schema_migrations WHERE version = ? LIMIT 1", [
+      POINT_DEVICE_VERSION,
+    ]);
+    if (linked.length === 0) {
+      await linkMeterPointSerialsToDevices();
+      await emsDb.execute("INSERT IGNORE INTO schema_migrations (version) VALUES (?)", [POINT_DEVICE_VERSION]);
+    }
   })().catch((error) => {
     catalogReady = null;
     throw error;
@@ -112,6 +120,50 @@ async function seedCatalog() {
       meterType,
       text(device.id),
     ]);
+  }
+}
+
+function normalizeSerial(value: unknown) {
+  return text(value).replace(/^SN:\s*/i, "");
+}
+
+const KIND_BY_UTILITY: Record<string, string> = { "Điện": "power", "Nước": "flow", "Nhiệt": "temp", "Hơi": "steam" };
+
+/**
+ * Serial giờ được khai báo ở trang Thiết bị, điểm đo chỉ chọn thiết bị.
+ * Lần đầu: mỗi serial nhập tay ở điểm đo được gắn với thiết bị cùng serial (tạo mới nếu chưa có),
+ * giữ nguyên serial trên điểm đo nên dữ liệu gateway vẫn liên kết như cũ.
+ */
+async function linkMeterPointSerialsToDevices() {
+  const devices = await queryRows<Row>("SELECT id, serial_number AS sn FROM devices");
+  const deviceBySerial = new Map<string, string>();
+  for (const device of devices) {
+    const key = normalizeSerial(device.sn).toLowerCase();
+    if (key) deviceBySerial.set(key, text(device.id));
+  }
+  const points = await queryRows<Row>(
+    `SELECT id, utility, device_id AS deviceId, serial_number AS serialNumber
+       FROM meter_points WHERE serial_number IS NOT NULL`,
+  );
+  let created = 0;
+  for (const point of points) {
+    const serial = normalizeSerial(point.serialNumber);
+    if (!serial) continue;
+    const key = serial.toLowerCase();
+    let deviceId = deviceBySerial.get(key);
+    if (!deviceId) {
+      deviceId = `dev-${Date.now()}-${created++}`;
+      const utility = text(point.utility) || "Điện";
+      await emsDb.execute(
+        `INSERT INTO devices (id, name, serial_number, brand_model, brand, device_type, category, kind, status, last_sync_label)
+         VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
+        [deviceId, `Đồng hồ ${serial}`, serial, "Chưa rõ model", "Chưa rõ", utility, KIND_BY_UTILITY[utility] ?? "power", "active", "—"],
+      );
+      deviceBySerial.set(key, deviceId);
+    }
+    if (text(point.deviceId) !== deviceId) {
+      await emsDb.execute("UPDATE meter_points SET device_id = ? WHERE id = ?", [deviceId, text(point.id)]);
+    }
   }
 }
 

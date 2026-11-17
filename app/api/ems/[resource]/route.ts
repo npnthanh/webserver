@@ -3,6 +3,7 @@ import type { PoolConnection, RowDataPacket } from "mysql2/promise";
 import { NextRequest } from "next/server";
 import { normalizeAccountRole } from "@/lib/accounts";
 import { getProjectsListTelemetry } from "@/lib/gateway-store";
+import { PROTOCOL_VERSION } from "@/lib/gateway-protocol";
 import { canAccessAdminProject, canManageAccountRole, isAdminRole } from "@/lib/permissions";
 import { ensureAccountProjectsSchema, ensureCustomerAccountsSchema, getServerSession, requirePermission } from "@/lib/server-auth";
 import { emsDb, jsonField, queryRows } from "@/lib/server-db";
@@ -59,9 +60,11 @@ const RESOURCE_NAMES = new Set([
   "devices",
   "meter-types",
   "meter-models",
+  "gateway-protocol-versions",
   "client-meters",
   "emission-factors",
   "ghg-sources",
+  "ghg-templates",
   "alert-events",
   "meter-readings",
   "diagram-states",
@@ -77,6 +80,51 @@ const RESOURCE_NAMES = new Set([
 
 /** Lỗi nghiệp vụ: thông điệp được trả nguyên văn cho người dùng với HTTP 400. */
 class UserFacingError extends Error {}
+
+function normalizeSerial(value: unknown) {
+  return asString(value).trim().replace(/^SN:\s*/i, "");
+}
+
+type SerialConflict = { serial: string; projectId: string; projectName: string; pointName: string; pointCode: string };
+
+/**
+ * Điểm đo ở dự án KHÁC đang dùng các số serial này (serial nhập tay, hoặc serial của thiết bị nếu để trống).
+ * Một serial chỉ được gắn với một dự án để dữ liệu gateway không bị lẫn giữa các dự án.
+ */
+async function findSerialConflicts(projectId: string, serials: unknown[]): Promise<SerialConflict[]> {
+  const wanted = [...new Set(serials.map(normalizeSerial).filter(Boolean))];
+  if (!wanted.length) return [];
+  const variants = [...new Set(wanted.flatMap((serial) => [serial, `SN: ${serial}`, `SN:${serial}`]))];
+  const marks = variants.map(() => "?").join(", ");
+  const rows = await queryRows<Row>(
+    `SELECT mp.project_id AS projectId, COALESCE(p.name, mp.project_id) AS projectName,
+            mp.name AS pointName, mp.code AS pointCode,
+            COALESCE(NULLIF(TRIM(mp.serial_number), ''), d.serial_number) AS serial
+       FROM meter_points mp
+       LEFT JOIN devices d ON d.id = mp.device_id
+       LEFT JOIN projects p ON p.id = mp.project_id
+      WHERE mp.project_id <> ?
+        AND (TRIM(mp.serial_number) IN (${marks})
+             OR (COALESCE(TRIM(mp.serial_number), '') = '' AND d.serial_number IN (${marks})))
+      LIMIT 50`,
+    [projectId, ...variants, ...variants],
+  );
+  const wantedKeys = new Set(wanted.map((serial) => serial.toLowerCase()));
+  return rows
+    .map((row) => ({
+      serial: normalizeSerial(row.serial),
+      projectId: asString(row.projectId),
+      projectName: asString(row.projectName),
+      pointName: asString(row.pointName),
+      pointCode: asString(row.pointCode),
+    }))
+    .filter((row) => wantedKeys.has(row.serial.toLowerCase()));
+}
+
+function serialConflictMessage(conflict: SerialConflict) {
+  const point = conflict.pointName || conflict.pointCode;
+  return `Số serial "${conflict.serial}" đã được dùng ở dự án "${conflict.projectName}"${point ? ` (điểm đo "${point}")` : ""}.`;
+}
 
 function badRequest(message: string) {
   return Response.json({ error: message }, { status: 400 });
@@ -133,6 +181,65 @@ function ensureDiagramDisplaysColumn() {
       .catch(() => undefined);
   }
   return diagramDisplaysReady;
+}
+
+let emissionFactorOrderReady: Promise<void> | null = null;
+
+/** Thứ tự hiển thị hệ số phát thải: nhóm mới nhất lên đầu, khí trong nhóm theo đúng thứ tự đã nhập. */
+function ensureEmissionFactorOrdering() {
+  emissionFactorOrderReady ??= (async () => {
+    await emsDb
+      .query("ALTER TABLE emission_factor_groups ADD COLUMN created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP")
+      .catch(() => undefined);
+    await emsDb
+      .query("ALTER TABLE emission_factor_gases ADD COLUMN sort_order INT NOT NULL DEFAULT 0")
+      .catch(() => undefined);
+  })();
+  return emissionFactorOrderReady;
+}
+
+let ghgTemplatesReady: Promise<void> | null = null;
+
+/** Mẫu nguồn phát thải nhập thủ công (Cấu hình → Nguồn phát thải thủ công). */
+function ensureGhgTemplatesTable() {
+  ghgTemplatesReady ??= emsDb
+    .query(
+      `CREATE TABLE IF NOT EXISTS ghg_manual_templates (
+         id VARCHAR(64) NOT NULL,
+         name VARCHAR(255) NOT NULL,
+         unit VARCHAR(40) NOT NULL,
+         default_value DECIMAL(18,6) NULL,
+         factor_group_id VARCHAR(100) NULL,
+         multipliers_json LONGTEXT NULL,
+         formula VARCHAR(500) NOT NULL,
+         updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+         PRIMARY KEY (id)
+       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+    )
+    .then(() => undefined)
+    .catch((error) => {
+      ghgTemplatesReady = null;
+      throw error;
+    });
+  return ghgTemplatesReady;
+}
+
+async function listGhgTemplates() {
+  await ensureGhgTemplatesTable();
+  const rows = await queryRows<Row>(
+    `SELECT id, name, unit, default_value AS defaultValue, factor_group_id AS factorGroupId,
+            multipliers_json AS multipliers, formula
+       FROM ghg_manual_templates ORDER BY name, id`,
+  );
+  return rows.map((row) => ({
+    id: asString(row.id),
+    name: asString(row.name),
+    unit: asString(row.unit),
+    defaultValue: row.defaultValue == null ? null : asNumber(row.defaultValue),
+    factorGroupId: asString(row.factorGroupId),
+    multipliers: jsonField<unknown[]>(row.multipliers, []),
+    formula: asString(row.formula),
+  }));
 }
 
 let recipientChannelsReady: Promise<void> | null = null;
@@ -470,6 +577,21 @@ async function getResource(resource: string, request: NextRequest) {
   if (resource === "meter-models") {
     return listMeterModels();
   }
+  if (resource === "gateway-protocol-versions") {
+    // Protocol Version (PV) do gateway gửi lên + phiên bản server đang hỗ trợ.
+    const rows = await queryRows<Row>(
+      "SELECT DISTINCT protocol_version AS version FROM gateway_devices WHERE protocol_version IS NOT NULL",
+    ).catch(() => [] as Row[]);
+    const versions = new Set<string>([PROTOCOL_VERSION]);
+    for (const row of rows) {
+      const version = asString(row.version).trim();
+      if (version) versions.add(version);
+    }
+    return [...versions].sort((a, b) => a.localeCompare(b, "en", { numeric: true }));
+  }
+  if (resource === "ghg-templates") {
+    return listGhgTemplates();
+  }
   if (resource === "client-meters") {
     if (!projectId) throw new Error("projectId is required");
     const [rows, historyRows] = await Promise.all([
@@ -507,13 +629,14 @@ async function getResource(resource: string, request: NextRequest) {
     }));
   }
   if (resource === "emission-factors") {
+    await ensureEmissionFactorOrdering();
     const groups = await queryRows<Row>(
-      "SELECT id, name, source FROM emission_factor_groups ORDER BY id",
+      "SELECT id, name, source FROM emission_factor_groups ORDER BY created_at DESC, name, id",
     );
     const gases = await queryRows<Row>(
       `SELECT group_id AS groupId, gas_key AS gasKey, gas_label AS gasLabel,
               factor_value AS value, unit
-         FROM emission_factor_gases ORDER BY group_id, gas_key`,
+         FROM emission_factor_gases ORDER BY group_id, sort_order, CASE gas_key WHEN 'co2' THEN 0 WHEN 'ch4' THEN 1 WHEN 'n2o' THEN 2 ELSE 3 END, gas_key`,
     );
     return groups.map((group) => ({
       ...group,
@@ -529,6 +652,7 @@ async function getResource(resource: string, request: NextRequest) {
   }
   if (resource === "ghg-sources") {
     await ensureGhgColumns();
+    await ensureEmissionFactorOrdering();
     const [rows, gasRows] = await Promise.all([
       queryRows<Row>(
         `SELECT id, project_id AS projectId, scope_id AS scope, name,
@@ -547,7 +671,7 @@ async function getResource(resource: string, request: NextRequest) {
       queryRows<Row>(
         `SELECT group_id AS groupId, gas_key AS gasKey, gas_label AS gasLabel,
                 factor_value AS value, unit
-           FROM emission_factor_gases ORDER BY group_id, gas_key`,
+           FROM emission_factor_gases ORDER BY group_id, sort_order, CASE gas_key WHEN 'co2' THEN 0 WHEN 'ch4' THEN 1 WHEN 'n2o' THEN 2 ELSE 3 END, gas_key`,
       ).catch(() => [] as Row[]),
     ]);
     const gasesByGroup = new Map<string, { key: string; label: string; value: number; unit: string }[]>();
@@ -580,7 +704,8 @@ async function getResource(resource: string, request: NextRequest) {
     }));
   }
   if (resource === "alert-events") {
-    await evaluateProjectAlerts(projectId);
+    // Bộ lập lịch nền đánh giá cảnh báo mỗi phút: không bắt người dùng chờ.
+    void evaluateProjectAlerts(projectId);
     const rows = await queryRows<Row>(
       `SELECT a.id, a.project_id AS projectId, a.meter_point_id AS meterPointId,
               DATE_FORMAT(a.occurred_at, '%Y-%m-%d %H:%i:%s') AS occurredAt,
@@ -991,6 +1116,9 @@ async function saveResource(resource: string, body: Row) {
       for (const item of body.items as Row[]) await saveResource(resource, item);
       return getResource(resource, new NextRequest("http://localhost/api/ems/devices"));
     }
+    const [previousDevice] = await queryRows<Row>("SELECT serial_number AS sn FROM devices WHERE id = ?", [
+      asString(body.id),
+    ]);
     await emsDb.execute(
       `INSERT INTO devices
         (id, name, serial_number, brand_model, brand, device_type, category, kind, status,
@@ -1009,6 +1137,15 @@ async function saveResource(resource: string, body: Row) {
         body.registers ? JSON.stringify(body.registers) : null,
         asString(body.modelId) || null],
     );
+    // Điểm đo lưu kèm serial của thiết bị đã chọn: đổi serial ở trang Thiết bị thì cập nhật theo.
+    const oldSerial = asString(previousDevice?.sn).trim();
+    const newSerial = asString(body.sn).trim();
+    if (oldSerial && newSerial && oldSerial !== newSerial) {
+      await emsDb.execute(
+        "UPDATE meter_points SET serial_number = ? WHERE device_id = ? AND TRIM(serial_number) = ?",
+        [newSerial, asString(body.id), oldSerial],
+      );
+    }
     return getResource(resource, new NextRequest("http://localhost/api/ems/devices"));
   }
   if (resource === "meter-types") {
@@ -1054,6 +1191,25 @@ async function saveResource(resource: string, body: Row) {
     const projectId = asString(body.projectId);
     const meters = Array.isArray(body.meters) ? body.meters as Row[] : [];
     if (!projectId) throw new Error("projectId is required");
+    {
+      const serialDevices = await queryRows<Row>("SELECT id, serial_number AS sn FROM devices").catch(() => [] as Row[]);
+      const snByDevice = new Map(serialDevices.map((d) => [String(d.id), asString(d.sn)]));
+      const effectiveSerial = (serial: unknown, deviceId: unknown) =>
+        normalizeSerial(serial) || normalizeSerial(snByDevice.get(asString(deviceId)) ?? "");
+      // Chỉ kiểm tra serial mới hoặc vừa đổi: dữ liệu cũ đã trùng không chặn các lần lưu khác của dự án.
+      const currentRows = await queryRows<Row>(
+        "SELECT id, serial_number AS serialNumber, device_id AS deviceId FROM meter_points WHERE project_id = ?",
+        [projectId],
+      ).catch(() => [] as Row[]);
+      const currentSerial = new Map(
+        currentRows.map((row) => [asString(row.id), effectiveSerial(row.serialNumber, row.deviceId).toLowerCase()]),
+      );
+      const serials = meters
+        .map((meter) => effectiveSerial(meter.serialNumber, meter.deviceId))
+        .filter((serial, index) => serial && currentSerial.get(asString(meters[index].id)) !== serial.toLowerCase());
+      const [conflict] = await findSerialConflicts(projectId, serials);
+      if (conflict) throw new UserFacingError(serialConflictMessage(conflict));
+    }
     await emsDb
       .query(
         `CREATE TABLE IF NOT EXISTS meter_point_history (
@@ -1093,6 +1249,27 @@ async function saveResource(resource: string, body: Row) {
         const oldSerial = prev ? asString(prev.serialNumber).trim().replace(/^SN:\s*/i, "") : "";
         const oldCat = prev ? asString(prev.category).trim() || "PM2230" : "PM2230";
 
+        if (oldSerial && !newSerial) {
+          // Gỡ đồng hồ khỏi điểm đo: giữ dữ liệu cũ (tới thời điểm gỡ), dữ liệu mới không tính cho điểm đo này nữa.
+          const [closed] = await connection.execute(
+            `UPDATE meter_point_history
+                SET valid_to = UTC_TIMESTAMP()
+              WHERE project_id = ? AND meter_point_id = ? AND serial_number = ? AND valid_to IS NULL`,
+            [projectId, pointId, oldSerial],
+          );
+          if (((closed as { affectedRows?: number }).affectedRows ?? 0) === 0) {
+            const [[lastRow]] = await connection.query<RowDataPacket[]>(
+              `SELECT DATE_FORMAT(MAX(valid_to), '%Y-%m-%d %H:%i:%s') AS lastTo
+                 FROM meter_point_history WHERE project_id = ? AND meter_point_id = ?`,
+              [projectId, pointId],
+            );
+            await connection.execute(
+              `INSERT INTO meter_point_history (project_id, meter_point_id, category, serial_number, valid_from, valid_to)
+               VALUES (?, ?, ?, ?, ?, UTC_TIMESTAMP())`,
+              [projectId, pointId, oldCat, oldSerial, asString(lastRow?.lastTo) || "2020-01-01 00:00:00"],
+            );
+          }
+        }
         if (oldSerial && newSerial && oldSerial !== newSerial) {
           // Đóng hiệu lực của đồng hồ cũ tại thời điểm thay thế
           const [updated] = await connection.execute(
@@ -1138,6 +1315,7 @@ async function saveResource(resource: string, body: Row) {
   if (resource === "emission-factors") {
     const group = body;
     const gases = Array.isArray(group.gases) ? group.gases as Row[] : [];
+    await ensureEmissionFactorOrdering();
     await transaction(async (connection) => {
       await connection.execute(
         `INSERT INTO emission_factor_groups (id, name, source) VALUES (?, ?, ?)
@@ -1145,12 +1323,13 @@ async function saveResource(resource: string, body: Row) {
         [group.id, group.name, group.source || ""],
       );
       await connection.execute("DELETE FROM emission_factor_gases WHERE group_id = ?", [group.id]);
-      for (const gas of gases) {
+      for (const [index, gas] of gases.entries()) {
         await connection.execute(
-          `INSERT INTO emission_factor_gases (group_id, gas_key, gas_label, factor_value, unit)
-           VALUES (?, ?, ?, ?, ?)
-           ON DUPLICATE KEY UPDATE gas_label=VALUES(gas_label), factor_value=VALUES(factor_value), unit=VALUES(unit)`,
-          [group.id, gas.key, gas.label, asNumber(gas.value), gas.unit || ""],
+          `INSERT INTO emission_factor_gases (group_id, gas_key, gas_label, factor_value, unit, sort_order)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON DUPLICATE KEY UPDATE gas_label=VALUES(gas_label), factor_value=VALUES(factor_value), unit=VALUES(unit),
+             sort_order=VALUES(sort_order)`,
+          [group.id, gas.key, gas.label, asNumber(gas.value), gas.unit || "", index],
         );
       }
     });
@@ -1158,6 +1337,7 @@ async function saveResource(resource: string, body: Row) {
   }
   if (resource === "ghg-sources") {
     await ensureGhgColumns();
+    await ensureEmissionFactorOrdering();
     const projectId = asString(body.projectId);
     const sources = Array.isArray(body.sources) ? body.sources as Row[] : [];
     if (!projectId) throw new Error("projectId is required");
@@ -1392,6 +1572,33 @@ export async function POST(request: NextRequest, context: Params) {
       if (!gate.ok) return forbidden("Bạn không có quyền cấu hình loại đồng hồ.");
       return Response.json(await saveMeterModel(body));
     }
+    if (resource === "ghg-templates") {
+      const gate = await requirePermission("manageEmissionFactors");
+      if (!gate.ok) return forbidden("Bạn không có quyền cấu hình nguồn phát thải.");
+      await ensureGhgTemplatesTable();
+      const name = asString(body.name).trim();
+      const unit = asString(body.unit).trim();
+      const formula = asString(body.formula).trim();
+      if (!name || !unit || !formula) return badRequest("Vui lòng nhập tên nguồn, đơn vị và công thức tính.");
+      const defaultValue = body.defaultValue == null || body.defaultValue === "" ? null : Number(body.defaultValue);
+      if (defaultValue != null && !Number.isFinite(defaultValue)) return badRequest("Giá trị mặc định không hợp lệ.");
+      await emsDb.execute(
+        `INSERT INTO ghg_manual_templates (id, name, unit, default_value, factor_group_id, multipliers_json, formula)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE name = VALUES(name), unit = VALUES(unit), default_value = VALUES(default_value),
+           factor_group_id = VALUES(factor_group_id), multipliers_json = VALUES(multipliers_json), formula = VALUES(formula)`,
+        [
+          asString(body.id).trim() || `ghgt-${Date.now()}`,
+          name.slice(0, 255),
+          unit.slice(0, 40),
+          defaultValue,
+          asString(body.factorGroupId).trim() || null,
+          JSON.stringify(Array.isArray(body.multipliers) ? body.multipliers : []),
+          formula.slice(0, 500),
+        ],
+      );
+      return Response.json(await listGhgTemplates());
+    }
     return Response.json(await saveResource(resource, body));
   } catch (error) {
     return serverError(error);
@@ -1422,6 +1629,15 @@ export async function DELETE(request: NextRequest, context: Params) {
       const gate = await requirePermission("manageDevices");
       if (!gate.ok) return forbidden("Bạn không có quyền cấu hình loại đồng hồ.");
       return Response.json(await deleteMeterModel(request.nextUrl.searchParams.get("id") ?? ""));
+    }
+    if (resource === "ghg-templates") {
+      const gate = await requirePermission("manageEmissionFactors");
+      if (!gate.ok) return forbidden("Bạn không có quyền cấu hình nguồn phát thải.");
+      await ensureGhgTemplatesTable();
+      await emsDb.execute("DELETE FROM ghg_manual_templates WHERE id = ?", [
+        request.nextUrl.searchParams.get("id") ?? "",
+      ]);
+      return Response.json({ ok: true });
     }
     return Response.json(await deleteResource(resource, request));
   } catch (error) {

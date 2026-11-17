@@ -172,6 +172,29 @@ function slotStoredAt(day: string, hour: number, minute: number) {
   return new Date(Date.UTC(year, month - 1, date, hour, minute) - 7 * 60 * 60 * 1000).toISOString().slice(0, 19);
 }
 
+/** Mốc "mới nhất" nhỏ nhất giữa các điểm đo: xin mẫu mới hơn mốc này để không sót điểm đo gửi chậm. */
+function oldestLatestSampleAt(samples: ProjectGatewaySample[]) {
+  const latestByPoint = new Map<string, string>();
+  for (const sample of samples) {
+    const current = latestByPoint.get(sample.meterPointId);
+    if (!current || sample.at > current) latestByPoint.set(sample.meterPointId, sample.at);
+  }
+  let oldest: string | undefined;
+  for (const at of latestByPoint.values()) {
+    if (!oldest || at < oldest) oldest = at;
+  }
+  return oldest;
+}
+
+/** Ghép mẫu mới vào danh sách hiện có (bỏ trùng theo điểm đo + thời điểm), giữ thứ tự thời gian. */
+function mergeNewSamples(prev: ProjectGatewaySample[], incoming: ProjectGatewaySample[]) {
+  if (!incoming.length) return prev;
+  const seen = new Set(prev.map((sample) => `${sample.meterPointId}|${sample.at}`));
+  const fresh = incoming.filter((sample) => !seen.has(`${sample.meterPointId}|${sample.at}`));
+  if (!fresh.length) return prev;
+  return [...prev, ...fresh].sort((a, b) => a.at.localeCompare(b.at));
+}
+
 type SlotInterval = 15 | 30 | 60;
 const SLOT_INTERVALS: SlotInterval[] = [15, 30, 60];
 const SLOT_INTERVAL_STORAGE_KEY = "ems:energy-day-interval";
@@ -432,6 +455,9 @@ export function EnergyCharts() {
   const filterTouched = useRef(false);
   const selectionTouched = useRef(false);
   const lastFilterKeyRef = useRef<string>("");
+  // Tự làm mới nhẹ: lần tải đầy đủ gần nhất + mẫu đang hiển thị (để chỉ xin phần mẫu mới).
+  const lastFullLoadRef = useRef<{ key: string; at: number; reloadTick: number }>({ key: "", at: 0, reloadTick: -1 });
+  const samplesRef = useRef<ProjectGatewaySample[]>([]);
   const handleRefresh = () => {
     setReloadTick((value) => value + 1);
     setLivePollTick((value) => value + 1);
@@ -501,9 +527,20 @@ export function EnergyCharts() {
     const isSameFilter = lastFilterKeyRef.current === filterKey;
     lastFilterKeyRef.current = filterKey;
     let active = true;
+    const fullKey = `${filterKey}:${slotInterval}`;
+    const now = Date.now();
+    const sinceFull = now - lastFullLoadRef.current.at;
+    const manualReload = lastFullLoadRef.current.reloadTick !== reloadTick;
+    const autoRefresh = isSameFilter && lastFullLoadRef.current.key === fullKey && !manualReload;
+    // Chế độ Tháng/Năm: số liệu ít đổi, làm mới tối đa mỗi 60 giây thay vì mỗi 10 giây.
+    if (!span.hourly && autoRefresh && sinceFull < 60_000) return;
+    // Chế độ Ngày: tự làm mới chỉ tải phần mẫu mới; cứ 5 phút tải lại toàn bộ để nhận dữ liệu gửi bù / đồng bộ muộn.
+    const tailOnly = span.hourly && autoRefresh && sinceFull < 5 * 60_000 && samplesRef.current.length > 0;
+    const tailAfter = tailOnly ? oldestLatestSampleAt(samplesRef.current) : undefined;
+    if (!tailOnly) lastFullLoadRef.current = { key: fullKey, at: now, reloadTick };
     if (span.hourly) {
       void Promise.all([
-        loadProjectGatewaySamples(projectId, { from: span.from, to: span.to, limit: 18000 }),
+        loadProjectGatewaySamples(projectId, { from: span.from, to: span.to, limit: 18000, after: tailAfter }),
         loadProjectGatewayEnergySlots(
           projectId,
           span.from,
@@ -531,7 +568,15 @@ export function EnergyCharts() {
               }
             }
           }
-          setGatewaySamples((prev) => (isSameFilter && rows.length === 0 && prev.length > 0 ? prev : rows));
+          setGatewaySamples((prev) => {
+            const next = tailOnly
+              ? mergeNewSamples(prev, rows)
+              : isSameFilter && rows.length === 0 && prev.length > 0
+                ? prev
+                : rows;
+            samplesRef.current = next;
+            return next;
+          });
           setEnergySlots((prev) =>
             isSameFilter && slotSummary.slots.length === 0 && prev.length > 0 ? prev : slotSummary.slots,
           );
@@ -548,7 +593,11 @@ export function EnergyCharts() {
         setDailyRows((prev) =>
           isSameFilter && summary.days.length === 0 && prev.length > 0 ? prev : summary.days,
         );
-        setGatewaySamples((prev) => (isSameFilter && rows.length === 0 && prev.length > 0 ? prev : rows));
+        setGatewaySamples((prev) => {
+          const next = isSameFilter && rows.length === 0 && prev.length > 0 ? prev : rows;
+          samplesRef.current = next;
+          return next;
+        });
         setEnergySlots((prev) =>
           isSameFilter && slotSummary.slots.length === 0 && prev.length > 0 ? prev : slotSummary.slots,
         );

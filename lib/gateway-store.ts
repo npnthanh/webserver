@@ -20,6 +20,13 @@ import {
 } from "@/lib/gateway-protocol";
 import type { ProjectGatewaySample } from "@/lib/gateway-series";
 import { resolveMeterNames } from "@/lib/server-meter-catalog";
+import {
+  ROLLUP_SECONDS,
+  isRollupReady,
+  loadRollupBuckets,
+  rawRetentionCutoffWall,
+  vietnamParts,
+} from "@/lib/server-gateway-rollup";
 
 type ThresholdRow = {
   gateway_id: string;
@@ -562,7 +569,6 @@ export async function ingestGateway(rawText: string, headers?: Headers) {
 
     let packetId = 0;
     if (registered && sample && disposition === "accepted") {
-      queryCache.clear();
       const validReadingTime =
         packet.timeSynced &&
         packet.readingDate.getTime() > 1_000_000_000_000 &&
@@ -718,7 +724,6 @@ export async function ingestGateway(rawText: string, headers?: Headers) {
     }
 
     await connection.commit();
-    queryCache.clear();
   } catch (error) {
     await connection.rollback();
     throw error;
@@ -1067,7 +1072,7 @@ async function syncFromUpstreamGateway() {
 
 export async function getGatewayConsole(input: { from?: string; to?: string; gatewayId?: string }): Promise<GatewayConsole> {
   await ensureGatewaySchema();
-  await syncFromUpstreamGateway();
+  void syncFromUpstreamGateway();
   const filters = ["1=1"];
   const params: string[] = [];
   if (input.from) {
@@ -1823,21 +1828,22 @@ async function triggerUpstreamSync() {
   if (lastUpstreamSyncAt > 0 && Date.now() - lastUpstreamSyncAt < 8_000) {
     return;
   }
-  if (lastUpstreamSyncAt > 0) {
-    void syncFromUpstreamGateway();
-    return;
-  }
-  await syncFromUpstreamGateway();
+  // Không chờ: bộ lập lịch nền (lib/server-alert-scheduler.ts) đồng bộ mỗi phút.
+  void syncFromUpstreamGateway();
 }
 
 export async function getProjectGatewaySeries(
   projectId: string,
-  options?: { from?: string; to?: string; limit?: number; resolution?: "auto" | "raw" },
+  options?: { from?: string; to?: string; limit?: number; resolution?: "auto" | "raw"; after?: string },
 ): Promise<ProjectGatewaySample[]> {
   const id = projectId.trim();
   if (!id) return [];
   await ensureGatewaySchema();
   await triggerUpstreamSync();
+  // `after`: biểu đồ đang mở chỉ xin phần mẫu mới (thay vì tải lại cả ngày mỗi lần làm mới).
+  const afterSql = options?.after && /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}/.test(options.after)
+    ? options.after.replace("T", " ").replace("Z", "").slice(0, 23)
+    : null;
 
   const bounds = options?.from && options?.to ? vietnamRangeBounds(options.from, options.to) : null;
   const spanDays = bounds
@@ -1851,7 +1857,7 @@ export async function getProjectGatewaySeries(
       )
     : 1;
 
-  if (options?.from && options?.to && spanDays <= 2) {
+  if (options?.from && options?.to && spanDays <= 2 && !afterSql) {
     if (!syncedUpstreamDays.has(options.from)) {
       await syncUpstreamDayIfNeeded(options.from);
     } else {
@@ -1866,11 +1872,14 @@ export async function getProjectGatewaySeries(
     }
   }
 
-  const cacheKey = `series:${id}:${options?.from ?? ""}:${options?.to ?? ""}:${options?.limit ?? ""}:${options?.resolution ?? "auto"}`;
+  const cacheKey = `series:${id}:${options?.from ?? ""}:${options?.to ?? ""}:${options?.limit ?? ""}:${options?.resolution ?? "auto"}:${afterSql ?? ""}`;
   const cached = getCachedQuery<ProjectGatewaySample[]>(cacheKey);
   if (cached) return cached;
 
   const segments = await loadProjectMeterSegments(id);
+  const rollupReady = await isRollupReady();
+  // Ngày đã quá hạn lưu mẫu thô: chỉ còn bảng tổng hợp 15 phút.
+  const beyondRawRetention = Boolean(bounds && bounds.end <= rawRetentionCutoffWall());
 
   // Khi xem theo Ngày (spanDays <= 2): trả về 100% mẫu thời gian thật (10s/lần, tối đa 18,000 mẫu).
   // Khi xem theo Tháng hoặc Năm (spanDays > 2): tự động gom nhóm (downsample) trên Server để tránh treo máy & tăng tốc tải.
@@ -1912,8 +1921,25 @@ export async function getProjectGatewaySeries(
       clauses.push("received_at < ?");
       params.push(endBound);
     }
+    if (afterSql) {
+      clauses.push("received_at > ?");
+      params.push(afterSql);
+    }
 
     let chronological: RowDataPacket[] = [];
+    if (rollupReady && startBound && endBound && !afterSql && (bucketSeconds > 0 || beyondRawRetention)) {
+      chronological = await seriesRowsFromRollup(
+        seg.meterId,
+        startBound,
+        endBound,
+        Math.max(ROLLUP_SECONDS, bucketSeconds),
+        limit,
+      );
+      for (const row of chronological) {
+        samples.push({ meterPointId: seg.pointId, at: String(row.at), values: numericValues(row.values) });
+      }
+      continue;
+    }
     if (bucketSeconds > 0) {
       const bucketRows = await queryRows<RowDataPacket>(
         `SELECT s.received_at, s.values_json
@@ -2085,6 +2111,7 @@ async function queryProjectGatewayDaily(
   const segments = await loadProjectMeterSegments(id);
   const rawDays: Array<GatewayDailyEnergy & { meterId: string }> = [];
   let latest: ProjectGatewaySample | null = null;
+  const useRollup = await isRollupReady();
 
   for (const seg of segments) {
     const startBound = seg.validFrom && seg.validFrom > bounds.start ? seg.validFrom : bounds.start;
@@ -2092,7 +2119,9 @@ async function queryProjectGatewayDaily(
     if (startBound >= endBound) continue;
 
     const [rows, latestRows] = await Promise.all([
-      queryRows<RowDataPacket>(
+      useRollup
+        ? dailyRowsFromRollup(seg.meterId, startBound, endBound)
+        : queryRows<RowDataPacket>(
         `SELECT day_vn,
                 MAX(CASE WHEN rn_asc = 1 THEN epaed END) AS first_wh,
                 MAX(CASE WHEN rn_desc = 1 THEN epaed END) AS last_wh
@@ -2117,7 +2146,7 @@ async function queryProjectGatewayDaily(
           GROUP BY day_vn
           ORDER BY day_vn`,
         [seg.meterId, startBound, endBound],
-      ),
+          ),
       !seg.validTo
         ? queryRows<RowDataPacket>(
             `SELECT received_at, values_json
@@ -2240,6 +2269,7 @@ export async function getProjectGatewayEnergySlots(
   const segments = await loadProjectMeterSegments(id);
   const slots: GatewayEnergySlot[] = [];
   let latest: ProjectGatewaySample | null = null;
+  const useRollup = await isRollupReady();
 
   for (const seg of segments) {
     const startBound = seg.validFrom && seg.validFrom > bounds.start ? seg.validFrom : bounds.start;
@@ -2247,7 +2277,9 @@ export async function getProjectGatewayEnergySlots(
     if (startBound >= endBound) continue;
 
     const [rows, latestRows] = await Promise.all([
-      queryRows<RowDataPacket>(
+      useRollup
+        ? slotRowsFromRollup(seg.meterId, startBound, endBound, slotMinutes)
+        : queryRows<RowDataPacket>(
         `SELECT slot_vn,
                 MAX(CASE WHEN rn_asc = 1 THEN epaed END) AS first_wh,
                 MAX(CASE WHEN rn_desc = 1 THEN epaed END) AS last_wh
@@ -2278,7 +2310,7 @@ export async function getProjectGatewayEnergySlots(
           GROUP BY slot_vn
           ORDER BY slot_vn`,
         [seg.meterId, startBound, endBound],
-      ),
+          ),
       !seg.validTo
         ? queryRows<RowDataPacket>(
             `SELECT received_at, values_json
@@ -2366,7 +2398,7 @@ function powerKwFromValues(values: Record<string, number>) {
 /** Telemetry cho danh sách dự án: phụ tải (Papt), GHG, trạng thái điểm đo. */
 export async function getProjectsListTelemetry(): Promise<ProjectListTelemetry[]> {
   await ensureGatewaySchema();
-  await syncFromUpstreamGateway();
+  void syncFromUpstreamGateway();
 
   const meterRows = await queryRows<{
     projectId: string;
@@ -2512,3 +2544,62 @@ function receivedAtText(value: unknown) {
 }
 
 export type { PacketNumber };
+
+/* ---------------- Đọc từ bảng tổng hợp 15 phút (lib/server-gateway-rollup.ts) ---------------- */
+
+/** Cùng định dạng với truy vấn SQL cũ: { day_vn, first_wh, last_wh } theo ngày Việt Nam. */
+async function dailyRowsFromRollup(meterId: string, startWall: string, endWall: string) {
+  const buckets = await loadRollupBuckets(meterId, startWall, endWall);
+  const days = new Map<string, { first: number | null; last: number | null }>();
+  for (const bucket of buckets) {
+    const { day } = vietnamParts(bucket.bucketStart);
+    const entry = days.get(day) ?? { first: null, last: null };
+    if (entry.first == null && bucket.epaedFirst != null) entry.first = bucket.epaedFirst;
+    if (bucket.epaedLast != null) entry.last = bucket.epaedLast;
+    days.set(day, entry);
+  }
+  return [...days.entries()]
+    .filter(([, entry]) => entry.first != null && entry.last != null)
+    .map(([day, entry]) => ({ day_vn: day, first_wh: entry.first, last_wh: entry.last }) as unknown as RowDataPacket);
+}
+
+/** Cùng định dạng với truy vấn SQL cũ: { slot_vn: "YYYY-MM-DD HH:MM", first_wh, last_wh }. */
+async function slotRowsFromRollup(meterId: string, startWall: string, endWall: string, slotMinutes: number) {
+  const buckets = await loadRollupBuckets(meterId, startWall, endWall);
+  const slots = new Map<string, { first: number | null; last: number | null }>();
+  for (const bucket of buckets) {
+    const { day, hour, minute } = vietnamParts(bucket.bucketStart);
+    const slotMinute = minute - (minute % slotMinutes);
+    const key = `${day} ${String(hour).padStart(2, "0")}:${String(slotMinute).padStart(2, "0")}`;
+    const entry = slots.get(key) ?? { first: null, last: null };
+    if (entry.first == null && bucket.epaedFirst != null) entry.first = bucket.epaedFirst;
+    if (bucket.epaedLast != null) entry.last = bucket.epaedLast;
+    slots.set(key, entry);
+  }
+  return [...slots.entries()]
+    .filter(([, entry]) => entry.first != null && entry.last != null)
+    .map(([slot, entry]) => ({ slot_vn: slot, first_wh: entry.first, last_wh: entry.last }) as unknown as RowDataPacket);
+}
+
+/** Chuỗi mẫu đã gom nhóm cho biểu đồ nhiều ngày: giá trị cuối của mỗi khung bucketSeconds. */
+async function seriesRowsFromRollup(
+  meterId: string,
+  startWall: string,
+  endWall: string,
+  bucketSeconds: number,
+  limit: number,
+) {
+  const buckets = await loadRollupBuckets(meterId, startWall, endWall, { withValues: true });
+  const picked = new Map<number, (typeof buckets)[number]>();
+  for (const bucket of buckets) {
+    const ms = Date.parse(`${bucket.bucketStart.replace(" ", "T")}Z`);
+    picked.set(Math.floor(ms / 1000 / bucketSeconds), bucket);
+  }
+  return [...picked.values()].slice(-limit).map(
+    (bucket) =>
+      ({
+        at: bucket.lastAt.slice(0, 19).replace(" ", "T"),
+        values: bucket.valuesLast,
+      }) as unknown as RowDataPacket,
+  );
+}

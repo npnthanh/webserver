@@ -55,6 +55,10 @@ export function resetAlertEvalThrottle(projectId: string) {
 const lastAlertEvalAt = new Map<string, number>();
 
 const GAP_SCAN_LIMIT = 500;
+/** Rà khoảng mất kết nối trong lịch sử: chỉ 3 ngày gần nhất, mỗi đồng hồ tối đa 10 phút/lần (tốn tài nguyên nhất). */
+const GAP_SCAN_DAYS = 3;
+const GAP_SCAN_EVERY_MS = 10 * 60_000;
+const lastGapScanAt = new Map<string, number>();
 
 /** Xóa các cặp sự kiện OFF/ONL của điểm đo không còn ứng với khoảng gián đoạn thực tế nào. */
 async function reconcileConnectivityEvents(
@@ -67,7 +71,7 @@ async function reconcileConnectivityEvents(
     `SELECT id FROM alert_events
       WHERE project_id = ? AND meter_point_id = ?
         AND (id LIKE ? OR id LIKE ?)
-        AND occurred_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 13 DAY)`,
+        AND occurred_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ${GAP_SCAN_DAYS - 1} DAY)`,
     [projectId, pointId, `OFF-${shortPoint}-%`, `ONL-${shortPoint}-%`],
   ).catch(() => [] as Row[]);
   const stale = rows
@@ -251,8 +255,11 @@ export async function evaluateProjectAlerts(targetProjectId?: string) {
         if (!rawSerial) continue;
         const shortPoint = pointId.replace(/[^a-zA-Z0-9]/g, "").slice(-14) || "pt";
 
-        // 2a. Rà soát các khoảng gián đoạn lịch sử trong 14 ngày gần nhất vượt quá timeoutSeconds
-        const gapRows = await queryRows<Row>(
+        // 2a. Rà soát các khoảng gián đoạn lịch sử (GAP_SCAN_DAYS ngày gần nhất) vượt quá timeoutSeconds.
+        const gapScanKey = `${pid}:${pointId}`;
+        const gapScanDue = Date.now() - (lastGapScanAt.get(gapScanKey) ?? 0) >= GAP_SCAN_EVERY_MS;
+        if (gapScanDue) lastGapScanAt.set(gapScanKey, Date.now());
+        const gapRows = !gapScanDue ? null : await queryRows<Row>(
           `SELECT DATE_FORMAT(DATE_ADD(prev_at, INTERVAL ? SECOND), '%Y-%m-%d %H:%i:%s') AS offlineAt,
                   DATE_FORMAT(received_at, '%Y-%m-%d %H:%i:%s') AS onlineAt,
                   TIMESTAMPDIFF(SECOND, prev_at, received_at) AS gapSec,
@@ -262,7 +269,7 @@ export async function evaluateProjectAlerts(targetProjectId?: string) {
                       LAG(received_at) OVER (ORDER BY received_at ASC, id ASC) AS prev_at
                  FROM gateway_samples
                 WHERE meter_id = ?
-                  AND received_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 14 DAY)
+                  AND received_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL ${GAP_SCAN_DAYS} DAY)
              ) seq
             WHERE prev_at IS NOT NULL
               AND TIMESTAMPDIFF(SECOND, prev_at, received_at) > ?

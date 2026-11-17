@@ -9,8 +9,19 @@ export type ManagerAccount = {
   phone: string;
 };
 
+export type ManagerHistoryItem = {
+  accountId: string | null;
+  managerName: string;
+  /** "YYYY-MM-DD"; rỗng nếu không rõ. */
+  startDate: string;
+  /** "YYYY-MM-DD"; rỗng nếu đang quản lý. */
+  endDate: string;
+};
+
 export type ProjectManagerState = {
   accounts: ManagerAccount[];
+  /** Lịch sử người quản lý, mới nhất trước. */
+  history?: ManagerHistoryItem[];
   /** Người đang quản lý dự án. */
   currentId: string | null;
   /** Lịch hẹn chuyển giao (ngày bắt đầu ở tương lai). */

@@ -45,6 +45,7 @@ export async function GET(request: NextRequest) {
       from: civilDate.test(from) ? from : undefined,
       to: civilDate.test(to) ? to : undefined,
       limit: Number.isFinite(limit) && limit > 0 ? limit : undefined,
+      after: request.nextUrl.searchParams.get("after") || undefined,
     });
     return Response.json(samples);
   } catch (error) {

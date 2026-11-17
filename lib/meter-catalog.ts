@@ -1,7 +1,9 @@
 import { dbFetch, emitDbChange } from "@/lib/db-client";
 
-/** Giao thức kết nối dùng cho model đồng hồ (trang Cấu hình loại đồng hồ). */
-export const CONNECTION_PROTOCOLS = ["Modbus TCP", "Modbus RTU", "M-Bus", "BACnet", "MQTT"] as const;
+/** Giao thức của model = Protocol Version (PV) mà gateway gửi lên (VD "1.0"). */
+export function loadGatewayProtocolVersions() {
+  return dbFetch<string[]>("gateway-protocol-versions").catch(() => ["1.0"]);
+}
 
 /**
  * Model đồng hồ trong danh mục cấu hình.

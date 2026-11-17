@@ -8,7 +8,6 @@ import {
   loadFactorGroups,
   parseFactorNumber,
   type FactorGroup,
-  type GasKey,
   type GasValue,
 } from "@/lib/emission-factors";
 import {
@@ -29,6 +28,8 @@ import {
   parseAppNumber,
 } from "@/lib/number-format";
 import { vietnamNow } from "@/lib/vietnam-time";
+import { hydrateGhgTemplates, type GhgManualTemplate } from "@/lib/ghg-templates";
+import Link from "next/link";
 import {
   hydrateClientMeters,
   loadClientMeters,
@@ -54,6 +55,8 @@ const METHOD_LABEL: Record<InputMethod, string> = {
 
 const DEFAULT_METER_FORMULA = "{Giá trị điểm đo} * {Hệ số phát thải}";
 const DEFAULT_MANUAL_FORMULA = "{Giá trị thủ công} * {Hệ số phát thải}";
+/** Giá trị chọn "giữ cấu hình hiện tại" khi sửa nguồn thủ công tạo trước khi có danh mục nguồn mẫu. */
+const KEEP_CURRENT = "__current__";
 
 type MultiplierDraft = {
   id: string;
@@ -115,7 +118,6 @@ type FactorHistoryRow = {
 export function GhgConfig({ projectId }: { projectId: string }) {
   const [activeScope, setActiveScope] = useState<ScopeId>(1);
   const [tableFilter, setTableFilter] = useState<ScopeId | "all">("all");
-  const [query, setQuery] = useState("");
   const [groups, setGroups] = useState<FactorGroup[]>([]);
   const [sources, setSources] = useState<EmissionSource[]>([]);
   const [sourcesProjectId, setSourcesProjectId] = useState<string | null>(null);
@@ -137,6 +139,9 @@ export function GhgConfig({ projectId }: { projectId: string }) {
   const [formula, setFormula] = useState(DEFAULT_METER_FORMULA);
   const [appliedAt, setAppliedAt] = useState(() => vietnamNow().date);
   const [formError, setFormError] = useState("");
+  // Nhập thủ công: chọn nguồn phát thải đã cấu hình sẵn (Cấu hình → Nguồn phát thải thủ công).
+  const [templates, setTemplates] = useState<GhgManualTemplate[]>([]);
+  const [templateId, setTemplateId] = useState("");
 
   const selectedMeter = useMemo(
     () => meters.find((meter) => meter.id === meterPointId),
@@ -184,6 +189,9 @@ export function GhgConfig({ projectId }: { projectId: string }) {
           setMetersProjectId(projectId);
         }
       });
+    void hydrateGhgTemplates().then((rows) => {
+      if (active) setTemplates(rows);
+    });
     void Promise.all([hydrateFactorGroups(), hydrateGhgSources(projectId)]).then(([nextGroups, sources]) => {
       if (!active) return;
       setGroups(nextGroups);
@@ -234,6 +242,7 @@ export function GhgConfig({ projectId }: { projectId: string }) {
       setFormula(DEFAULT_METER_FORMULA);
       setAppliedAt(vietnamNow().date);
       setFormError("");
+      setTemplateId("");
       setTableFilter((current) => {
         setActiveScope(current === "all" ? 1 : current);
         return current;
@@ -250,21 +259,6 @@ export function GhgConfig({ projectId }: { projectId: string }) {
     saveGhgSources(withProject, projectId);
   }
 
-  const filteredGroups = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return groups;
-    return groups.filter(
-      (group) =>
-        group.name.toLowerCase().includes(q) ||
-        group.source.toLowerCase().includes(q) ||
-        group.gases.some(
-          (gas) =>
-            gas.label.toLowerCase().includes(q) ||
-            gas.key.toLowerCase().includes(q) ||
-            gas.unit.toLowerCase().includes(q),
-        ),
-    );
-  }, [groups, query]);
 
   const visibleSources = useMemo(
     () =>
@@ -320,6 +314,7 @@ export function GhgConfig({ projectId }: { projectId: string }) {
     setFormula(DEFAULT_METER_FORMULA);
     setAppliedAt(vietnamNow().date);
     setFormError("");
+    setTemplateId("");
     setFormOpen(false);
   }
 
@@ -352,6 +347,10 @@ export function GhgConfig({ projectId }: { projectId: string }) {
     }
     if (method === "meter" && !meterPointId) {
       setFormError("Vui lòng chọn điểm đo cho nguồn phát thải.");
+      return;
+    }
+    if (method === "manual" && !templateId) {
+      setFormError("Vui lòng chọn nguồn phát thải đã cấu hình.");
       return;
     }
     const parsedManual =
@@ -447,7 +446,22 @@ export function GhgConfig({ projectId }: { projectId: string }) {
     setFormula(source.formula);
     setAppliedAt(source.appliedAt);
     setFormError("");
+    // Nguồn thủ công đã có: giữ nguyên cấu hình hiện tại cho tới khi chọn một nguồn khác.
+    setTemplateId(source.method === "manual" ? KEEP_CURRENT : "");
     setFormOpen(true);
+  }
+
+  function applyTemplate(nextId: string) {
+    setTemplateId(nextId);
+    if (formError) setFormError("");
+    const template = templates.find((item) => item.id === nextId);
+    if (!template) return;
+    setName((current) => current.trim() || template.name);
+    setManualUnit(template.unit);
+    setManualValue(template.defaultValue == null ? "" : formatAppNumber(template.defaultValue, { maxDecimals: 6 }));
+    setFactorGroupId(template.factorGroupId);
+    setMultipliers(draftsFromMultipliers(template.multipliers));
+    setFormula(template.formula);
   }
 
   return (
@@ -480,7 +494,7 @@ export function GhgConfig({ projectId }: { projectId: string }) {
         })}
       </div>
 
-      <div className="grid items-start gap-5 lg:grid-cols-[minmax(0,1fr)_300px]">
+      <div className="grid items-start gap-5">
         <section
           id="them-nguon-phat-thai"
           onDragOver={(e) => {
@@ -622,7 +636,67 @@ export function GhgConfig({ projectId }: { projectId: string }) {
               </Field>
             ) : null}
 
-            {method !== "meter" ? (
+            {method === "manual" ? (
+              <Field label="NGUỒN PHÁT THẢI">
+                <div className="relative">
+                  <CustomSelect
+                    value={templateId}
+                    onChange={(e) => applyTemplate(e.target.value)}
+                    className="input appearance-none pr-9"
+                  >
+                    <option value="">
+                      {templates.length ? "Chọn nguồn phát thải đã cấu hình" : "Chưa có nguồn phát thải nào được cấu hình"}
+                    </option>
+                    {editingId && templateId === KEEP_CURRENT ? (
+                      <option value={KEEP_CURRENT}>Giữ cấu hình hiện tại</option>
+                    ) : null}
+                    {templates.map((template) => (
+                      <option key={template.id} value={template.id}>
+                        {template.name}
+                      </option>
+                    ))}
+                  </CustomSelect>
+                  <ChevronIcon className="pointer-events-none absolute top-1/2 right-3 h-4 w-4 -translate-y-1/2 text-slate-400" />
+                </div>
+                {templates.length === 0 ? (
+                  <p className="mt-1.5 text-xs text-slate-500">
+                    <Link href="/cau-hinh/nguon-phat-thai" className="font-semibold text-emerald-700 hover:underline">
+                      Thêm nguồn phát thải
+                    </Link>{" "}
+                    ở Cấu hình → Nguồn phát thải thủ công.
+                  </p>
+                ) : null}
+                {templateId ? (
+                  <div className="mt-3 grid gap-2 rounded-xl border border-emerald-100 bg-emerald-50/60 p-3 text-xs sm:grid-cols-2">
+                    <div>
+                      <span className="block text-slate-500">Đơn vị</span>
+                      <strong className="mt-0.5 block text-slate-800">
+                        {manualUnit || "—"}
+                        {manualValue ? ` · mặc định ${manualValue}` : ""}
+                      </strong>
+                    </div>
+                    <div>
+                      <span className="block text-slate-500">Hệ số phát thải</span>
+                      <strong className="mt-0.5 block text-slate-800">{selectedGroup?.name ?? "Không dùng"}</strong>
+                    </div>
+                    {multipliers.length ? (
+                      <div className="sm:col-span-2">
+                        <span className="block text-slate-500">Hệ số nhân</span>
+                        <strong className="mt-0.5 block text-slate-800">
+                          {multipliers.map((row) => `${row.label} (${row.symbol}) = ${row.value} ${row.unit}`).join(" · ")}
+                        </strong>
+                      </div>
+                    ) : null}
+                    <div className="sm:col-span-2">
+                      <span className="block text-slate-500">Công thức</span>
+                      <code className="mt-0.5 block break-all font-mono text-slate-800">{formula}</code>
+                    </div>
+                  </div>
+                ) : null}
+              </Field>
+            ) : null}
+
+            {method === "file" ? (
               <Field label="ĐƠN VỊ ĐO CỐ ĐỊNH & GIÁ TRỊ MẶC ĐỊNH (TÙY CHỌN)">
                 <div className="grid gap-2 sm:grid-cols-[180px_minmax(0,1fr)]">
                   <div>
@@ -654,6 +728,8 @@ export function GhgConfig({ projectId }: { projectId: string }) {
               </Field>
             ) : null}
 
+            {method !== "manual" ? (
+            <>
             <Field label="LỰA CHỌN HỆ SỐ PHÁT THẢI (TÙY CHỌN)">
               <div className="relative">
                 <CustomSelect
@@ -841,6 +917,8 @@ export function GhgConfig({ projectId }: { projectId: string }) {
                 </div>
               </div>
             </Field>
+            </>
+            ) : null}
 
             <div className="grid gap-4 sm:grid-cols-2">
               <Field label="NGÀY BẮT ĐẦU ÁP DỤNG">
@@ -926,63 +1004,6 @@ export function GhgConfig({ projectId }: { projectId: string }) {
           </form>
         </section>
 
-        <aside className="rounded-xl border border-slate-200 bg-white p-5 shadow-[0_1px_2px_rgba(16,24,40,0.04)] lg:sticky lg:top-6">
-          <h2 className="mb-4 text-[13px] font-semibold tracking-wide text-slate-700 uppercase">
-            Thư viện hệ số phát thải
-          </h2>
-
-          <label className="relative mb-4 flex items-center">
-            <span className="pointer-events-none absolute left-3 text-slate-400">
-              <SearchIcon className="h-4 w-4" />
-            </span>
-            <input
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Tìm kiếm hệ số..."
-              className="h-9 w-full rounded-xl border border-slate-200 bg-[#f8fafc] pr-3 pl-9 text-sm outline-none placeholder:text-slate-400 focus:border-emerald-500 focus:bg-white transition-colors"
-            />
-          </label>
-
-          <ul className="max-h-[min(640px,70vh)] space-y-2 overflow-y-auto pr-1">
-            {filteredGroups.map((group) => {
-              const Icon = factorIcons[group.gases[0]?.key as GasKey] ?? BoltIcon;
-              return (
-                <li key={group.id}>
-                  <button
-                    type="button"
-                    draggable
-                    onDragStart={(e) => {
-                      e.dataTransfer.setData("text/plain", group.id);
-                      e.dataTransfer.effectAllowed = "copy";
-                    }}
-                    onClick={() => applyGroup(group)}
-                    className="flex w-full items-center gap-3 rounded-xl border border-slate-100 bg-white px-3 py-3 text-left hover:border-emerald-200 hover:bg-emerald-50/30 transition-colors"
-                  >
-                    <GripIcon className="h-3.5 w-3.5 shrink-0 text-slate-300" />
-                    <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-emerald-50 text-emerald-600">
-                      <Icon className="h-4 w-4" />
-                    </span>
-                    <span className="min-w-0">
-                      <span className="block truncate text-sm font-medium text-slate-800">
-                        {group.name}
-                      </span>
-                      <span className="block truncate text-xs text-slate-400">
-                        {group.gases.map((gas) => plainGasLabel(gas)).join(", ") || "Chưa có khí"}
-                      </span>
-                    </span>
-                  </button>
-                </li>
-              );
-            })}
-            {filteredGroups.length === 0 && (
-              <li className="py-6 text-center text-sm text-slate-400">Không tìm thấy hệ số</li>
-            )}
-          </ul>
-
-          <p className="mt-4 text-center text-[11px] leading-relaxed text-slate-400">
-            Kéo thả thẻ vào form để tự động điền thông tin
-          </p>
-        </aside>
       </div>
       </>
       ) : (
@@ -1044,18 +1065,7 @@ export function GhgConfig({ projectId }: { projectId: string }) {
                         <span className="flex h-7 w-7 items-center justify-center rounded-md bg-slate-50 text-slate-500">
                           <MethodIcon className="h-3.5 w-3.5" />
                         </span>
-                        <span>
-                          <span className="block">{METHOD_LABEL[source.method]}</span>
-                          {source.method !== "meter" ? (
-                            <span className="block text-[11px] text-slate-400">
-                              {source.manualValue != null
-                                ? `${formatAppNumber(source.manualValue, { maxDecimals: 6 })}${source.manualUnit ? ` ${source.manualUnit}` : ""}`
-                                : source.manualUnit
-                                  ? `Đơn vị: ${source.manualUnit}`
-                                  : "Chưa nhập số liệu"}
-                            </span>
-                          ) : null}
-                        </span>
+                        <span>{METHOD_LABEL[source.method]}</span>
                       </span>
                     </td>
                     <td className="px-5 py-3.5 font-mono text-xs font-semibold text-slate-800">
@@ -1151,11 +1161,6 @@ const methodIcons: Record<InputMethod, (props: { className?: string }) => ReactN
   file: UploadIcon,
 };
 
-const factorIcons: Record<string, (props: { className?: string }) => ReactNode> = {
-  co2: BoltIcon,
-  ch4: FlameIcon,
-  n2o: DropIcon,
-};
 
 function LeafIcon({ className }: { className?: string }) {
   return (
@@ -1226,61 +1231,10 @@ function ChevronIcon({ className }: { className?: string }) {
   );
 }
 
-function SearchIcon({ className }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" aria-hidden>
-      <circle cx="11" cy="11" r="6.5" stroke="currentColor" strokeWidth="1.8" />
-      <path d="M16 16.5 20 20.5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
-    </svg>
-  );
-}
 
-function GripIcon({ className }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 16 16" fill="currentColor" aria-hidden>
-      <circle cx="5" cy="4" r="1.1" />
-      <circle cx="11" cy="4" r="1.1" />
-      <circle cx="5" cy="8" r="1.1" />
-      <circle cx="11" cy="8" r="1.1" />
-      <circle cx="5" cy="12" r="1.1" />
-      <circle cx="11" cy="12" r="1.1" />
-    </svg>
-  );
-}
 
-function BoltIcon({ className }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="currentColor" aria-hidden>
-      <path d="M13 2 4.5 13.5h6.2L9.2 22 19.5 10h-6.2L13 2Z" />
-    </svg>
-  );
-}
 
-function DropIcon({ className }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" aria-hidden>
-      <path
-        d="M12 3s6 7 6 11a6 6 0 1 1-12 0c0-4 6-11 6-11Z"
-        stroke="currentColor"
-        strokeWidth="1.8"
-        strokeLinejoin="round"
-      />
-    </svg>
-  );
-}
 
-function FlameIcon({ className }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" aria-hidden>
-      <path
-        d="M12 3c1.5 3 5 5.2 5 10a5 5 0 1 1-10 0c0-2 1-4.2 2.2-6C10 9 11 10.5 12 10.5c0-2.2.5-5 0-7.5Z"
-        stroke="currentColor"
-        strokeWidth="1.8"
-        strokeLinejoin="round"
-      />
-    </svg>
-  );
-}
 
 function SaveIcon({ className }: { className?: string }) {
   return (

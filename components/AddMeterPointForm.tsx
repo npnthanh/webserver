@@ -4,12 +4,7 @@ import Link from "next/link";
 import { CustomSelect } from "@/components/ui/CustomSelect";
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import {
-  deviceSpec,
-  hydrateDevices,
-  loadDevices,
-  type CatalogDevice,
-} from "@/lib/devices";
+import { hydrateDevices, loadDevices, type CatalogDevice } from "@/lib/devices";
 import {
   loadClientMeters,
   hydrateClientMeters,
@@ -41,17 +36,12 @@ export function AddMeterPointForm({
     initialMeter?.utility ?? (configuredMeterTypes ? configuredMeterTypes.find(Boolean) ?? "" : "Điện"),
   );
   const [parentId, setParentId] = useState(initialMeter?.parentId ?? "");
-  const [query, setQuery] = useState("");
   const [devices, setDevices] = useState<CatalogDevice[]>([]);
   const [existingMeters, setExistingMeters] = useState<ClientMeter[]>([]);
-  const [droppedDevice, setDroppedDevice] = useState<CatalogDevice | null>(null);
   const [deviceId, setDeviceId] = useState<string | null>(initialMeter?.deviceId ?? null);
-  const [serialNumber, setSerialNumber] = useState(initialMeter?.serialNumber ?? "");
   const [pointId, setPointId] = useState(initialMeter?.code ?? "");
   const [pointName, setPointName] = useState(initialMeter?.name ?? "");
-  const [formula, setFormula] = useState("");
   const [error, setError] = useState("");
-
   const configuredTypeNames = useMemo(
     () =>
       configuredMeterTypes === undefined
@@ -93,11 +83,6 @@ export function AddMeterPointForm({
       if (!active) return;
       setDevices(devices);
       setEnergyTypes(energyTypes);
-      if (initialMeter?.deviceId) {
-        const device = devices.find((item) => item.id === initialMeter.deviceId) ?? null;
-        setDroppedDevice(device);
-        if (!initialMeter.serialNumber && device) setSerialNumber(device.sn);
-      }
       if (projectId) setExistingMeters(meters);
     }).catch(() => {
       if (!active) return;
@@ -108,7 +93,16 @@ export function AddMeterPointForm({
     return () => {
       active = false;
     };
-  }, [initialMeter, projectId]);
+  }, [projectId]);
+
+  // Thêm đồng hồ ở tab khác (trang Thiết bị) rồi quay lại: nạp lại danh sách.
+  useEffect(() => {
+    const reload = () => {
+      void hydrateDevices().then(setDevices).catch(() => undefined);
+    };
+    window.addEventListener("focus", reload);
+    return () => window.removeEventListener("focus", reload);
+  }, []);
 
   const parentOptions = useMemo(
     () => existingMeters.filter((meter) =>
@@ -119,67 +113,71 @@ export function AddMeterPointForm({
     [energy, existingMeters, initialMeter],
   );
 
+  const typeNames = useMemo(() => energyTypes.map((item) => item.name), [energyTypes]);
+
   const compatibleDevices = useMemo(
     () =>
       configuredTypeNames === undefined
         ? devices
         : devices.filter((device) => {
-            const deviceEnergy = utilityForDevice(device);
+            const deviceEnergy = utilityForDevice(device, typeNames);
             return !deviceEnergy || configuredTypeNames.includes(deviceEnergy);
           }),
-    [configuredTypeNames, devices],
+    [configuredTypeNames, devices, typeNames],
   );
 
-  const filteredDevices = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return compatibleDevices;
-    return compatibleDevices.filter(
-      (d) =>
-        d.name.toLowerCase().includes(q) ||
-        d.brandModel.toLowerCase().includes(q) ||
-        d.type.toLowerCase().includes(q) ||
-        d.sn.toLowerCase().includes(q) ||
-        (d.protocol ?? "").toLowerCase().includes(q),
-    );
-  }, [compatibleDevices, query]);
+  const selectedDevice = devices.find((device) => device.id === deviceId) ?? null;
 
-  function applyDevice(device: CatalogDevice) {
-    const deviceEnergy = utilityForDevice(device);
-    if (
-      configuredTypeNames !== undefined &&
-      deviceEnergy &&
-      !configuredTypeNames.includes(deviceEnergy)
-    ) {
-      setError(`Thiết bị này thuộc loại ${deviceEnergy}, chưa được cấu hình cho dự án.`);
-      return;
-    }
+  /** Đồng hồ cùng loại điểm đo; đồng hồ đã gắn ở dự án khác / điểm đo khác thì không chọn được. */
+  const deviceOptions = useMemo(
+    () =>
+      compatibleDevices
+        .filter((device) => {
+          const deviceEnergy = utilityForDevice(device, typeNames);
+          return device.id === deviceId || !deviceEnergy || deviceEnergy === energy;
+        })
+        .map((device) => {
+          const links = (device.projects ?? []).filter((link) => link.meterId !== initialMeter?.id);
+          const otherProject = links.find((link) => link.projectId !== projectId);
+          const otherPoint = links.find((link) => link.projectId === projectId);
+          const usedBy = otherProject
+            ? `đang gắn ở dự án ${otherProject.projectName}`
+            : otherPoint
+              ? `đang gắn ở điểm đo ${otherPoint.meterName}`
+              : "";
+          // Đồng hồ đang gắn với chính điểm đo này vẫn giữ được (dữ liệu cũ có thể đã trùng).
+          return { device, usedBy, disabled: Boolean(usedBy) && device.id !== initialMeter?.deviceId };
+        })
+        .sort((a, b) => Number(a.disabled) - Number(b.disabled) || a.device.sn.localeCompare(b.device.sn)),
+    [compatibleDevices, deviceId, energy, initialMeter, projectId, typeNames],
+  );
+
+  function selectDevice(nextId: string) {
     setError("");
-    setDroppedDevice(device);
-    setDeviceId(device.id);
-    setSerialNumber(device.sn);
-    if (deviceEnergy) {
+    const device = devices.find((item) => item.id === nextId) ?? null;
+    setDeviceId(device?.id ?? null);
+    if (!device) return;
+    const deviceEnergy = utilityForDevice(device, typeNames);
+    if (deviceEnergy && deviceEnergy !== energy) {
       setEnergy(deviceEnergy);
       const parent = existingMeters.find((meter) => meter.id === parentId);
       if (parent && parent.utility !== deviceEnergy) setParentId("");
     }
     setPointName((current) => current || device.name);
-    setPointId((current) => current || device.id.toUpperCase());
-  }
-
-  function clearDevice() {
-    setDroppedDevice(null);
-    setDeviceId(null);
   }
 
   function selectParent(nextParentId: string) {
     setParentId(nextParentId);
     if (!nextParentId) return;
     const parent = existingMeters.find((meter) => meter.id === nextParentId);
-    if (parent) setEnergy(parent.utility);
+    if (parent) selectEnergy(parent.utility);
   }
 
   function selectEnergy(nextEnergy: string) {
     setEnergy(nextEnergy);
+    // Đồng hồ đang chọn khác loại điểm đo mới thì bỏ chọn.
+    const selectedEnergy = selectedDevice ? utilityForDevice(selectedDevice, typeNames) : null;
+    if (selectedEnergy && selectedEnergy !== nextEnergy) setDeviceId(null);
     const parent = existingMeters.find((meter) => meter.id === parentId);
     if (parent && parent.utility !== nextEnergy) setParentId("");
   }
@@ -211,14 +209,15 @@ export function AddMeterPointForm({
     try {
       const meters = await hydrateClientMeters(projectId);
       const next: ClientMeter = {
-        id: initialMeter?.id ?? `m-${Date.now()}`,
+        id: initialMeter?.id ?? newMeterPointId(),
         name,
         code: id,
-        type: droppedDevice?.brandModel || droppedDevice?.type || initialMeter?.type || "Chưa gán thiết bị",
+        type: selectedDevice ? selectedDevice.brandModel || selectedDevice.type : "Chưa gán thiết bị",
         parentId: parentId || null,
         utility: energy,
         deviceId,
-        serialNumber: serialNumber.trim() || null,
+        // Serial lấy theo đồng hồ đã chọn ở trang Thiết bị; không gắn đồng hồ thì để trống.
+        serialNumber: selectedDevice?.sn.trim() || null,
       };
       const updated = initialMeter
         ? meters.map((meter) => (meter.id === initialMeter.id ? next : meter))
@@ -234,19 +233,14 @@ export function AddMeterPointForm({
   }
 
   return (
-    <div className="mx-auto max-w-[1400px] p-6 lg:p-8">
+    <div className="mx-auto max-w-[980px] p-6 lg:p-8">
       <div className="mb-6">
         <h1 className="text-2xl font-bold tracking-tight text-slate-900">
           {initialMeter ? "Chỉnh sửa điểm đo" : "Thêm mới điểm đo"}
         </h1>
-        <p className="mt-1 text-sm text-slate-500">
-          {initialMeter
-            ? "Cập nhật thông tin và cấu hình điểm đo trong dự án."
-            : "Cấu hình điểm thu thập dữ liệu mới cho hệ thống giám sát năng lượng."}
-        </p>
       </div>
 
-      <div className="grid items-start gap-6 lg:grid-cols-[minmax(0,1fr)_320px]">
+      <div>
         <section className="rounded-xl border border-slate-200 bg-white p-6 shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
           <h2 className="text-[15px] font-semibold text-slate-800">Thông số cơ bản</h2>
 
@@ -325,60 +319,39 @@ export function AddMeterPointForm({
               </Field>
             </div>
 
-            <Field label="SỐ SERIAL ĐỒNG HỒ (NHẬP TAY)">
-              <input
-                value={serialNumber}
-                onChange={(e) => setSerialNumber(e.target.value)}
-                placeholder="VD: EM-992834-A"
-                className="input"
-              />
-              <p className="mt-1.5 text-xs text-slate-400">
-                Có thể nhập trước khi gán thiết bị. Serial chưa được ghép nối sẽ chưa có dữ liệu.
-              </p>
-            </Field>
-
-            <Field label="THIẾT BỊ">
-              <div
-                onDragOver={(e) => {
-                  e.preventDefault();
-                  e.dataTransfer.dropEffect = "copy";
-                }}
-                onDrop={(e) => {
-                  e.preventDefault();
-                  const id = e.dataTransfer.getData("text/plain");
-                  const device = devices.find((d) => d.id === id);
-                  if (device) applyDevice(device);
-                }}
-                className="flex flex-col items-center justify-center rounded-xl border-2 border-dashed border-emerald-300 bg-emerald-50/50 px-6 py-10 text-center"
-              >
-                <ImportIcon className="mb-3 h-8 w-8 text-emerald-600" />
-                {droppedDevice ? (
-                  <>
-                    <p className="max-w-md text-sm font-semibold text-slate-700">
-                      Đã gán đồng hồ: {droppedDevice.name}
-                    </p>
-                    <p className="mt-1 max-w-md text-xs text-slate-500">
-                      {serialNumber || droppedDevice.sn} · {droppedDevice.brandModel}
-                    </p>
-                    <button
-                      type="button"
-                      onClick={clearDevice}
-                      className="mt-2 rounded-md px-2 py-1 text-xs font-semibold text-red-500 hover:bg-red-50"
-                    >
-                      Bỏ gán đồng hồ
-                    </button>
-                  </>
-                ) : (
-                  <>
-                    <p className="max-w-md text-sm text-slate-500">
-                      Chưa gán đồng hồ hoặc số serial
-                    </p>
-                    <p className="mt-1 max-w-md text-xs text-slate-400">
-                      Điểm đo vẫn được lưu; trạng thái và giá trị sẽ hiển thị chưa có dữ liệu cho đến khi gán đồng hồ.
-                    </p>
-                  </>
-                )}
+            <Field label="ĐỒNG HỒ (SERIAL)">
+              <div className="flex gap-2">
+                <div className="relative min-w-0 flex-1">
+                  <CustomSelect
+                    value={deviceId ?? ""}
+                    onChange={(e) => selectDevice(e.target.value)}
+                    className="input appearance-none pr-9"
+                    searchable
+                    searchPlaceholder="Tìm serial, model..."
+                  >
+                    <option value="">— Không gắn đồng hồ —</option>
+                    {deviceOptions.map(({ device, usedBy, disabled }) => (
+                      <option key={device.id} value={device.id} disabled={disabled}>
+                        {device.sn} · {device.brandModel || device.name}
+                        {usedBy ? ` (${usedBy})` : ""}
+                      </option>
+                    ))}
+                  </CustomSelect>
+                  <ChevronIcon className="pointer-events-none absolute top-1/2 right-3 h-4 w-4 -translate-y-1/2 text-slate-400" />
+                </div>
+                <Link
+                  href="/thiet-bi/them-moi"
+                  target="_blank"
+                  className="inline-flex h-10 shrink-0 items-center gap-1 rounded-xl border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-700 shadow-xs transition-colors hover:border-slate-300 hover:bg-slate-50"
+                  title="Khai báo đồng hồ mới ở trang Thiết bị (mở tab mới)"
+                >
+                  <span className="text-lg leading-none text-emerald-600">+</span>
+                  Thêm đồng hồ
+                </Link>
               </div>
+              {!deviceOptions.length ? (
+                <p className="mt-1.5 text-xs text-slate-500">Chưa có đồng hồ loại {energy || "này"} ở trang Thiết bị.</p>
+              ) : null}
             </Field>
 
             <Field label="ĐIỂM ĐO CHA">
@@ -396,23 +369,6 @@ export function AddMeterPointForm({
                   ))}
                 </CustomSelect>
                 <ChevronIcon className="pointer-events-none absolute top-1/2 right-3 h-4 w-4 -translate-y-1/2 text-slate-400" />
-              </div>
-              <p className="mt-1.5 text-xs text-slate-400">
-                Chỉ chọn nếu điểm đo này có quan hệ cha–con. Nếu không, giữ “Không có điểm đo cha”.
-              </p>
-            </Field>
-
-            <Field label="CÔNG THỨC CHUYỂN ĐỔI (DATA TRANSFORM)">
-              <div className="relative">
-                <input
-                  value={formula}
-                  onChange={(e) => setFormula(e.target.value)}
-                  placeholder="VD: kWh * 0.85"
-                  className="input pr-10"
-                />
-                <span className="absolute top-1/2 right-3 -translate-y-1/2 text-lg font-semibold text-slate-400">
-                  Σ
-                </span>
               </div>
             </Field>
 
@@ -435,60 +391,19 @@ export function AddMeterPointForm({
           </form>
         </section>
 
-        <aside className="rounded-xl border border-slate-200 bg-white p-5 shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
-          <div className="mb-4 flex items-center gap-2">
-            <h2 className="text-[15px] font-semibold text-slate-800">Thư viện loại đồng hồ</h2>
-            <InfoIcon className="h-4 w-4 text-slate-400" />
-          </div>
-
-          <label className="relative mb-4 flex items-center">
-            <span className="pointer-events-none absolute left-3 text-slate-400">
-              <MiniSearchIcon className="h-4 w-4" />
-            </span>
-            <input
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Tìm thiết bị..."
-              className="h-9 w-full rounded-xl border border-slate-200 bg-[#f8fafc] pr-3 pl-9 text-sm outline-none placeholder:text-slate-400 focus:border-emerald-500 focus:bg-white transition-colors"
-            />
-          </label>
-
-          <ul className="max-h-[min(640px,70vh)] space-y-2 overflow-y-auto pr-1">
-            {filteredDevices.map((device) => (
-              <li key={device.id}>
-                <button
-                  type="button"
-                  draggable
-                  onDragStart={(e) => {
-                    e.dataTransfer.setData("text/plain", device.id);
-                    e.dataTransfer.effectAllowed = "copy";
-                  }}
-                  onClick={() => applyDevice(device)}
-                  className="flex w-full items-center gap-3 rounded-xl border border-slate-100 bg-white px-3 py-3 text-left hover:border-emerald-300 hover:bg-emerald-50/40 transition-colors"
-                >
-                  <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-emerald-50 text-emerald-600">
-                    <MeterIcon className="h-4 w-4" />
-                  </span>
-                  <span className="min-w-0">
-                    <span className="block truncate text-sm font-medium text-slate-800">{device.name}</span>
-                    <span className="block truncate text-xs text-slate-400">
-                      {device.brandModel} • {deviceSpec(device)}
-                    </span>
-                  </span>
-                </button>
-              </li>
-            ))}
-            {filteredDevices.length === 0 && (
-              <li className="py-6 text-center text-sm text-slate-400">Không tìm thấy thiết bị</li>
-            )}
-          </ul>
-        </aside>
       </div>
     </div>
   );
 }
 
-function utilityForDevice(device: CatalogDevice): string | null {
+function newMeterPointId() {
+  return `m-${Date.now()}`;
+}
+
+/** Loại điểm đo của đồng hồ: ưu tiên loại đã cấu hình (device.type = "Điện", "Khí nén", ...), sau đó mới đoán theo kind. */
+function utilityForDevice(device: CatalogDevice, typeNames: string[]): string | null {
+  const configured = device.type?.trim();
+  if (configured && typeNames.includes(configured)) return configured;
   switch (device.kind) {
     case "flow":
       return "Nước";
@@ -518,25 +433,6 @@ function Field({
   );
 }
 
-function ImportIcon({ className }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" aria-hidden>
-      <path
-        d="M4 14v5.5A1.5 1.5 0 0 0 5.5 21h13a1.5 1.5 0 0 0 1.5-1.5V14"
-        stroke="currentColor"
-        strokeWidth="1.8"
-        strokeLinecap="round"
-      />
-      <path
-        d="M12 4v11M8 11l4 4 4-4"
-        stroke="currentColor"
-        strokeWidth="1.8"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-    </svg>
-  );
-}
 
 function ChevronIcon({ className }: { className?: string }) {
   return (
@@ -546,29 +442,5 @@ function ChevronIcon({ className }: { className?: string }) {
   );
 }
 
-function InfoIcon({ className }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" aria-hidden>
-      <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="1.8" />
-      <path d="M12 11v5M12 8v.01" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
-    </svg>
-  );
-}
 
-function MiniSearchIcon({ className }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" aria-hidden>
-      <circle cx="11" cy="11" r="6.5" stroke="currentColor" strokeWidth="1.8" />
-      <path d="M16 16.5 20 20.5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
-    </svg>
-  );
-}
 
-function MeterIcon({ className }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" aria-hidden>
-      <rect x="4" y="5" width="16" height="14" rx="2" stroke="currentColor" strokeWidth="1.8" />
-      <path d="M8 15V9M12 15v-4M16 15v-6" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
-    </svg>
-  );
-}

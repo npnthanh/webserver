@@ -1,29 +1,40 @@
 "use client";
 
 import Link from "next/link";
-import { CustomSelect } from "@/components/ui/CustomSelect";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { ProjectConfigHeader } from "@/components/ProjectConfigHeader";
-import {
-  EXTRA_METER_TYPE_SUGGESTIONS,
-  METER_TYPES,
-  resolveMeterTypes,
-  upsertProject,
-  type MeterType,
-  type Project,
-} from "@/lib/projects";
-import { upsertMeterTypeDef } from "@/lib/meter-types";
+import { resolveMeterTypes, type MeterType, type Project } from "@/lib/projects";
 import { projectConfigPath } from "@/lib/project-config";
 import { hydrateClientMeters, orderMetersByTree, saveClientMeters, type ClientMeter } from "@/lib/client-meters";
 import { hydrateDevices, type CatalogDevice } from "@/lib/devices";
 import { hydrateAlertEvents } from "@/lib/alert-events";
 import { hydrateMeterReadings } from "@/lib/meter-readings";
 import { formatAppNumber } from "@/lib/number-format";
+import { loadProjectGatewayLatest, type ProjectGatewaySample } from "@/lib/gateway-series";
+import { DIAGRAM_ONLINE_MS } from "@/components/client/diagram/metrics";
 
 type Energy = string;
 type DeviceKind = "meter" | "inverter" | "thermo" | "water" | "wind" | "steam" | "air";
-type Status = "connected" | "disconnected";
+/** connected: có dữ liệu gateway gần đây; disconnected: mất kết nối; disabled: điểm đo chưa gắn đồng hồ. */
+type Status = "connected" | "disconnected" | "disabled";
+
+const STATUS_STYLE: Record<Status, { label: string; dot: string; text: string }> = {
+  connected: { label: "Connected", dot: "bg-emerald-500", text: "text-slate-700" },
+  disconnected: { label: "Disconnected", dot: "bg-red-500", text: "text-red-500" },
+  disabled: { label: "Disabled", dot: "bg-slate-300", text: "text-slate-400" },
+};
+
+/** Điểm đo đang kết nối = có mẫu gateway trong cửa sổ online (cùng quy tắc với Sơ đồ hệ thống). */
+function onlinePointIds(samples: ProjectGatewaySample[]) {
+  const now = Date.now();
+  const ids = new Set<string>();
+  for (const sample of samples) {
+    const ms = Date.parse(sample.at.endsWith("Z") ? sample.at : `${sample.at}Z`);
+    if (Number.isFinite(ms) && now - ms <= DIAGRAM_ONLINE_MS) ids.add(sample.meterPointId);
+  }
+  return ids;
+}
 
 type MeterPoint = {
   id: string;
@@ -74,7 +85,7 @@ function fromDbMeters(meters: ClientMeter[], devices: CatalogDevice[], readings:
       type: meter.type,
       energy: meter.utility,
       kind: meterKind(meter),
-      status: !device || device.status === "offline" ? "disconnected" : "connected",
+      status: meter.deviceId || meter.serialNumber ? "disconnected" : "disabled",
       value: latest.get(meter.id) ?? null,
       unit: meterUnit(meter.utility),
       ...(meter.parentId ? { parentId: meter.parentId } : {}),
@@ -83,15 +94,13 @@ function fromDbMeters(meters: ClientMeter[], devices: CatalogDevice[], readings:
 }
 
 export function ProjectMeterConfig({ project }: { project: Project }) {
-  const [energies, setEnergies] = useState<MeterType[]>(() => resolveMeterTypes(project));
-  const [addingType, setAddingType] = useState(false);
-  const [energyToDelete, setEnergyToDelete] = useState<MeterType | null>(null);
-  const [newType, setNewType] = useState("");
+  const energies = useMemo<MeterType[]>(() => resolveMeterTypes(project), [project]);
   const [query, setQuery] = useState("");
   const [deviceType, setDeviceType] = useState("all");
   const [page, setPage] = useState(1);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  const [allPoints, setAllPoints] = useState<MeterPoint[]>([]);
+  const [basePoints, setBasePoints] = useState<MeterPoint[]>([]);
+  const [onlineIds, setOnlineIds] = useState<Set<string>>(new Set());
   const [meterDataReady, setMeterDataReady] = useState(false);
   const [alertCount, setAlertCount] = useState(0);
   const [rawMeters, setRawMeters] = useState<ClientMeter[]>([]);
@@ -100,31 +109,53 @@ export function ProjectMeterConfig({ project }: { project: Project }) {
   const [deleteError, setDeleteError] = useState("");
 
   useEffect(() => {
-    setEnergies(resolveMeterTypes(project));
-  }, [project]);
-
-  useEffect(() => {
     let active = true;
     void Promise.all([
       hydrateClientMeters(project.id),
       hydrateDevices(),
       hydrateMeterReadings(project.id),
       hydrateAlertEvents(project.id),
-    ]).then(([meters, devices, readings, alerts]) => {
+      loadProjectGatewayLatest(project.id),
+    ]).then(([meters, devices, readings, alerts, latest]) => {
       if (!active) return;
       setRawMeters(meters);
-      setAllPoints(fromDbMeters(meters, devices, readings));
+      setBasePoints(fromDbMeters(meters, devices, readings));
+      setOnlineIds(onlinePointIds(latest));
       setMeterDataReady(true);
       setAlertCount(alerts.filter((event) => event.status !== "resolved").length);
     }).catch(() => {
       if (!active) return;
-      setAllPoints([]);
+      setBasePoints([]);
       setMeterDataReady(true);
     });
     return () => {
       active = false;
     };
   }, [project.id, reloadTick]);
+
+  // Làm mới trạng thái kết nối định kỳ.
+  useEffect(() => {
+    let active = true;
+    const timer = window.setInterval(() => {
+      void loadProjectGatewayLatest(project.id).then((latest) => {
+        if (active) setOnlineIds(onlinePointIds(latest));
+      });
+    }, 30_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [project.id]);
+
+  const allPoints = useMemo(
+    () =>
+      basePoints.map((point) =>
+        point.status === "disabled"
+          ? point
+          : { ...point, status: (onlineIds.has(point.id) ? "connected" : "disconnected") as Status },
+      ),
+    [basePoints, onlineIds],
+  );
 
   /** Xóa điểm đo: các điểm đo con chuyển lên làm con của điểm cha trên một cấp (hoặc thành điểm gốc). */
   async function deletePoint(point: MeterPoint) {
@@ -143,19 +174,6 @@ export function ProjectMeterConfig({ project }: { project: Project }) {
     }
   }
 
-  function persistEnergies(next: MeterType[]) {
-    setEnergies(next);
-    void upsertProject({ ...project, meterTypes: next }).catch(() => undefined);
-  }
-
-  const suggestions = useMemo(
-    () =>
-      [...METER_TYPES, ...EXTRA_METER_TYPE_SUGGESTIONS].filter(
-        (item) => !energies.includes(item),
-      ),
-    [energies],
-  );
-
   const flatPoints = useMemo(
     () => (meterDataReady ? flatten(allPoints) : []),
     [allPoints, meterDataReady],
@@ -165,19 +183,19 @@ export function ProjectMeterConfig({ project }: { project: Project }) {
     [flatPoints],
   );
   const disconnectedPoints = useMemo(
-    () => flatPoints.filter((item) => item.status !== "connected").length,
+    () => flatPoints.filter((item) => item.status === "disconnected").length,
     [flatPoints],
   );
 
-  // Loại thiết bị = loại điểm đo (Điện, Nước, Nhiệt, Hơi, ...) đã bật cho dự án.
-  const deviceTypes = energies;
+  // Lọc theo loại điểm đo (Điện, Nước, Nhiệt, Hơi, ...) đã bật cho dự án; mặc định "Tất cả".
+  const activeType = deviceType !== "all" && energies.includes(deviceType) ? deviceType : "all";
 
   const filteredRoots = useMemo(() => {
     const q = query.trim().toLowerCase();
 
     function match(point: MeterPoint): boolean {
       const energyOk = energies.includes(point.energy);
-      const typeOk = deviceType === "all" || point.energy === deviceType;
+      const typeOk = activeType === "all" || point.energy === activeType;
       const textOk =
         !q ||
         point.name.toLowerCase().includes(q) ||
@@ -196,26 +214,12 @@ export function ProjectMeterConfig({ project }: { project: Project }) {
       }
     }
     return next;
-  }, [allPoints, deviceType, energies, meterDataReady, query]);
+  }, [activeType, allPoints, energies, meterDataReady, query]);
 
   const totalPages = Math.max(1, Math.ceil(filteredRoots.length / PAGE_SIZE));
   const currentPage = Math.min(page, totalPages);
   const start = (currentPage - 1) * PAGE_SIZE;
   const pageRows = filteredRoots.slice(start, start + PAGE_SIZE);
-
-  function addEnergyType(raw: string) {
-    const label = raw.trim();
-    if (!label || energies.includes(label)) return;
-    setPage(1);
-    persistEnergies([...energies, label]);
-    try {
-      upsertMeterTypeDef({ name: label, description: "" });
-    } catch {
-      // Loại đã có trong catalog thì chỉ cần gán vào dự án.
-    }
-    setNewType("");
-    setAddingType(false);
-  }
 
   function toggleExpand(id: string) {
     setExpanded((current) => {
@@ -251,76 +255,27 @@ export function ProjectMeterConfig({ project }: { project: Project }) {
           </div>
 
           <div className="mb-4 flex flex-wrap items-center gap-2">
-            {energies.map((energy) => (
-              <div
-                key={energy}
-                className="inline-flex h-8 items-center rounded-full bg-emerald-600 pl-3 text-sm font-semibold text-white shadow-xs"
-              >
-                <span className="pr-1">{energy}</span>
+            {["all", ...energies].map((type) => {
+              const selected = activeType === type;
+              return (
                 <button
+                  key={type}
                   type="button"
-                  aria-label={`Bỏ loại ${energy}`}
-                  className="px-2 text-base leading-none text-white/80 hover:text-white"
-                  onClick={() => setEnergyToDelete(energy)}
-                >
-                  ×
-                </button>
-              </div>
-            ))}
-            {addingType ? (
-              <div className="flex items-center gap-2">
-                <input
-                  autoFocus
-                  value={newType}
-                  onChange={(e) => setNewType(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      e.preventDefault();
-                      addEnergyType(newType);
-                    }
-                    if (e.key === "Escape") {
-                      setAddingType(false);
-                      setNewType("");
-                    }
-                  }}
-                  placeholder="VD: Khí nén"
-                  list="meter-type-suggestions"
-                  className="h-8 w-36 rounded-full border border-emerald-500 bg-white px-3 text-sm outline-none"
-                />
-                <datalist id="meter-type-suggestions">
-                  {suggestions.map((item) => (
-                    <option key={item} value={item} />
-                  ))}
-                </datalist>
-                <button
-                  type="button"
-                  onClick={() => addEnergyType(newType)}
-                  className="h-8 rounded-full bg-emerald-600 px-3 text-xs font-semibold text-white hover:bg-emerald-700 shadow-xs"
-                >
-                  Thêm
-                </button>
-                <button
-                  type="button"
+                  aria-pressed={selected}
                   onClick={() => {
-                    setAddingType(false);
-                    setNewType("");
+                    setDeviceType(type);
+                    setPage(1);
                   }}
-                  className="h-8 rounded-full px-2 text-xs text-slate-500 hover:bg-slate-100"
+                  className={`inline-flex h-8 items-center rounded-full px-4 text-sm font-semibold transition-colors ${
+                    selected
+                      ? "bg-emerald-600 text-white shadow-xs"
+                      : "bg-white text-slate-600 ring-1 ring-slate-200 hover:bg-emerald-50 hover:text-emerald-700"
+                  }`}
                 >
-                  Hủy
+                  {type === "all" ? "Tất cả" : type}
                 </button>
-              </div>
-            ) : (
-              <button
-                type="button"
-                onClick={() => setAddingType(true)}
-                className="flex h-8 w-8 items-center justify-center rounded-full bg-white text-lg text-emerald-600 ring-1 ring-slate-200 hover:bg-emerald-50 transition-colors"
-                aria-label="Thêm loại năng lượng"
-                title="Thêm loại điểm đo (hiển thị trên thanh công cụ Sơ đồ)"
-              >
-                +
-              </button>
-            )}
+              );
+            })}
           </div>
 
           <div className="mb-4 flex flex-wrap items-center gap-3">
@@ -338,21 +293,6 @@ export function ProjectMeterConfig({ project }: { project: Project }) {
                 className="h-10 w-full rounded-xl border border-slate-200 bg-white pr-3 pl-9 text-sm outline-none placeholder:text-slate-400 focus:border-emerald-500 transition-colors"
               />
             </label>
-            <CustomSelect
-              value={deviceType}
-              onChange={(e) => {
-                setDeviceType(e.target.value);
-                setPage(1);
-              }}
-              className="h-10 rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-600 outline-none focus:border-emerald-500 transition-colors"
-            >
-              <option value="all">Tất cả loại thiết bị</option>
-              {deviceTypes.map((type) => (
-                <option key={type} value={type}>
-                  {type}
-                </option>
-              ))}
-            </CustomSelect>
           </div>
 
           <section className="rounded-xl border border-slate-200 bg-white shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
@@ -440,21 +380,6 @@ export function ProjectMeterConfig({ project }: { project: Project }) {
           </section>
 
       <ConfirmDialog
-        open={Boolean(energyToDelete)}
-        title="Xác nhận bỏ loại năng lượng"
-        description={`Bạn có chắc chắn muốn bỏ loại "${energyToDelete}" khỏi dự án này không?`}
-        confirmText="Xác nhận bỏ"
-        onConfirm={() => {
-          if (energyToDelete) {
-            persistEnergies(energies.filter((item) => item !== energyToDelete));
-            setPage(1);
-            setEnergyToDelete(null);
-          }
-        }}
-        onCancel={() => setEnergyToDelete(null)}
-      />
-
-      <ConfirmDialog
         open={Boolean(pointToDelete)}
         title="Xác nhận xóa điểm đo"
         description={
@@ -524,14 +449,8 @@ function DeviceRows({
         <td className="px-5 py-3.5 text-slate-600">{point.energy}</td>
         <td className="px-5 py-3.5">
           <span className="inline-flex items-center gap-2 text-sm font-medium">
-            <span
-              className={`h-2 w-2 rounded-full ${
-                point.status === "connected" ? "bg-emerald-500" : "bg-red-500"
-              }`}
-            />
-            <span className={point.status === "connected" ? "text-slate-700" : "text-red-500"}>
-              {point.status === "connected" ? "Connected" : "Disconnected"}
-            </span>
+            <span className={`h-2 w-2 rounded-full ${STATUS_STYLE[point.status].dot}`} />
+            <span className={STATUS_STYLE[point.status].text}>{STATUS_STYLE[point.status].label}</span>
           </span>
         </td>
         <td className="px-5 py-3.5">

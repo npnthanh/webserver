@@ -4,8 +4,8 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { CustomSelect } from "@/components/ui/CustomSelect";
 import {
-  CONNECTION_PROTOCOLS,
   hydrateMeterModels,
+  loadGatewayProtocolVersions,
   loadMeterModels,
   parseIdentCode,
   removeMeterModel,
@@ -24,7 +24,7 @@ type TypeDraft = { name: string; code: string; description: string };
 type ModelDraft = { meterType: string; brand: string; modelName: string; code: string; protocol: string };
 
 const EMPTY_TYPE: TypeDraft = { name: "", code: "", description: "" };
-const EMPTY_MODEL: ModelDraft = { meterType: "", brand: "", modelName: "", code: "", protocol: CONNECTION_PROTOCOLS[0] };
+const EMPTY_MODEL: ModelDraft = { meterType: "", brand: "", modelName: "", code: "", protocol: "" };
 
 type PendingDelete = { kind: "type"; name: string } | { kind: "model"; model: MeterModelDef };
 
@@ -32,6 +32,7 @@ type PendingDelete = { kind: "type"; name: string } | { kind: "model"; model: Me
 export function MeterCatalogConfig({ section }: { section: "types" | "models" }) {
   const [types, setTypes] = useState<MeterTypeDef[]>([]);
   const [models, setModels] = useState<MeterModelDef[]>([]);
+  const [protocolVersions, setProtocolVersions] = useState<string[]>([]);
 
   const [typeDraft, setTypeDraft] = useState<TypeDraft>(EMPTY_TYPE);
   const [editingType, setEditingType] = useState<string | null>(null);
@@ -48,11 +49,15 @@ export function MeterCatalogConfig({ section }: { section: "types" | "models" })
 
   useEffect(() => {
     let active = true;
-    void Promise.all([hydrateMeterTypeDefs(), hydrateMeterModels({ force: true })]).then(([typeRows, modelRows]) => {
-      if (!active) return;
-      setTypes(typeRows);
-      setModels(modelRows);
-    });
+    void Promise.all([hydrateMeterTypeDefs(), hydrateMeterModels({ force: true }), loadGatewayProtocolVersions()]).then(
+      ([typeRows, modelRows, versions]) => {
+        if (!active) return;
+        setTypes(typeRows);
+        setModels(modelRows);
+        setProtocolVersions(versions);
+        setModelDraft((current) => (current.protocol ? current : { ...current, protocol: versions[0] ?? "" }));
+      },
+    );
     const syncTypes = () => setTypes(loadMeterTypeDefs());
     const syncModels = () => setModels(loadMeterModels());
     window.addEventListener("ems-meter-types-changed", syncTypes);
@@ -81,7 +86,7 @@ export function MeterCatalogConfig({ section }: { section: "types" | "models" })
   }
 
   function resetModel() {
-    setModelDraft({ ...EMPTY_MODEL, meterType: modelDraft.meterType });
+    setModelDraft({ ...EMPTY_MODEL, meterType: modelDraft.meterType, protocol: protocolVersions[0] ?? "" });
     setEditingModel(null);
     setModelError("");
   }
@@ -278,24 +283,28 @@ export function MeterCatalogConfig({ section }: { section: "types" | "models" })
               placeholder="0–255"
             />
           </Field>
-          <Field label="Giao thức kết nối">
+          <Field label="Giao thức (Protocol Version)">
             <CustomSelect
               className="input"
               value={modelDraft.protocol}
               onChange={(e) => setModelDraft({ ...modelDraft, protocol: e.target.value })}
             >
-              {CONNECTION_PROTOCOLS.map((item) => (
+              {protocolVersions.map((item) => (
                 <option key={item} value={item}>
                   {item}
                 </option>
               ))}
+              {/* Model cũ lưu tên giao thức (VD "Modbus TCP"): vẫn hiện để không mất khi sửa. */}
+              {modelDraft.protocol && !protocolVersions.includes(modelDraft.protocol) ? (
+                <option value={modelDraft.protocol}>{modelDraft.protocol}</option>
+              ) : null}
             </CustomSelect>
           </Field>
           <FormButtons editing={Boolean(editingModel)} saving={savingModel} onSubmit={submitModel} onCancel={resetModel} />
         </div>
         {modelError ? <ErrorText text={modelError} /> : null}
 
-        <Table headers={["Loại điểm đo", "Thương hiệu / Nhà sản xuất", "Tên model", "Mã nhận dạng (MT · MM)", "Giao thức", ""]}>
+        <Table headers={["Loại điểm đo", "Thương hiệu / Nhà sản xuất", "Tên model", "Mã nhận dạng (MT · MM)", "Protocol Version", ""]}>
           {models.length === 0 ? (
             <tr>
               <td colSpan={6} className="px-4 py-10 text-center text-slate-400">
@@ -325,7 +334,7 @@ export function MeterCatalogConfig({ section }: { section: "types" | "models" })
                         brand: item.brand,
                         modelName: item.modelName,
                         code: item.modelCode == null ? "" : String(item.modelCode),
-                        protocol: item.protocol || CONNECTION_PROTOCOLS[0],
+                        protocol: item.protocol || protocolVersions[0] || "",
                       });
                     }}
                     onDelete={() => {

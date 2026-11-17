@@ -69,6 +69,12 @@ const navGroups: {
         permission: "manageDevices",
       },
       {
+        href: "/cau-hinh/nguon-phat-thai",
+        label: "Nguồn phát thải thủ công",
+        icon: EmissionIcon,
+        permission: "manageEmissionFactors",
+      },
+      {
         href: "/cau-hinh/thong-bao",
         label: "Cấu hình thông báo",
         icon: AlertConfigIcon,
@@ -79,7 +85,7 @@ const navGroups: {
 ];
 
 const configItems: { module: ProjectConfigModule; label: string; icon: typeof ChartIcon }[] = [
-  { module: "project-info", label: "Sửa thông tin dự án", icon: EditProjectIcon },
+  { module: "project-info", label: "Thông tin dự án", icon: EditProjectIcon },
   { module: "points", label: "Cấu hình điểm đo", icon: MeterConfigIcon },
   { module: "ghg", label: "Cấu hình khí nhà kính", icon: EmissionIcon },
   { module: "alerts", label: "Cấu hình cảnh báo", icon: AlertConfigIcon },

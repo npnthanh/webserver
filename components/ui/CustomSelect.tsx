@@ -54,7 +54,11 @@ function collectOptions(children: ReactNode, out: ParsedOption[] = []): ParsedOp
   return out;
 }
 
-export type CustomSelectProps = Omit<React.SelectHTMLAttributes<HTMLSelectElement>, "size">;
+export type CustomSelectProps = Omit<React.SelectHTMLAttributes<HTMLSelectElement>, "size"> & {
+  /** Hiện ô tìm kiếm trong danh sách (dùng cho danh sách dài). Option giá trị rỗng luôn được giữ. */
+  searchable?: boolean;
+  searchPlaceholder?: string;
+};
 
 export function CustomSelect({
   value,
@@ -67,8 +71,11 @@ export function CustomSelect({
   name,
   title,
   "aria-label": ariaLabel,
+  searchable = false,
+  searchPlaceholder = "Tìm kiếm...",
 }: CustomSelectProps) {
   const options = useMemo(() => collectOptions(children), [children]);
+  const [search, setSearch] = useState("");
   const [internalValue, setInternalValue] = useState<string>(() =>
     defaultValue !== undefined ? String(defaultValue) : (options[0]?.value ?? ""),
   );
@@ -80,6 +87,11 @@ export function CustomSelect({
   );
 
   const [open, setOpen] = useState(false);
+  const visibleOptions = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!searchable || !q) return options;
+    return options.filter((opt) => opt.value === "" || opt.text.toLowerCase().includes(q));
+  }, [options, search, searchable]);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const [coords, setCoords] = useState<{
@@ -180,6 +192,7 @@ export function CustomSelect({
         disabled={disabled}
         onClick={() => {
           if (disabled) return;
+          setSearch("");
           setOpen((prev) => !prev);
         }}
         className={`inline-flex items-center justify-between gap-1.5 text-left transition-colors ${
@@ -228,7 +241,21 @@ export function CustomSelect({
               }}
               className="z-[9999] max-h-64 overflow-y-auto rounded-xl border border-slate-200/90 bg-white p-1 font-sans shadow-[0_12px_32px_-6px_rgba(15,23,42,0.16),0_2px_6px_rgba(15,23,42,0.06)] ring-1 ring-slate-900/5"
             >
-              {options.map((opt, idx) => {
+              {searchable ? (
+                <div className="sticky top-0 z-10 -mx-1 -mt-1 mb-1 border-b border-slate-100 bg-white p-1.5">
+                  <input
+                    autoFocus
+                    value={search}
+                    onChange={(event) => setSearch(event.target.value)}
+                    placeholder={searchPlaceholder}
+                    className="h-8 w-full rounded-lg border border-slate-200 bg-slate-50 px-2.5 text-[12.5px] outline-none placeholder:text-slate-400 focus:border-emerald-500 focus:bg-white"
+                  />
+                </div>
+              ) : null}
+              {searchable && search.trim() && visibleOptions.every((opt) => opt.value === "") ? (
+                <p className="px-2.5 py-2 text-[12.5px] text-slate-400">Không tìm thấy kết quả</p>
+              ) : null}
+              {visibleOptions.map((opt, idx) => {
                 const active = opt.value === currentValue;
                 return (
                   <button
