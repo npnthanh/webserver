@@ -141,7 +141,6 @@ export function AddEmissionFactorForm() {
         <h1 className="text-2xl font-bold tracking-tight text-slate-900">
           {isEdit ? "Cập nhật hệ số phát thải" : "Thêm hệ số phát thải"}
         </h1>
-        <p className="mt-1 text-sm text-slate-500">Quản lý thư viện hệ số phát thải</p>
       </div>
 
       <form
@@ -155,9 +154,6 @@ export function AddEmissionFactorForm() {
           <h2 className="text-[15px] font-semibold text-slate-800">
             {isEdit ? "Cập nhật hệ số phát thải" : "Thêm hệ số phát thải mới"}
           </h2>
-          <p className="mt-1 text-sm text-slate-500">
-            Nhập thông tin chi tiết cho nguồn phát thải vào hệ thống.
-          </p>
         </div>
 
         <div className="space-y-4">
@@ -187,9 +183,6 @@ export function AddEmissionFactorForm() {
               <h3 className="text-[15px] font-semibold text-slate-800">
                 Cấu hình thành phần phát thải
               </h3>
-              <p className="mt-0.5 text-xs text-slate-500">
-                Thêm, bớt hoặc tùy chỉnh các thành phần khí phát thải và định lượng hệ số tương ứng
-              </p>
             </div>
             <button
               type="button"
@@ -288,15 +281,6 @@ export function AddEmissionFactorForm() {
           </button>
         </div>
       </form>
-
-      <div className="mt-5 flex gap-3 rounded-xl border border-emerald-200 bg-emerald-50/50 px-4 py-3 text-sm text-slate-700">
-        <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-emerald-600 text-[11px] font-bold text-white shadow-xs">
-          i
-        </span>
-        <p>
-          <span className="font-semibold text-emerald-900">Mẹo:</span> Bạn có thể thêm, bớt hoặc chỉnh sửa bất kỳ thành phần phát thải nào (CO2, CH4, N2O, SF6...) theo đúng quy định và tài liệu viện dẫn kỹ thuật của cơ sở.
-        </p>
-      </div>
 
       <ConfirmDialog
         open={Boolean(rowToDelete)}

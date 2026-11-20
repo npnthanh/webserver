@@ -83,7 +83,8 @@ export type TariffHistoryEntry = {
   applyDate: string;
   note?: string;
   voltageLevel: VoltageLevelId;
-  prices: Record<TouBand, string>;
+  /** `none`: đơn giá phần điện năng "Không xác định" khung giờ (bỏ trống = giá giờ bình thường). */
+  prices: Record<TouBand, string> & { none?: string };
   /** Nếu có danh sách khung giờ tùy chỉnh (ví dụ 4 khung giá) thì ưu tiên tính theo slots */
   slots?: CustomTariffSlot[];
 };
@@ -95,7 +96,7 @@ export type SavedElectricityCostConfig = {
   flatPrices?: Record<string, string>;
   electricity?: {
     voltageLevel?: string;
-    prices?: Partial<Record<TouBand, unknown>>;
+    prices?: Partial<Record<TouBand | "none", unknown>>;
   };
   tariffHistory?: TariffHistoryEntry[];
 };
@@ -219,4 +220,95 @@ export function industrialEnergyCost(kwh: TouPrices, prices: TouPrices) {
   const off = kwh.off * prices.off;
   const peak = kwh.peak * prices.peak;
   return { normal, off, peak, total: normal + off + peak };
+}
+
+/* ---------------- Điện năng "Không xác định" khung giờ ---------------- */
+
+/** Mục điện năng không xác định được khung giờ (mất dữ liệu / hỏng đồng hồ vắt qua nhiều khung giờ). */
+export const UNKNOWN_BAND = "none" as const;
+export const UNKNOWN_BAND_LABEL = "Không xác định";
+
+export type VietnamClockParts = { year: number; month: number; day: number; hour: number; minute: number };
+
+function storedMs(at: string) {
+  return Date.parse(`${at.slice(0, 19)}Z`);
+}
+
+/** Thời điểm (ms UTC) → ngày giờ Việt Nam. */
+export function vietnamClockAt(ms: number): VietnamClockParts {
+  const date = new Date(ms + 7 * 3600_000);
+  return {
+    year: date.getUTCFullYear(),
+    month: date.getUTCMonth() + 1,
+    day: date.getUTCDate(),
+    hour: date.getUTCHours(),
+    minute: date.getUTCMinutes(),
+  };
+}
+
+/** Độ dài một khung dữ liệu (15 / 30 phút…) suy ra từ khoảng cách nhỏ nhất giữa các khung liên tiếp. */
+export function inferSlotMs(storedTimes: string[], fallbackMs = 30 * 60_000) {
+  let best = Number.POSITIVE_INFINITY;
+  for (let i = 1; i < storedTimes.length; i++) {
+    const diff = storedMs(storedTimes[i]) - storedMs(storedTimes[i - 1]);
+    if (diff > 0 && diff < best) best = diff;
+  }
+  return Number.isFinite(best) ? best : fallbackMs;
+}
+
+/**
+ * Khung giờ của phần điện năng tích lại GIỮA khung dữ liệu trước (`prevAt`) và khung hiện tại (`at`).
+ * - Hai khung liền nhau: thuộc khung giờ của khung hiện tại (như trước đây).
+ * - Có khoảng mất dữ liệu: nếu cả khoảng (từ khung trước tới hết khung hiện tại) nằm trọn trong MỘT khung giờ
+ *   thì vẫn tính cho khung giờ đó; vắt qua từ 2 khung giờ trở lên → "none" (Không xác định), vì không biết
+ *   phần điện năng đó dùng vào giờ nào.
+ * `at`, `prevAt`: giờ lưu UTC "YYYY-MM-DDTHH:mm:ss"; `bandAt`: khung giờ tại một thời điểm.
+ */
+export function bandForGap<B extends string>(
+  prevAt: string | null,
+  at: string,
+  slotMs: number,
+  bandAt: (parts: VietnamClockParts) => B,
+): B | typeof UNKNOWN_BAND {
+  const toMs = storedMs(at);
+  const current = bandAt(vietnamClockAt(toMs));
+  if (!prevAt) return current;
+  const fromMs = storedMs(prevAt);
+  if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || toMs - fromMs <= slotMs + 1000) return current;
+  const endMs = toMs + slotMs;
+  for (let t = fromMs; t < endMs; t += 5 * 60_000) {
+    if (bandAt(vietnamClockAt(t)) !== current) return UNKNOWN_BAND;
+  }
+  return current;
+}
+
+/** Khung giờ điện công nghiệp tại một thời điểm Việt Nam. */
+export function industrialBandAt(parts: VietnamClockParts): TouBand {
+  return industrialBand(civilWeekday(parts.year, parts.month, parts.day), parts.hour, parts.minute);
+}
+
+/**
+ * Đơn giá phần điện năng "Không xác định" khung giờ tại thời điểm `parts`:
+ * giá đã cấu hình (biểu giá đang hiệu lực), bỏ trống thì lấy giá giờ bình thường.
+ */
+export function resolveUnknownPriceAt(
+  config: SavedElectricityCostConfig | undefined,
+  parts: { year: number; month: number; day: number },
+) {
+  const dayKey = `${parts.year}-${String(parts.month).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`;
+  const history = Array.isArray(config?.tariffHistory) ? config!.tariffHistory : [];
+  if (history.length > 0) {
+    const sorted = [...history]
+      .map((item) => ({ ...item, normDate: normalizeDateKey(item.applyDate) || "0000-01-01" }))
+      .sort((a, b) => a.normDate.localeCompare(b.normDate));
+    let active = sorted[0];
+    for (const entry of sorted) {
+      if (entry.normDate <= dayKey) active = entry;
+    }
+    const custom = parseTariffPrice(active.prices?.none);
+    return custom > 0 ? custom : resolveTouPrices(active.voltageLevel, active.prices).prices.normal;
+  }
+  const custom = parseTariffPrice(config?.electricity?.prices?.none);
+  if (custom > 0) return custom;
+  return resolveTouPrices(config?.electricity?.voltageLevel, config?.electricity?.prices).prices.normal;
 }

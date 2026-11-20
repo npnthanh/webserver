@@ -48,10 +48,12 @@ import {
   DEFAULT_NOTIFICATION_CHANNELS,
   DEFAULT_SEVERITY_BY_CATEGORY,
   DEFAULT_USER_ALERT_CATEGORIES,
-  DEFAULT_USER_ALERT_RULES,
+  buildRuleOverrides,
   cloneDefaultRulesByGroup,
   normalizeAlertConfig,
+  ruleThresholdsForPoint,
   type AlertCategoryId,
+  type AlertPointSetting,
   type AlertSeverityLevel,
   type NotificationChannelsConfig,
   type UserAlertCategoryTab,
@@ -60,32 +62,36 @@ import {
 } from "@/lib/alert-config";
 import { hydrateAlertEvents } from "@/lib/alert-events";
 import { loadProjectGatewayLatest } from "@/lib/gateway-series";
-import {
-  METER_PARAMETERS,
-  parametersForChart,
-  readMeterValue,
-  type MeterChartId,
-  type MeterParameter,
-} from "@/lib/meter-parameters";
+import { METER_PARAMETERS, readMeterValue } from "@/lib/meter-parameters";
 import { hydrateProjectSettings, saveProjectSettings, type ProjectSettingsPayload } from "@/lib/project-settings";
+import { readChartShowMarkers } from "@/lib/chart-display";
+import {
+  CHART_PARAMETER_TABS,
+  allTabKeys,
+  readChartParameterConfig,
+  type ChartParameterConfig,
+  type ChartParamTabId,
+} from "@/lib/chart-parameters";
 
-type TabId = "project" | "meters" | "cost" | "alerts" | "accounts";
+type TabId = "project" | "meters" | "cost" | "alerts" | "accounts" | "charts";
 type Utility = string;
 type DropPosition = "before" | "after" | "child";
 type Meter = ClientMeter;
 
-const NAV: { id: TabId; n: number; label: string; icon: "doc" | "nodes" | "cash" | "warn" | "user" }[] = [
+const NAV: { id: TabId; n: number; label: string; icon: NavIconType }[] = [
   { id: "project", n: 1, label: "Dự án", icon: "doc" },
   { id: "meters", n: 2, label: "Cụm điểm đo", icon: "nodes" },
   { id: "cost", n: 3, label: "Chi phí", icon: "cash" },
   { id: "alerts", n: 4, label: "Cảnh báo", icon: "warn" },
   { id: "accounts", n: 5, label: "Quản lý tài khoản", icon: "user" },
+  { id: "charts", n: 6, label: "Tham số biểu đồ", icon: "chart" },
 ];
 
 const FALLBACK_UTILITIES = ["Điện", "Nước", "Nhiệt", "Hơi"];
 
 type Slot = { id: string; name: string; color: string; from: string; to: string; price: string };
-type TouPriceInputs = Record<TouBand, string>;
+/** `none`: đơn giá phần điện năng "Không xác định" khung giờ; bỏ trống = theo giá giờ bình thường. */
+type TouPriceInputs = Record<TouBand, string> & { none: string };
 type SavedProjectConfig = {
   classify?: string;
   startTime?: string;
@@ -132,6 +138,7 @@ function tariffInputs(levelId: string | undefined): TouPriceInputs {
     normal: formatTariffPrice(prices.normal),
     off: formatTariffPrice(prices.off),
     peak: formatTariffPrice(prices.peak),
+    none: "",
   };
 }
 export function ClientConfig() {
@@ -139,6 +146,8 @@ export function ClientConfig() {
   const projectId = params?.id ?? "default";
   const { session } = useAuth();
   const [tab, setTab] = useState<TabId>("meters");
+  const [chartConfig, setChartConfig] = useState<ChartParameterConfig>({});
+  const [chartShowMarkers, setChartShowMarkers] = useState(false);
   const [openParams, setOpenParams] = useState(true);
   const [saved, setSaved] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -247,6 +256,8 @@ export function ClientConfig() {
   }, [projectId]);
 
   function applyCostSettings(settings: ProjectSettingsPayload, types: string[] = utilities) {
+    setChartConfig(readChartParameterConfig(settings));
+    setChartShowMarkers(readChartShowMarkers(settings));
     const savedProject = settings.projectConfig as SavedProjectConfig | undefined;
     if (savedProject) {
       if (savedProject.classify !== undefined) setClassify(savedProject.classify);
@@ -293,10 +304,12 @@ export function ClientConfig() {
     setFlatPrices(savedCost.flatPrices ? { ...savedCost.flatPrices } : {});
     const tariff = resolveTouPrices(savedCost.electricity?.voltageLevel, savedCost.electricity?.prices);
     setVoltageLevel(tariff.levelId);
+    const savedUnknown = parseTariffPrice(savedCost.electricity?.prices?.none);
     setTouPrices({
       normal: formatTariffPrice(tariff.prices.normal),
       off: formatTariffPrice(tariff.prices.off),
       peak: formatTariffPrice(tariff.prices.peak),
+      none: savedUnknown > 0 ? formatTariffPrice(savedUnknown) : "",
     });
     if (savedCost.utility && types.includes(savedCost.utility)) setUtility(savedCost.utility);
   }
@@ -360,9 +373,9 @@ export function ClientConfig() {
         const stored = await saveProjectSettings(projectId, {
           alertsConfig: {
             classify: alertClassify,
-            categories: alertCategories,
             activeGroupId: activeAlertGroupId,
-            rulesByGroup: alertRulesByGroup,
+            // Danh sách ngưỡng lấy từ thư viện của dự án; chỉ lưu phần bật/tắt, mức độ, ngưỡng riêng từng điểm đo.
+            ruleOverrides: buildRuleOverrides(alertRulesByGroup),
             notifications: alertNotifications,
             severityByCategory,
             overConsumptionKwh: threshold,
@@ -376,23 +389,27 @@ export function ClientConfig() {
         void hydrateAlertEvents(projectId, { force: true }).catch(() => undefined);
         // Đồng bộ các quy tắc ngưỡng đang bật xuống bảng gateway_thresholds
         const allRules = Object.values(alertRulesByGroup).flat();
+        const thresholdJobs: { meterId: string; parameterName: string; minNum: number | null; maxNum: number | null }[] = [];
         for (const rule of allRules) {
-          if (!rule.enabled || !rule.parameterKey) continue;
-          const minNum = rule.minValue.trim() ? Number(rule.minValue) : null;
-          const maxNum = rule.maxValue.trim() ? Number(rule.maxValue) : null;
-          if (
-            (minNum == null || !Number.isFinite(minNum)) &&
-            (maxNum == null || !Number.isFinite(maxNum))
-          ) {
-            continue;
+          if (!rule.parameterKey) continue;
+          for (const meter of meters) {
+            const limits = ruleThresholdsForPoint(rule, meter.id);
+            if (!limits) continue;
+            const minNum = limits.minValue.trim() ? Number(limits.minValue) : null;
+            const maxNum = limits.maxValue.trim() ? Number(limits.maxValue) : null;
+            if (
+              (minNum == null || !Number.isFinite(minNum)) &&
+              (maxNum == null || !Number.isFinite(maxNum))
+            ) {
+              continue;
+            }
+            const assignedDevice = meter.deviceId ? devices.find((d) => d.id === meter.deviceId) : undefined;
+            const meterId = assignedDevice?.sn || meter.serialNumber || "";
+            if (!meterId) continue;
+            thresholdJobs.push({ meterId, parameterName: rule.parameterKey, minNum, maxNum });
           }
-          const matchedMeter = rule.meterPointId
-            ? meters.find((m) => m.id === rule.meterPointId)
-            : undefined;
-          const assignedDevice = matchedMeter?.deviceId
-            ? devices.find((d) => d.id === matchedMeter.deviceId)
-            : undefined;
-          const meterId = assignedDevice?.sn || matchedMeter?.serialNumber || "";
+        }
+        for (const { meterId, parameterName, minNum, maxNum } of thresholdJobs) {
           void fetch("/api/gateway/console", {
             method: "POST",
             headers: { "content-type": "application/json" },
@@ -401,12 +418,15 @@ export function ClientConfig() {
               gatewayId: "",
               meterModel: "",
               meterId,
-              parameterName: rule.parameterKey,
+              parameterName,
               minValue: minNum != null && Number.isFinite(minNum) ? minNum : null,
               maxValue: maxNum != null && Number.isFinite(maxNum) ? maxNum : null,
             }),
           }).catch(() => undefined);
         }
+      } else if (tab === "charts") {
+        const stored = await saveProjectSettings(projectId, { chartParameters: chartConfig, chartShowMarkers });
+        applyCostSettings(stored);
       } else if (tab === "cost") {
         // Tự động ghi mốc lịch sử biểu giá theo ngày bắt đầu áp dụng (applyDate) để bảo toàn kỳ tính giá trước đó
         let nextHistory = [...tariffHistory];
@@ -471,6 +491,10 @@ export function ClientConfig() {
       hint: "Thiết lập mức độ phân loại cảnh báo (nghiêm trọng / cảnh báo / thông tin) và ngưỡng vận hành tiêu thụ của nhà máy.",
     },
     accounts: { title: "Quản lý tài khoản", hint: "Quản lý các thiết lập cơ bản cho dự án EMS" },
+    charts: {
+      title: "Tham số biểu đồ",
+      hint: "Chọn các tham số gateway được vẽ trên từng biểu đồ của trang Biểu đồ.",
+    },
   }[tab];
 
   return (
@@ -587,6 +611,8 @@ export function ClientConfig() {
                 utilities={utilities}
                 onUtility={setUtility}
                 meters={visibleMeters}
+                allMeters={meters}
+                projectId={projectId}
                 devices={devices}
                 addMeterHref={addMeterHref}
                 onMetersChange={(nextVisible) => {
@@ -614,11 +640,20 @@ export function ClientConfig() {
                 onTariffHistoryChange={setTariffHistory}
                 onVoltageLevel={(levelId) => {
                   setVoltageLevel(levelId);
-                  setTouPrices(tariffInputs(levelId));
+                  setTouPrices((current) => ({ ...tariffInputs(levelId), none: current.none }));
                 }}
                 onTouPrice={(band, value) => setTouPrices((current) => ({ ...current, [band]: value }))}
                 flatPrice={flatPrices[utility]}
                 onFlatPrice={(value) => setFlatPrices((current) => ({ ...current, [utility]: value }))}
+              />
+            ) : null}
+
+            {tab === "charts" ? (
+              <ChartParamsPanel
+                config={chartConfig}
+                onChange={setChartConfig}
+                showMarkers={chartShowMarkers}
+                onShowMarkers={setChartShowMarkers}
               />
             ) : null}
 
@@ -629,11 +664,8 @@ export function ClientConfig() {
                 categories={alertCategories}
                 activeGroupId={activeAlertGroupId}
                 onActiveGroup={setActiveAlertGroupId}
-                onCategoriesChange={setAlertCategories}
                 rulesByGroup={alertRulesByGroup}
                 onRulesByGroupChange={setAlertRulesByGroup}
-                notifications={alertNotifications}
-                onNotificationsChange={setAlertNotifications}
                 meters={meters}
                 liveMeterValues={liveMeterValues}
                 severityByCategory={severityByCategory}
@@ -847,6 +879,8 @@ function MetersPanel({
   utilities,
   onUtility,
   meters,
+  allMeters,
+  projectId,
   devices,
   addMeterHref,
   onMetersChange,
@@ -855,6 +889,9 @@ function MetersPanel({
   utilities: string[];
   onUtility: (v: Utility) => void;
   meters: Meter[];
+  /** Mọi điểm đo của dự án (mọi loại năng lượng) — để biết đồng hồ nào đã gắn cho điểm đo khác. */
+  allMeters: Meter[];
+  projectId: string;
   devices: CatalogDevice[];
   addMeterHref?: string;
   onMetersChange: (rows: Meter[]) => void;
@@ -863,6 +900,28 @@ function MetersPanel({
   const [dropHint, setDropHint] = useState<{ id: string; position: DropPosition } | null>(null);
 
   const depthMap = useMemo(() => buildMeterDepthMap(meters), [meters]);
+
+  const cleanSerial = (value: string | null | undefined) => (value ?? "").trim().replace(/^SN:\s*/i, "").toLowerCase();
+  const serialOf = (meter: Meter) =>
+    cleanSerial(meter.serialNumber) || cleanSerial(devices.find((device) => device.id === meter.deviceId)?.sn);
+
+  /** Đồng hồ đang gắn cho điểm đo / dự án khác thì không chọn được (mỗi đồng hồ chỉ gắn một điểm đo). */
+  function deviceUsedBy(device: CatalogDevice, pointId: string) {
+    const sn = cleanSerial(device.sn);
+    const otherPoint = allMeters.find(
+      (meter) => meter.id !== pointId && (meter.deviceId === device.id || (sn && serialOf(meter) === sn)),
+    );
+    if (otherPoint) return `đang gắn ở điểm đo ${otherPoint.name}`;
+    const otherProject = (device.projects ?? []).find((link) => link.projectId !== projectId);
+    return otherProject ? `đang gắn ở dự án ${otherProject.projectName}` : "";
+  }
+
+  /** Điểm đo khác trong dự án đang dùng cùng đồng hồ với điểm đo này. */
+  function duplicateOf(meter: Meter) {
+    const sn = serialOf(meter);
+    if (!sn) return [];
+    return allMeters.filter((other) => other.id !== meter.id && serialOf(other) === sn);
+  }
 
   function resolveDropPosition(event: DragEvent<HTMLTableRowElement>): DropPosition {
     const rect = event.currentTarget.getBoundingClientRect();
@@ -1075,11 +1134,14 @@ function MetersPanel({
                             className="h-7 max-w-[180px] rounded border border-slate-200 bg-white px-2 text-[11px] font-medium text-slate-700 outline-none focus:border-emerald-500"
                           >
                             <option value="">-- Đổi / Gán đồng hồ --</option>
-                            {devices.map((dev) => (
-                              <option key={dev.id} value={dev.id}>
-                                {dev.name} ({dev.sn})
-                              </option>
-                            ))}
+                            {devices.map((dev) => {
+                              const usedBy = dev.id === item.deviceId ? "" : deviceUsedBy(dev, item.id);
+                              return (
+                                <option key={dev.id} value={dev.id} disabled={Boolean(usedBy)}>
+                                  {dev.name} ({dev.sn}){usedBy ? ` — ${usedBy}` : ""}
+                                </option>
+                              );
+                            })}
                           </CustomSelect>
                           <input
                             value={item.serialNumber ?? assigned?.sn ?? ""}
@@ -1096,6 +1158,12 @@ function MetersPanel({
                             className="h-7 w-36 rounded border border-slate-200 bg-white px-2 font-mono text-[11px] text-slate-700 outline-none focus:border-emerald-500"
                           />
                         </div>
+                        {duplicateOf(item).length ? (
+                          <p className="rounded border border-rose-200 bg-rose-50 px-2 py-1 text-[11px] font-medium text-rose-700">
+                            Trùng đồng hồ với điểm đo {duplicateOf(item).map((other) => other.name).join(", ")}. Mỗi đồng hồ chỉ
+                            được gắn cho một điểm đo — hãy đổi hoặc bỏ gán ở một điểm đo.
+                          </p>
+                        ) : null}
                         {item.serialHistory && item.serialHistory.length > 1 ? (
                           <div className="rounded border border-sky-200 bg-sky-50/70 px-2 py-1 text-[10px] text-sky-800">
                             <span className="font-semibold">Lịch sử thay đồng hồ:</span>{" "}
@@ -1206,7 +1274,7 @@ function CostPanel({
   tariffHistory: TariffHistoryEntry[];
   onTariffHistoryChange: (next: TariffHistoryEntry[]) => void;
   onVoltageLevel: (levelId: VoltageLevelId) => void;
-  onTouPrice: (band: TouBand, value: string) => void;
+  onTouPrice: (band: TouBand | "none", value: string) => void;
   flatPrice?: string;
   onFlatPrice: (value: string) => void;
 }) {
@@ -1285,12 +1353,13 @@ function CostPanel({
             </CustomSelect>
           </label>
 
-          <div className="grid gap-3 sm:grid-cols-3">
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
             {(
               [
                 ["normal", "Giờ bình thường", "#27ae60"],
                 ["off", "Giờ thấp điểm", "#7ec8e3"],
                 ["peak", "Giờ cao điểm", "#e67e22"],
+                ["none", "Không xác định", "#9aa3af"],
               ] as const
             ).map(([band, label, color]) => (
               <label key={band} className="rounded-md border border-slate-200 p-3">
@@ -1302,6 +1371,7 @@ function CostPanel({
                   <input
                     value={touPrices[band]}
                     onChange={(e) => onTouPrice(band, e.target.value)}
+                    placeholder={band === "none" ? `Theo giờ bình thường (${touPrices.normal})` : undefined}
                     inputMode="decimal"
                     className="h-10 w-full rounded-md border border-slate-200 pr-16 pl-3 text-sm font-semibold text-slate-800 outline-none focus:border-emerald-500"
                   />
@@ -1346,7 +1416,7 @@ function CostPanel({
             Dòng được tô là đơn giá đang áp dụng và sẽ ghi vào database khi bấm Lưu cấu hình. Các dòng còn lại là biểu giá nhà nước để đối chiếu. Đổi cấp điện áp sẽ điền lại đơn giá theo biểu giá đó.
           </p>
 
-          <div className="grid gap-2 text-[12px] text-slate-600 sm:grid-cols-3">
+          <div className="grid gap-2 text-[12px] text-slate-600 sm:grid-cols-2 lg:grid-cols-4">
             <p className="rounded-md bg-slate-50 px-3 py-2">
               <span className="block font-semibold text-slate-700">Giờ thấp điểm</span>
               00:00 – 06:00, tất cả các ngày trong tuần.
@@ -1358,6 +1428,11 @@ function CostPanel({
             <p className="rounded-md bg-slate-50 px-3 py-2">
               <span className="block font-semibold text-slate-700">Giờ cao điểm</span>
               17:30 – 22:30 từ thứ Hai đến thứ Bảy. Chủ nhật không có giờ cao điểm.
+            </p>
+            <p className="rounded-md bg-slate-50 px-3 py-2">
+              <span className="block font-semibold text-slate-700">Không xác định</span>
+              Điện năng tích lại trong khoảng mất dữ liệu / hỏng đồng hồ kéo dài qua từ 2 khung giờ trở lên (không biết
+              dùng vào giờ nào). Bỏ trống đơn giá thì tính theo giờ bình thường.
             </p>
           </div>
 
@@ -1545,43 +1620,14 @@ function CostPanel({
   );
 }
 
-function groupToChartId(groupId: string): MeterChartId | null {
-  switch (groupId) {
-    case "energy":
-      return "energy";
-    case "ui":
-      return "ui";
-    case "frequency":
-      return "freq";
-    case "power":
-      return "power";
-    case "harmonics":
-      return "harm";
-    case "imbalance":
-      return "unbalance";
-    default:
-      return null;
-  }
-}
-
-function parametersForAlertGroup(groupId: string): MeterParameter[] {
-  const chartId = groupToChartId(groupId);
-  if (!chartId) return METER_PARAMETERS;
-  const primary = parametersForChart(chartId);
-  return primary.length > 0 ? primary : METER_PARAMETERS;
-}
-
 function AlertsPanel({
   classify,
   onClassify,
   categories,
   activeGroupId,
   onActiveGroup,
-  onCategoriesChange,
   rulesByGroup,
   onRulesByGroupChange,
-  notifications,
-  onNotificationsChange,
   meters,
   liveMeterValues,
   severityByCategory,
@@ -1598,11 +1644,8 @@ function AlertsPanel({
   categories: UserAlertCategoryTab[];
   activeGroupId: UserAlertGroupId;
   onActiveGroup: (id: UserAlertGroupId) => void;
-  onCategoriesChange: (next: UserAlertCategoryTab[]) => void;
   rulesByGroup: Record<string, UserAlertRule[]>;
   onRulesByGroupChange: (next: Record<string, UserAlertRule[]>) => void;
-  notifications: NotificationChannelsConfig;
-  onNotificationsChange: (next: NotificationChannelsConfig) => void;
   meters: ClientMeter[];
   liveMeterValues: Record<string, { at: string; values: Record<string, number> }>;
   severityByCategory: Record<AlertCategoryId, AlertSeverityLevel>;
@@ -1614,105 +1657,73 @@ function AlertsPanel({
   peakWarn: boolean;
   onPeakWarn: (v: boolean) => void;
 }) {
-  const [selectedMeterId, setSelectedMeterId] = useState<string>("all");
-  const [addingTag, setAddingTag] = useState(false);
-  const [newTagName, setNewTagName] = useState("");
   const [showSeverityDefaults, setShowSeverityDefaults] = useState(false);
+  /** Ngưỡng đang mở danh sách điểm đo. */
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
 
   const activeCategory = categories.find((c) => c.id === activeGroupId) ?? categories[0];
   const currentGroupId = activeCategory?.id ?? "energy";
-  const allRulesInGroup = rulesByGroup[currentGroupId] ?? [];
-  const visibleRules =
-    selectedMeterId === "all"
-      ? allRulesInGroup
-      : allRulesInGroup.filter((r) => !r.meterPointId || r.meterPointId === selectedMeterId);
-
-  const groupParams = useMemo(() => parametersForAlertGroup(currentGroupId), [currentGroupId]);
-
-  const combinedLiveValues = useMemo(() => {
-    if (selectedMeterId !== "all" && liveMeterValues[selectedMeterId]) {
-      return liveMeterValues[selectedMeterId].values;
-    }
-    const merged: Record<string, number> = {};
-    for (const entry of Object.values(liveMeterValues)) {
-      for (const [k, v] of Object.entries(entry.values)) {
-        if (merged[k] === undefined && typeof v === "number" && Number.isFinite(v)) {
-          merged[k] = v;
-        }
-      }
-    }
-    return merged;
-  }, [liveMeterValues, selectedMeterId]);
-
-  function updateGroupRules(nextList: UserAlertRule[]) {
-    onRulesByGroupChange({
-      ...rulesByGroup,
-      [currentGroupId]: nextList,
-    });
-  }
+  const rulesInGroup = rulesByGroup[currentGroupId] ?? [];
 
   function updateRule(ruleId: string, patch: Partial<UserAlertRule>) {
-    updateGroupRules(
-      allRulesInGroup.map((item) => (item.id === ruleId ? { ...item, ...patch } : item)),
-    );
-  }
-
-  function addRule() {
-    const fallbackParam = groupParams[allRulesInGroup.length % Math.max(groupParams.length, 1)] ?? METER_PARAMETERS[0];
-    const nextRule: UserAlertRule = {
-      id: `rule-${currentGroupId}-${Date.now()}`,
-      groupId: currentGroupId,
-      name: fallbackParam ? `Ngưỡng ${fallbackParam.name}` : `Ngưỡng cảnh báo #${allRulesInGroup.length + 1}`,
-      parameterKey: fallbackParam?.key ?? "",
-      minValue: "",
-      maxValue: "",
-      unit: fallbackParam?.unit ?? "",
-      severity: "warning",
-      enabled: true,
-      meterPointId: selectedMeterId === "all" ? undefined : selectedMeterId,
-      description: fallbackParam ? `Tham số đo: ${fallbackParam.key} (${fallbackParam.group})` : "",
-    };
-    updateGroupRules([...allRulesInGroup, nextRule]);
-  }
-
-  function removeRule(ruleId: string) {
-    updateGroupRules(allRulesInGroup.filter((item) => item.id !== ruleId));
-  }
-
-  function restoreDefaultGroupRules() {
-    const defaults = DEFAULT_USER_ALERT_RULES[currentGroupId];
-    if (defaults?.length) {
-      updateGroupRules(defaults.map((item) => ({ ...item, id: `${item.id}-${Date.now()}` })));
-    }
-  }
-
-  function handleAddCategory() {
-    const label = newTagName.trim();
-    if (!label) return;
-    const slug = `custom-${label.toLowerCase().replace(/\s+/g, "-")}-${Date.now().toString().slice(-4)}`;
-    const nextCategories = [...categories, { id: slug, label }];
-    onCategoriesChange(nextCategories);
     onRulesByGroupChange({
       ...rulesByGroup,
-      [slug]: [],
+      [currentGroupId]: rulesInGroup.map((item) => (item.id === ruleId ? { ...item, ...patch } : item)),
     });
-    onActiveGroup(slug);
-    setNewTagName("");
-    setAddingTag(false);
   }
 
-  function handleRemoveCategory(catId: string) {
-    if (categories.length <= 1) return;
-    const nextCategories = categories.filter((c) => c.id !== catId);
-    onCategoriesChange(nextCategories);
-    if (activeGroupId === catId && nextCategories[0]) {
-      onActiveGroup(nextCategories[0].id);
-    }
+  function updatePoint(rule: UserAlertRule, pointId: string, patch: Partial<AlertPointSetting>) {
+    const current = rule.points?.[pointId] ?? { enabled: true, minValue: "", maxValue: "" };
+    const next = { ...current, ...patch };
+    const points = { ...(rule.points ?? {}) };
+    // Điểm đo bật + không đặt ngưỡng riêng = mặc định: không cần lưu.
+    if (next.enabled && !next.minValue.trim() && !next.maxValue.trim()) delete points[pointId];
+    else points[pointId] = next;
+    updateRule(rule.id, { points });
+  }
+
+  function toggleRule(rule: UserAlertRule) {
+    const enabled = !rule.enabled;
+    updateRule(rule.id, { enabled });
+    setExpandedIds((current) => {
+      const next = new Set(current);
+      if (enabled) next.add(rule.id);
+      else next.delete(rule.id);
+      return next;
+    });
+  }
+
+  function toggleExpanded(ruleId: string) {
+    setExpandedIds((current) => {
+      const next = new Set(current);
+      if (next.has(ruleId)) next.delete(ruleId);
+      else next.add(ruleId);
+      return next;
+    });
+  }
+
+  function restoreLibraryRules() {
+    onRulesByGroupChange({
+      ...rulesByGroup,
+      [currentGroupId]: rulesInGroup.map((rule) => ({
+        ...rule,
+        enabled: true,
+        severity: "warning",
+        minValue: rule.libraryMin ?? rule.minValue,
+        maxValue: rule.libraryMax ?? rule.maxValue,
+        points: undefined,
+      })),
+    });
+  }
+
+  /** Điểm đo áp dụng được cho ngưỡng: tham số điện chỉ áp cho điểm đo điện. */
+  function metersForRule(rule: UserAlertRule) {
+    const electric = METER_PARAMETERS.some((param) => param.key === rule.parameterKey);
+    return electric ? meters.filter((meter) => (meter.utility || "Điện") === "Điện") : meters;
   }
 
   return (
     <div className="space-y-5">
-      {/* Bộ lọc Phân loại & Điểm đo áp dụng */}
       <div className="grid gap-3 sm:grid-cols-2">
         <div>
           <p className="mb-1.5 text-[11px] font-semibold tracking-[0.08em] text-slate-400">
@@ -1728,26 +1739,13 @@ function AlertsPanel({
             <option value="Mức độ phân loại lỗi">Mức độ phân loại cảnh báo theo danh mục</option>
           </CustomSelect>
         </div>
-        <div>
-          <p className="mb-1.5 text-[11px] font-semibold tracking-[0.08em] text-slate-400">
-            ĐIỂM ĐO ÁP DỤNG
-          </p>
-          <CustomSelect
-            value={selectedMeterId}
-            onChange={(e) => setSelectedMeterId(e.target.value)}
-            className="h-10 w-full rounded-md border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none focus:border-emerald-500"
-          >
-            <option value="all">Tất cả điểm đo trong dự án ({meters.length} điểm đo)</option>
-            {meters.map((m) => (
-              <option key={m.id} value={m.id}>
-                {m.name} ({m.code})
-              </option>
-            ))}
-          </CustomSelect>
+        <div className="rounded-md border border-emerald-100 bg-emerald-50/50 px-3 py-2 text-[11px] leading-relaxed text-emerald-800">
+          Danh sách ngưỡng lấy từ thư viện cảnh báo của dự án (do quản trị viên cấu hình). Bật một ngưỡng để chọn
+          điểm đo áp dụng và đặt ngưỡng riêng cho từng điểm đo; để trống thì dùng ngưỡng mặc định.
         </div>
       </div>
 
-      {/* Thanh tab nhóm cảnh báo: Energy | U/I | Tần số | Công suất | Sóng hài | Mất cân bằng pha */}
+      {/* Nhóm cảnh báo của thư viện */}
       <div>
         <div className="mb-2 flex items-center justify-between gap-2">
           <p className="text-[11px] font-semibold tracking-[0.08em] text-slate-400">
@@ -1784,78 +1782,22 @@ function AlertsPanel({
                 >
                   {count}
                 </span>
-                {categories.length > 1 ? (
-                  <span
-                    role="presentation"
-                    title="Xóa nhóm"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      handleRemoveCategory(cat.id);
-                    }}
-                    className="ml-0.5 text-[12px] opacity-70 hover:opacity-100"
-                  >
-                    ×
-                  </span>
-                ) : null}
               </button>
             );
           })}
-          {addingTag ? (
-            <div className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-300 bg-emerald-50/60 p-1">
-              <input
-                value={newTagName}
-                onChange={(e) => setNewTagName(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    handleAddCategory();
-                  }
-                }}
-                placeholder="Tên nhóm mới..."
-                className="h-7 w-36 rounded border border-slate-200 bg-white px-2 text-xs outline-none focus:border-emerald-500"
-              />
-              <button
-                type="button"
-                onClick={handleAddCategory}
-                className="h-7 rounded bg-emerald-600 px-2.5 text-xs font-semibold text-white hover:bg-emerald-700"
-              >
-                Thêm
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setAddingTag(false);
-                  setNewTagName("");
-                }}
-                className="h-7 px-1.5 text-xs text-slate-500 hover:text-slate-700"
-              >
-                Hủy
-              </button>
-            </div>
-          ) : (
-            <button
-              type="button"
-              onClick={() => setAddingTag(true)}
-              className="inline-flex h-9 items-center gap-1 rounded-lg border border-dashed border-emerald-300 bg-emerald-50/40 px-3 text-xs font-semibold text-emerald-700 hover:bg-emerald-50"
-            >
-              + Thêm mới
-            </button>
-          )}
         </div>
       </div>
 
       {/* Bảng mức độ mặc định theo danh mục (khi bấm mở hoặc chọn phân loại Mức độ phân loại lỗi) */}
       {showSeverityDefaults || classify === "Mức độ phân loại lỗi" ? (
         <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-4">
-          <div className="mb-3 flex items-center justify-between">
-            <div>
-              <p className="text-xs font-bold tracking-wide text-slate-700 uppercase">
-                Mức độ cảnh báo mặc định theo danh mục lỗi
-              </p>
-              <p className="text-[11px] text-slate-500">
-                Áp dụng phân loại mức độ (Nghiêm trọng / Cảnh báo / Thông tin) cho các cảnh báo chung thuộc từng danh mục.
-              </p>
-            </div>
+          <div className="mb-3">
+            <p className="text-xs font-bold tracking-wide text-slate-700 uppercase">
+              Mức độ cảnh báo mặc định theo danh mục lỗi
+            </p>
+            <p className="text-[11px] text-slate-500">
+              Áp dụng phân loại mức độ (Nghiêm trọng / Cảnh báo / Thông tin) cho các cảnh báo chung thuộc từng danh mục.
+            </p>
           </div>
           <div className="grid gap-2.5 sm:grid-cols-2 lg:grid-cols-3">
             {ALERT_CATEGORY_OPTIONS.map((option) => (
@@ -1888,7 +1830,7 @@ function AlertsPanel({
         </div>
       ) : null}
 
-      {/* Danh sách cấu hình ngưỡng chi tiết của nhóm đang chọn */}
+      {/* Danh sách ngưỡng của nhóm đang chọn (từ thư viện) */}
       <div className="rounded-xl border border-slate-200 bg-white">
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 bg-slate-50/70 px-4 py-3">
           <div>
@@ -1896,257 +1838,180 @@ function AlertsPanel({
               Danh sách ngưỡng cảnh báo · {activeCategory?.label ?? currentGroupId}
             </h3>
             <p className="mt-0.5 text-[11px] text-slate-500">
-              Cài đặt ngưỡng giới hạn dưới (Min) và giới hạn trên (Max) cho các thông số đo thực tế từ đồng hồ.
+              Bật ngưỡng để chọn điểm đo áp dụng. Min / Max riêng của từng điểm đo để trống thì dùng ngưỡng mặc định.
             </p>
           </div>
-          <div className="flex flex-wrap items-center gap-2">
-            {DEFAULT_USER_ALERT_RULES[currentGroupId] ? (
-              <button
-                type="button"
-                onClick={restoreDefaultGroupRules}
-                className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-600 hover:bg-slate-50"
-              >
-                Khôi phục mặc định
-              </button>
-            ) : null}
+          {rulesInGroup.length ? (
             <button
               type="button"
-              onClick={addRule}
-              className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-emerald-600 px-3 text-xs font-semibold text-white shadow-xs hover:bg-emerald-700"
+              onClick={restoreLibraryRules}
+              className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-600 hover:bg-slate-50"
             >
-              + Thêm ngưỡng cảnh báo
+              Khôi phục theo thư viện
             </button>
-          </div>
+          ) : null}
         </div>
 
-        {visibleRules.length === 0 ? (
-          <div className="px-4 py-10 text-center">
-            <p className="text-sm font-medium text-slate-500">
-              Chưa có ngưỡng cảnh báo nào trong nhóm {activeCategory?.label}.
-            </p>
-            <div className="mt-3 flex justify-center gap-2">
-              {DEFAULT_USER_ALERT_RULES[currentGroupId] ? (
-                <button
-                  type="button"
-                  onClick={restoreDefaultGroupRules}
-                  className="rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50"
-                >
-                  Nạp bộ ngưỡng tiêu chuẩn
-                </button>
-              ) : null}
-              <button
-                type="button"
-                onClick={addRule}
-                className="rounded-lg bg-emerald-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-emerald-700"
-              >
-                + Thêm ngưỡng cảnh báo đầu tiên
-              </button>
-            </div>
-          </div>
+        {rulesInGroup.length === 0 ? (
+          <p className="px-4 py-10 text-center text-sm font-medium text-slate-500">
+            Thư viện cảnh báo của dự án chưa có ngưỡng nào trong nhóm {activeCategory?.label}. Liên hệ quản trị viên để
+            thêm ngưỡng.
+          </p>
         ) : (
           <div className="divide-y divide-slate-100">
-            {visibleRules.map((rule, idx) => {
+            {rulesInGroup.map((rule, idx) => {
               const matchedParam = METER_PARAMETERS.find((p) => p.key === rule.parameterKey);
-              const liveValue = rule.parameterKey
-                ? readMeterValue(combinedLiveValues, rule.parameterKey)
-                : null;
-              const minNum = rule.minValue.trim() !== "" ? Number(rule.minValue) : null;
-              const maxNum = rule.maxValue.trim() !== "" ? Number(rule.maxValue) : null;
-              const isViolated =
-                rule.enabled &&
-                liveValue !== null &&
-                ((minNum !== null && Number.isFinite(minNum) && liveValue < minNum) ||
-                  (maxNum !== null && Number.isFinite(maxNum) && liveValue > maxNum));
               const unitDisplay = rule.unit || matchedParam?.unit || "";
+              const ruleMeters = metersForRule(rule);
+              const appliedCount = ruleMeters.filter((meter) => ruleThresholdsForPoint(rule, meter.id)).length;
+              const expanded = rule.enabled && expandedIds.has(rule.id);
+              const defaultText = [
+                rule.minValue.trim() ? `Min ${rule.minValue}` : "",
+                rule.maxValue.trim() ? `Max ${rule.maxValue}` : "",
+              ]
+                .filter(Boolean)
+                .join(" · ");
 
               return (
-                <div
-                  key={rule.id}
-                  className={`p-4 transition-colors ${
-                    !rule.enabled
-                      ? "bg-slate-50/50 opacity-65"
-                      : isViolated
-                        ? "bg-rose-50/30"
-                        : "bg-white hover:bg-slate-50/40"
-                  }`}
-                >
-                  <div className="grid gap-3 lg:grid-cols-12 lg:items-center">
-                    {/* Cột 1: STT + Bật/tắt + Tên cảnh báo */}
-                    <div className="flex items-start gap-2.5 lg:col-span-4">
-                      <button
-                        type="button"
-                        role="switch"
-                        aria-checked={rule.enabled}
-                        title={rule.enabled ? "Đang bật cảnh báo" : "Đang tắt cảnh báo"}
-                        onClick={() => updateRule(rule.id, { enabled: !rule.enabled })}
-                        className={`mt-2 relative h-5 w-9 shrink-0 rounded-full transition-colors ${
-                          rule.enabled ? "bg-emerald-600" : "bg-slate-300"
-                        }`}
-                      >
-                        <span
-                          className="absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all"
-                          style={{ left: rule.enabled ? 18 : 2 }}
-                        />
-                      </button>
-                      <div className="min-w-0 flex-1">
-                        <label className="mb-1 block text-[10px] font-bold tracking-wider text-slate-400 uppercase">
-                          #{idx + 1} · Tên cảnh báo
-                        </label>
-                        <input
-                          value={rule.name}
-                          onChange={(e) => updateRule(rule.id, { name: e.target.value })}
-                          placeholder="Nhập tên cảnh báo..."
-                          className="h-9 w-full rounded-lg border border-slate-200 bg-white px-2.5 text-xs font-semibold text-slate-800 outline-none focus:border-emerald-500"
-                        />
-                      </div>
-                    </div>
-
-                    {/* Cột 2: Tham số đo từ đồng hồ */}
-                    <div className="lg:col-span-3">
-                      <label className="mb-1 block text-[10px] font-bold tracking-wider text-slate-400 uppercase">
-                        Tham số đo (Gateway)
-                      </label>
-                      <CustomSelect
-                        value={rule.parameterKey}
-                        onChange={(e) => {
-                          const nextKey = e.target.value;
-                          const param = METER_PARAMETERS.find((p) => p.key === nextKey);
-                          updateRule(rule.id, {
-                            parameterKey: nextKey,
-                            unit: param?.unit ?? rule.unit,
-                            name:
-                              !rule.name || rule.name.startsWith("Ngưỡng ")
-                                ? param
-                                  ? `Ngưỡng ${param.name} (${param.key})`
-                                  : rule.name
-                                : rule.name,
-                          });
-                        }}
-                        className="h-9 w-full rounded-lg border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 outline-none focus:border-emerald-500"
-                      >
-                        <option value="">-- Chọn tham số đo --</option>
-                        {groupParams.map((p) => (
-                          <option key={p.key} value={p.key}>
-                            {p.key} — {p.name} {p.unit ? `(${p.unit})` : ""}
-                          </option>
-                        ))}
-                        {METER_PARAMETERS.filter((p) => !groupParams.some((gp) => gp.key === p.key)).map(
-                          (p) => (
-                            <option key={p.key} value={p.key}>
-                              [{p.group}] {p.key} — {p.name} {p.unit ? `(${p.unit})` : ""}
-                            </option>
-                          ),
-                        )}
-                      </CustomSelect>
-                    </div>
-
-                    {/* Cột 3: Ngưỡng Min & Max */}
-                    <div className="grid grid-cols-2 gap-2 lg:col-span-3">
-                      <div>
-                        <label className="mb-1 block text-[10px] font-bold tracking-wider text-slate-400 uppercase">
-                          Ngưỡng thấp (Min)
-                        </label>
-                        <div className="relative">
-                          <input
-                            value={rule.minValue}
-                            onChange={(e) => updateRule(rule.id, { minValue: e.target.value })}
-                            placeholder="Không giới hạn"
-                            inputMode="decimal"
-                            className="h-9 w-full rounded-lg border border-slate-200 bg-white pr-8 pl-2.5 font-mono text-xs font-semibold text-slate-800 outline-none focus:border-emerald-500"
-                          />
-                          {unitDisplay ? (
-                            <span className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 text-[10px] font-semibold text-slate-400">
-                              {unitDisplay}
-                            </span>
-                          ) : null}
-                        </div>
-                      </div>
-                      <div>
-                        <label className="mb-1 block text-[10px] font-bold tracking-wider text-slate-400 uppercase">
-                          Ngưỡng cao (Max)
-                        </label>
-                        <div className="relative">
-                          <input
-                            value={rule.maxValue}
-                            onChange={(e) => updateRule(rule.id, { maxValue: e.target.value })}
-                            placeholder="Không giới hạn"
-                            inputMode="decimal"
-                            className="h-9 w-full rounded-lg border border-slate-200 bg-white pr-8 pl-2.5 font-mono text-xs font-semibold text-slate-800 outline-none focus:border-emerald-500"
-                          />
-                          {unitDisplay ? (
-                            <span className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 text-[10px] font-semibold text-slate-400">
-                              {unitDisplay}
-                            </span>
-                          ) : null}
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Cột 4: Mức độ + Xóa */}
-                    <div className="flex items-end gap-2 lg:col-span-2">
-                      <div className="min-w-0 flex-1">
-                        <label className="mb-1 block text-[10px] font-bold tracking-wider text-slate-400 uppercase">
-                          Mức độ
-                        </label>
-                        <CustomSelect
-                          value={rule.severity}
-                          onChange={(e) =>
-                            updateRule(rule.id, { severity: e.target.value as AlertSeverityLevel })
-                          }
-                          className={`h-9 w-full rounded-lg border px-2 text-xs font-semibold outline-none ${
-                            rule.severity === "critical"
-                              ? "border-rose-200 bg-rose-50 text-rose-700"
-                              : rule.severity === "warning"
-                                ? "border-amber-200 bg-amber-50 text-amber-800"
-                                : "border-slate-200 bg-slate-50 text-slate-700"
-                          }`}
-                        >
-                          <option value="critical">Nghiêm trọng</option>
-                          <option value="warning">Cảnh báo</option>
-                          <option value="info">Thông tin</option>
-                        </CustomSelect>
-                      </div>
-                      <button
-                        type="button"
-                        title="Xóa ngưỡng cảnh báo này"
-                        onClick={() => removeRule(rule.id)}
-                        className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-slate-200 text-slate-400 hover:border-rose-200 hover:bg-rose-50 hover:text-rose-600"
-                      >
-                        ×
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Dòng thông tin phụ: Giá trị đo thực tế hiện tại + mô tả */}
-                  <div className="mt-2 flex flex-wrap items-center justify-between gap-2 pl-0 sm:pl-11 text-[11px]">
-                    <div className="flex flex-wrap items-center gap-3">
+                <div key={rule.id} className={`p-4 ${rule.enabled ? "bg-white" : "bg-slate-50/50"}`}>
+                  <div className="flex flex-wrap items-start gap-3">
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={rule.enabled}
+                      title={rule.enabled ? "Đang bật — bấm để tắt" : "Bấm để bật và chọn điểm đo áp dụng"}
+                      onClick={() => toggleRule(rule)}
+                      className={`mt-1 relative h-5 w-9 shrink-0 rounded-full transition-colors ${
+                        rule.enabled ? "bg-emerald-600" : "bg-slate-300"
+                      }`}
+                    >
                       <span
-                        className={`inline-flex items-center gap-1.5 rounded-md px-2 py-0.5 font-mono font-semibold ${
-                          liveValue === null
-                            ? "bg-slate-100 text-slate-500"
-                            : isViolated
-                              ? "bg-rose-100 text-rose-700 ring-1 ring-rose-300"
-                              : "bg-emerald-50 text-emerald-700"
-                        }`}
-                      >
-                        <span
-                          className={`h-1.5 w-1.5 rounded-full ${
-                            liveValue === null
-                              ? "bg-slate-400"
-                              : isViolated
-                                ? "bg-rose-600 animate-pulse"
-                                : "bg-emerald-500"
-                          }`}
-                        />
-                        Giá trị thực hiện tại:{" "}
-                        {liveValue !== null ? `${liveValue} ${unitDisplay}`.trim() : "Chưa có mẫu đo"}
-                        {isViolated ? " (Vượt ngưỡng!)" : ""}
-                      </span>
-                      {rule.description ? (
-                        <span className="text-slate-400">{rule.description}</span>
+                        className="absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all"
+                        style={{ left: rule.enabled ? 18 : 2 }}
+                      />
+                    </button>
+                    <div className={`min-w-0 flex-1 ${rule.enabled ? "" : "opacity-65"}`}>
+                      <p className="text-sm font-semibold text-slate-800">
+                        <span className="mr-1.5 text-[11px] font-bold text-slate-400">#{idx + 1}</span>
+                        {rule.name}
+                      </p>
+                      <p className="mt-0.5 text-[11px] text-slate-500">
+                        <span className="font-mono font-semibold text-slate-600">{rule.parameterKey}</span>
+                        {matchedParam ? ` — ${matchedParam.name}` : ""}
+                        {unitDisplay ? ` (${unitDisplay})` : ""} · Ngưỡng mặc định:{" "}
+                        <span className="font-mono font-semibold text-slate-700">
+                          {defaultText ? `${defaultText}${unitDisplay ? ` ${unitDisplay}` : ""}` : "chưa đặt"}
+                        </span>
+                      </p>
+                      {rule.enabled ? (
+                        <button
+                          type="button"
+                          onClick={() => toggleExpanded(rule.id)}
+                          className="mt-1.5 text-[11px] font-semibold text-emerald-700 hover:underline"
+                        >
+                          {expanded ? "▾" : "▸"} Áp dụng {appliedCount}/{ruleMeters.length} điểm đo
+                          {expanded ? "" : " — bấm để xem / chỉnh"}
+                        </button>
                       ) : null}
                     </div>
+                    <div className="w-36 shrink-0">
+                      <CustomSelect
+                        value={rule.severity}
+                        onChange={(e) => updateRule(rule.id, { severity: e.target.value as AlertSeverityLevel })}
+                        className={`h-9 w-full rounded-lg border px-2 text-xs font-semibold outline-none ${
+                          rule.severity === "critical"
+                            ? "border-rose-200 bg-rose-50 text-rose-700"
+                            : rule.severity === "warning"
+                              ? "border-amber-200 bg-amber-50 text-amber-800"
+                              : "border-slate-200 bg-slate-50 text-slate-700"
+                        }`}
+                      >
+                        <option value="critical">Nghiêm trọng</option>
+                        <option value="warning">Cảnh báo</option>
+                        <option value="info">Thông tin</option>
+                      </CustomSelect>
+                    </div>
                   </div>
+
+                  {expanded ? (
+                    <div className="mt-3 overflow-x-auto rounded-lg border border-slate-200 sm:ml-12">
+                      {ruleMeters.length === 0 ? (
+                        <p className="px-3 py-4 text-center text-xs text-slate-400">Dự án chưa có điểm đo phù hợp.</p>
+                      ) : (
+                        <table className="w-full min-w-[560px] text-left text-xs">
+                          <thead>
+                            <tr className="border-b border-slate-100 bg-slate-50 text-[10px] font-bold tracking-wider text-slate-400 uppercase">
+                              <th className="px-3 py-2">Điểm đo</th>
+                              <th className="px-3 py-2">Giá trị hiện tại</th>
+                              <th className="px-3 py-2">Ngưỡng thấp (Min)</th>
+                              <th className="px-3 py-2">Ngưỡng cao (Max)</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100">
+                            {ruleMeters.map((meter) => {
+                              const setting = rule.points?.[meter.id];
+                              const limits = ruleThresholdsForPoint(rule, meter.id);
+                              const applied = Boolean(limits);
+                              const live = liveMeterValues[meter.id]?.values;
+                              const liveValue = live && rule.parameterKey ? readMeterValue(live, rule.parameterKey) : null;
+                              const minNum = limits?.minValue.trim() ? Number(limits.minValue) : null;
+                              const maxNum = limits?.maxValue.trim() ? Number(limits.maxValue) : null;
+                              const violated =
+                                applied &&
+                                liveValue !== null &&
+                                ((minNum !== null && Number.isFinite(minNum) && liveValue < minNum) ||
+                                  (maxNum !== null && Number.isFinite(maxNum) && liveValue > maxNum));
+                              return (
+                                <tr key={meter.id} className={applied ? (violated ? "bg-rose-50/40" : "") : "bg-slate-50/60 text-slate-400"}>
+                                  <td className="px-3 py-2">
+                                    <label className="inline-flex cursor-pointer items-center gap-2 font-semibold text-slate-700">
+                                      <input
+                                        type="checkbox"
+                                        checked={applied}
+                                        onChange={() => updatePoint(rule, meter.id, { enabled: !applied })}
+                                        className="accent-emerald-600"
+                                      />
+                                      <span className={applied ? "" : "text-slate-400"}>
+                                        {meter.name} <span className="font-normal text-slate-400">({meter.code})</span>
+                                      </span>
+                                    </label>
+                                  </td>
+                                  <td className="px-3 py-2 font-mono">
+                                    {liveValue !== null ? (
+                                      <span className={violated ? "font-bold text-rose-600" : "text-emerald-700"}>
+                                        {liveValue} {unitDisplay}
+                                        {violated ? " (vượt ngưỡng)" : ""}
+                                      </span>
+                                    ) : (
+                                      <span className="text-slate-400">Chưa có mẫu đo</span>
+                                    )}
+                                  </td>
+                                  {(["minValue", "maxValue"] as const).map((field) => (
+                                    <td key={field} className="px-3 py-2">
+                                      <input
+                                        value={setting?.[field] ?? ""}
+                                        disabled={!applied}
+                                        onChange={(e) => updatePoint(rule, meter.id, { [field]: e.target.value })}
+                                        placeholder={rule[field].trim() ? `Mặc định ${rule[field]}` : "Không giới hạn"}
+                                        inputMode="decimal"
+                                        className="h-8 w-full min-w-[120px] rounded-md border border-slate-200 bg-white px-2 font-mono text-xs font-semibold text-slate-800 outline-none focus:border-emerald-500 disabled:bg-slate-50"
+                                      />
+                                    </td>
+                                  ))}
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      )}
+                    </div>
+                  ) : null}
+
+                  {rule.description ? (
+                    <p className={`mt-2 text-[11px] text-slate-400 sm:pl-12 ${rule.enabled ? "" : "opacity-65"}`}>
+                      {rule.description}
+                    </p>
+                  ) : null}
                 </div>
               );
             })}
@@ -2615,7 +2480,142 @@ function IconBtn({
   );
 }
 
-function NavIcon({ type, className }: { type: "doc" | "nodes" | "cash" | "warn" | "user"; className?: string }) {
+type NavIconType = "doc" | "nodes" | "cash" | "warn" | "user" | "chart";
+
+/** Cấu hình → Tham số biểu đồ: tích chọn tham số được vẽ trên từng biểu đồ. */
+function ChartParamsPanel({
+  config,
+  onChange,
+  showMarkers,
+  onShowMarkers,
+}: {
+  config: ChartParameterConfig;
+  onChange: (next: ChartParameterConfig) => void;
+  showMarkers: boolean;
+  onShowMarkers: (next: boolean) => void;
+}) {
+  const selectedFor = (tabId: ChartParamTabId) => new Set(config[tabId] ?? allTabKeys(tabId));
+  const setTabKeys = (tabId: ChartParamTabId, keys: Set<string>) => {
+    // Giữ thứ tự gốc của tham số.
+    onChange({ ...config, [tabId]: allTabKeys(tabId).filter((key) => keys.has(key)) });
+  };
+
+  return (
+    <div className="space-y-4">
+      <section className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-200 bg-white p-4">
+        <div className="min-w-0">
+          <h3 className="text-sm font-bold text-slate-800">Dấu chấm điểm dữ liệu</h3>
+          <p className="mt-0.5 text-xs text-slate-500">
+            Hiện dấu chấm tại từng lần đọc trên biểu đồ đường theo thời gian (Tần số, Chỉ số điện năng, Tất cả tham số...).
+            Khi tắt, biểu đồ chỉ còn đường; rê chuột vẫn hiện điểm và giá trị.
+          </p>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={showMarkers}
+          onClick={() => onShowMarkers(!showMarkers)}
+          className="inline-flex items-center gap-2.5 text-sm font-semibold text-slate-700"
+        >
+          <span
+            className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${
+              showMarkers ? "bg-emerald-600" : "bg-slate-300"
+            }`}
+          >
+            <span
+              className={`inline-block h-5 w-5 rounded-full bg-white shadow transition-transform ${
+                showMarkers ? "translate-x-5" : "translate-x-0.5"
+              }`}
+            />
+          </span>
+          {showMarkers ? "Đang hiện" : "Đang ẩn"}
+        </button>
+      </section>
+      {CHART_PARAMETER_TABS.map((chart) => {
+        const selected = selectedFor(chart.id);
+        const total = allTabKeys(chart.id).length;
+        return (
+          <section key={chart.id} className="rounded-lg border border-slate-200 bg-white p-4">
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+              <h3 className="text-sm font-bold text-slate-800">
+                {chart.label}
+                <span className="ml-2 text-xs font-medium text-slate-400">
+                  {selected.size}/{total} tham số
+                </span>
+              </h3>
+              <div className="flex gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setTabKeys(chart.id, new Set(allTabKeys(chart.id)))}
+                  className="h-7 rounded-md border border-slate-200 bg-white px-2.5 text-xs font-semibold text-slate-600 hover:bg-slate-50"
+                >
+                  Chọn tất cả
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTabKeys(chart.id, new Set())}
+                  className="h-7 rounded-md border border-slate-200 bg-white px-2.5 text-xs font-semibold text-slate-600 hover:bg-slate-50"
+                >
+                  Bỏ chọn
+                </button>
+              </div>
+            </div>
+            <div className="space-y-2.5">
+              {chart.sections.map((section) => (
+                <div key={section.id} className="grid gap-2 sm:grid-cols-[180px_minmax(0,1fr)] sm:items-start">
+                  <span className="pt-1 text-xs font-semibold text-slate-500">{section.label}</span>
+                  <div className="flex flex-wrap gap-1.5">
+                    {section.series.map((item) => {
+                      const checked = selected.has(item.key);
+                      return (
+                        <button
+                          key={item.key}
+                          type="button"
+                          aria-pressed={checked}
+                          onClick={() => {
+                            const next = new Set(selected);
+                            if (checked) next.delete(item.key);
+                            else next.add(item.key);
+                            setTabKeys(chart.id, next);
+                          }}
+                          className={`inline-flex h-8 items-center gap-1.5 rounded-md border px-2.5 text-xs font-semibold transition-colors ${
+                            checked
+                              ? "border-emerald-500 bg-emerald-50 text-emerald-700"
+                              : "border-slate-200 bg-white text-slate-400 hover:border-slate-300 hover:text-slate-600"
+                          }`}
+                        >
+                          <span
+                            className={`flex h-3.5 w-3.5 items-center justify-center rounded-[3px] border text-[9px] leading-none ${
+                              checked ? "border-emerald-600 bg-emerald-600 text-white" : "border-slate-300 bg-white"
+                            }`}
+                          >
+                            {checked ? "✓" : ""}
+                          </span>
+                          <span className="font-mono">{item.key}</span>
+                          <span className="font-normal text-slate-400">{item.label}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+        );
+      })}
+    </div>
+  );
+}
+
+function NavIcon({ type, className }: { type: NavIconType; className?: string }) {
+  if (type === "chart") {
+    return (
+      <svg className={className} viewBox="0 0 24 24" fill="none" aria-hidden>
+        <path d="M4 19h16" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+        <path d="m5 15 4-5 4 3 6-7" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    );
+  }
   if (type === "nodes") {
     return (
       <svg className={className} viewBox="0 0 24 24" fill="none" aria-hidden>

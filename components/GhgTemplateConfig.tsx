@@ -1,5 +1,6 @@
 "use client";
 
+import { EmissionTabs } from "@/components/EmissionTabs";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { CustomSelect } from "@/components/ui/CustomSelect";
@@ -166,16 +167,19 @@ export function GhgTemplateConfig() {
   }
 
   return (
-    <div className="mx-auto max-w-[1100px] space-y-6 p-4 font-sans sm:p-6 lg:p-8">
+    <div className="mx-auto max-w-[1400px] space-y-6 p-4 font-sans sm:p-6 lg:p-8">
+      <div>
+        <EmissionTabs />
+      </div>
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <h1 className="text-xl font-bold tracking-tight text-slate-900 sm:text-2xl">Nguồn phát thải thủ công</h1>
+        <h1 className="text-xl font-bold tracking-tight text-slate-900 sm:text-2xl">Công thức phát thải</h1>
         {!formOpen ? (
           <button
             type="button"
             onClick={openNew}
             className="h-10 rounded-xl bg-emerald-600 px-4 text-sm font-semibold text-white shadow-sm hover:bg-emerald-700"
           >
-            + Thêm nguồn phát thải
+            + Thêm công thức
           </button>
         ) : null}
       </div>
@@ -183,7 +187,7 @@ export function GhgTemplateConfig() {
       {formOpen ? (
         <section className="space-y-5 rounded-2xl border border-slate-200/80 bg-white p-4 shadow-sm sm:p-6">
           <h2 className="text-[15px] font-semibold text-slate-800">
-            {draft.id ? "Sửa nguồn phát thải" : "Thêm nguồn phát thải"}
+            {draft.id ? "Sửa công thức phát thải" : "Thêm công thức phát thải"}
           </h2>
           <Field label="TÊN NGUỒN PHÁT THẢI">
             <input
@@ -358,7 +362,7 @@ export function GhgTemplateConfig() {
               {templates.length === 0 ? (
                 <tr>
                   <td colSpan={5} className="px-4 py-10 text-center text-slate-400">
-                    Chưa có nguồn phát thải nào.
+                    Chưa có công thức phát thải nào.
                   </td>
                 </tr>
               ) : (
@@ -400,7 +404,7 @@ export function GhgTemplateConfig() {
 
       <ConfirmDialog
         open={Boolean(toDelete)}
-        title="Xóa nguồn phát thải"
+        title="Xóa công thức phát thải"
         description={`Xóa "${toDelete?.name}" khỏi danh sách? Các nguồn đã thêm vào dự án vẫn giữ nguyên cấu hình.`}
         onConfirm={() => {
           if (!toDelete) return;

@@ -34,11 +34,20 @@ import {
 } from "@/lib/gateway-series";
 import { formatStoredVietnam, vietnamFromStored } from "@/lib/vietnam-time";
 import { hydrateMeterReadings, type MeterReading } from "@/lib/meter-readings";
-import { civilWeekday, industrialBand } from "@/lib/industrial-electricity";
+import {
+  bandForGap,
+  civilWeekday,
+  industrialBand,
+  industrialBandAt,
+  inferSlotMs,
+} from "@/lib/industrial-electricity";
 import { METER_PARAMETERS, registerToKwh } from "@/lib/meter-parameters";
+import { readChartParameterConfig, type ChartParameterConfig } from "@/lib/chart-parameters";
+import { readChartShowMarkers, setChartDisplay } from "@/lib/chart-display";
+import { hydrateProjectSettings } from "@/lib/project-settings";
 
 type EnergyKind = string;
-type MetricId = "energy" | "ui" | "freq" | "power" | "pf" | "harm" | "unbalance" | "all_params" | "pst";
+type MetricId = "energy" | "ui" | "freq" | "power" | "pf" | "harm" | "unbalance" | "pst";
 type ViewMode = "chart" | "table";
 
 type MeterPoint = {
@@ -67,7 +76,6 @@ const METRICS: { id: MetricId; label: string }[] = [
   { id: "pf", label: "Hệ số công suất" },
   { id: "harm", label: "Sóng hài" },
   { id: "unbalance", label: "Mất cân bằng pha" },
-  { id: "all_params", label: "Tất cả tham số (97+ & Động)" },
   { id: "pst", label: "Pst/Plt" },
 ];
 
@@ -245,6 +253,9 @@ function energyAndTouFromSlots(filter: TimeFilterValue, slots: GatewayEnergySlot
   );
   let previous: number | null = null;
   let lastMeterId: string | undefined;
+  // Khung dữ liệu trước (để biết phần điện năng tích lại có vắt qua khoảng mất dữ liệu nhiều khung giờ không).
+  let prevAt: string | null = null;
+  const slotMs = inferSlotMs(ordered.map((slot) => slotStoredAt(slot.day, slot.hour, slot.minute)));
   for (let i = 0; i < ordered.length; i++) {
     const slot = ordered[i];
     const startKwh = registerToKwh(slot.firstWh);
@@ -284,6 +295,7 @@ function energyAndTouFromSlots(filter: TimeFilterValue, slots: GatewayEnergySlot
           }
         }
         previous = Math.max(prevVal, endKwh);
+        prevAt = slotStoredAt(slot.day, slot.hour, slot.minute);
         continue;
       }
     }
@@ -303,12 +315,15 @@ function energyAndTouFromSlots(filter: TimeFilterValue, slots: GatewayEnergySlot
       const parts = vietnamFromStored(at);
       if (parts) {
         const band = industrialBand(civilWeekday(parts.year, parts.month, parts.day), parts.hour, parts.minute);
-        tou[band] += delta;
+        tou[band] += within;
+        // Phần tích lại sau khoảng mất dữ liệu vắt qua nhiều khung giờ → Không xác định.
+        if (gap > 0) tou[bandForGap(prevAt, at, slotMs, industrialBandAt)] += gap;
       } else {
         tou.none += delta;
       }
     }
     previous = endKwh;
+    prevAt = at;
     if (slot.meterId) lastMeterId = slot.meterId;
   }
   return {
@@ -399,7 +414,6 @@ function metricMeta(energy: EnergyKind, metric: MetricId) {
     pf: { title: "Hệ số công suất (PF / DPF)", unit: "COSΦ" },
     harm: { title: "Sóng hài (THD)", unit: "PHẦN TRĂM (%)" },
     unbalance: { title: "Mất cân bằng pha", unit: "PHẦN TRĂM (%)" },
-    all_params: { title: "Tra cứu toàn bộ tham số (>97 tham số & Động)", unit: "" },
     pst: { title: "Nháy sáng Pst/Plt", unit: "CHỈ SỐ PST" },
   };
   return map[metric];
@@ -408,9 +422,24 @@ function metricMeta(energy: EnergyKind, metric: MetricId) {
 export function EnergyCharts() {
   const params = useParams<{ id: string }>();
   const projectId = params?.id ?? "default";
+  // Tham số vẽ trên từng biểu đồ (Cấu hình → Tham số biểu đồ).
+  const [chartParams, setChartParams] = useState<ChartParameterConfig>({});
+  useEffect(() => {
+    let active = true;
+    void hydrateProjectSettings(projectId, { force: true })
+      .then((settings) => {
+        if (!active) return;
+        setChartParams(readChartParameterConfig(settings));
+        setChartDisplay({ showMarkers: readChartShowMarkers(settings) });
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, [projectId]);
   const [energyKinds, setEnergyKinds] = useState<EnergyKind[]>(["Điện", "Nước", "Nhiệt", "Hơi"]);
   const [energy, setEnergy] = useState<EnergyKind>("Điện");
-  const [metric, setMetric] = useState<MetricId>("energy");
+  const [metricChoice, setMetric] = useState<MetricId>("energy");
   const [view, setView] = useState<ViewMode>("chart");
   const [zoom, setZoom] = useState(1);
   const [hover, setHover] = useState<number | null>(null);
@@ -721,6 +750,10 @@ export function EnergyCharts() {
     setRange({ start: 0, end: Math.max(barCount - 1, 0) });
   }, [timeFilter, barCount]);
 
+  // Pst/Plt (nháy sáng): tab chỉ hiện khi đồng hồ có gửi các chỉ số này.
+  const pstKeys = useMemo(() => flickerKeys(liveSamples), [liveSamples]);
+  const metric: MetricId = metricChoice === "pst" && pstKeys.length === 0 ? "energy" : metricChoice;
+
   const isElectric = energy === "Điện";
   /** Tiêu thụ năng lượng/hạ tầng — áp dụng mọi loại (Điện, Nước, …) */
   const isConsumptionChart = metric === "energy";
@@ -731,14 +764,14 @@ export function EnergyCharts() {
   const isPfChart = isElectric && metric === "pf";
   const isHarmChart = isElectric && metric === "harm";
   const isUnbChart = isElectric && metric === "unbalance";
-  const isAllParamsChart = metric === "all_params";
-  const meta = metricMeta(energy, isElectric || metric === "all_params" ? metric : "energy");
+  const isPstChart = isElectric && metric === "pst";
+  const meta = metricMeta(energy, isElectric ? metric : "energy");
   const yMax = isConsumptionChart ? 7 : Math.max(...values.flat(), 1) * 1.08;
   const yMin = isConsumptionChart ? 0 : Math.min(0, Math.min(...values.flat()) * 0.92);
 
-  // Rời tab Điện → giữ chế độ tiêu thụ hoặc tất cả tham số
+  // Rời tab Điện → về chế độ tiêu thụ
   useEffect(() => {
-    if (!isElectric && metric !== "energy" && metric !== "all_params") {
+    if (!isElectric && metric !== "energy") {
       setMetric("energy");
     }
   }, [isElectric, metric]);
@@ -1043,7 +1076,10 @@ export function EnergyCharts() {
             />
           </div>
           <div className="mt-2 flex items-center gap-1 overflow-x-auto border-t border-slate-100 pt-2 pb-0.5 scrollbar-none sm:flex-wrap">
-            {(isElectric ? METRICS : METRICS.filter((m) => m.id === "energy" || m.id === "all_params")).map(
+            {(isElectric
+              ? METRICS.filter((m) => m.id !== "pst" || pstKeys.length > 0)
+              : METRICS.filter((m) => m.id === "energy")
+            ).map(
               (item) => (
                 <button
                   key={item.id}
@@ -1063,26 +1099,27 @@ export function EnergyCharts() {
         </div>
 
         <div className="min-w-0 flex-1 md:min-h-0 md:overflow-y-auto p-2 sm:p-3">
-        {isAllParamsChart ? (
-          <AllParametersExplorer samples={liveSamples} onRefresh={handleRefresh} />
+        {isPstChart ? (
+          <PstTrend keys={pstKeys} samples={liveSamples} onRefresh={handleRefresh} />
         ) : isUiChart ? (
           <section className="w-full min-w-0 rounded-lg border border-slate-200 bg-white p-2 shadow-[0_1px_2px_rgba(16,24,40,0.04)] sm:p-3">
-            <UiWaveform timeFilter={timeFilter} samples={liveSamples} onRefresh={handleRefresh} />
+            <UiWaveform timeFilter={timeFilter} samples={liveSamples} onRefresh={handleRefresh} chartParams={chartParams} />
           </section>
         ) : isFreqChart ? (
           <FrequencyChart
             timeFilter={timeFilter}
             samples={liveSamples}
             onRefresh={handleRefresh}
+            chartParams={chartParams}
           />
         ) : isPowerChart ? (
-          <PowerChart timeFilter={timeFilter} samples={liveSamples} onRefresh={handleRefresh} />
+          <PowerChart timeFilter={timeFilter} samples={liveSamples} onRefresh={handleRefresh} chartParams={chartParams} />
         ) : isPfChart ? (
-          <PowerFactorChart samples={liveSamples} onRefresh={handleRefresh} />
+          <PowerFactorChart timeFilter={timeFilter} samples={liveSamples} onRefresh={handleRefresh} chartParams={chartParams} />
         ) : isHarmChart ? (
-          <HarmonicsChart timeFilter={timeFilter} samples={liveSamples} onRefresh={handleRefresh} />
+          <HarmonicsChart timeFilter={timeFilter} samples={liveSamples} onRefresh={handleRefresh} chartParams={chartParams} />
         ) : isUnbChart ? (
-          <UnbalanceChart timeFilter={timeFilter} samples={liveSamples} onRefresh={handleRefresh} />
+          <UnbalanceChart timeFilter={timeFilter} samples={liveSamples} onRefresh={handleRefresh} chartParams={chartParams} />
         ) : isConsumptionChart ? (
           <>
             <div className="flex w-full min-w-0 flex-col gap-4">
@@ -1267,7 +1304,7 @@ export function EnergyCharts() {
               <div className="grid w-full min-w-0 grid-cols-1 gap-4 md:grid-cols-2">
                 <article className="min-w-0 rounded-lg border border-slate-200 bg-white p-4 shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
                   <h2 className="text-center text-[13px] font-bold tracking-wide text-slate-700">
-                    TỔNG HỢP TIÊU THỤ THEO ĐIỂM ĐO
+                    {energy === "Điện" ? "TỔNG ĐIỆN NĂNG TIÊU THỤ" : `TỔNG ${energy.toUpperCase()} TIÊU THỤ`}
                   </h2>
                   <ConsumptionDonut
                     value={grandTotal}
@@ -1485,16 +1522,16 @@ function MultiConsumptionBarChart({
   const innerH = H - pad.t - pad.b;
   const base = series[0]?.bars ?? [];
   const visibleLen = Math.max(range.end - range.start + 1, 1);
-  const rawMax = Math.max(
-    0,
-    ...series.flatMap((s) => s.bars.slice(range.start, range.end + 1).map((b) => b.kwh)),
-  );
+  // Cột xếp chồng: mỗi mốc thời gian là một cột, mỗi điểm đo là một đoạn của cột.
+  const valueAt = (item: { bars: BarPoint[] }, index: number) => Math.max(0, item.bars[index]?.kwh ?? 0);
+  const totalAt = (index: number) => series.reduce((sum, item) => sum + valueAt(item, index), 0);
+  const rawMax = Math.max(0, ...Array.from({ length: visibleLen }, (_, i) => totalAt(range.start + i)));
   const yMax =
     rawMax > 0 && rawMax < 50 ? rawMax * 1.25 : Math.max(yMaxHint, Math.ceil(Math.max(rawMax, 1) / 50) * 50);
   const yAt = (v: number) => pad.t + ((yMax - v) / yMax) * innerH;
   const groupW = innerW / visibleLen;
-  const barCount = Math.max(series.length, 1);
-  const barW = groupW / (barCount + 0.6);
+  const colW = Math.max(2, groupW * 0.7);
+  const tipW = 250;
   const tickStep =
     yMax <= 0.01 ? yMax / 4 : yMax <= 1 ? 0.2 : yMax <= 10 ? 2 : yMax <= 100 ? 20 : yMax <= 300 ? 50 : 100;
   const yTicks = Array.from({ length: Math.floor(yMax / tickStep) + 1 }, (_, i) => i * tickStep);
@@ -1529,24 +1566,38 @@ function MultiConsumptionBarChart({
         })}
         {Array.from({ length: visibleLen }, (_, i) => {
           const globalIndex = range.start + i;
-          return series.map((item, sIdx) => {
-            const point = item.bars[globalIndex];
-            if (!point) return null;
-            const x = pad.l + i * groupW + groupW * 0.15 + sIdx * barW;
-            const h = Math.max(0, yAt(0) - yAt(point.kwh));
-            return (
-              <rect
-                key={`${item.point.id}-${point.minute}`}
-                x={x}
-                y={yAt(point.kwh)}
-                width={Math.max(2, barW * 0.85)}
-                height={h}
-                fill={item.point.color}
-                opacity={hover == null || hover === globalIndex ? 1 : 0.4}
-                onMouseEnter={() => onHover(globalIndex)}
-              />
-            );
-          });
+          if (!base[globalIndex]) return null;
+          const x = pad.l + i * groupW + (groupW - colW) / 2;
+          let stacked = 0;
+          return (
+            <g
+              key={`col-${globalIndex}`}
+              opacity={hover == null || hover === globalIndex ? 1 : 0.4}
+              onMouseEnter={() => onHover(globalIndex)}
+            >
+              {/* Vùng bắt hover cả chiều cao để rê vào cột thấp vẫn hiện chi tiết. */}
+              <rect x={pad.l + i * groupW} y={pad.t} width={groupW} height={innerH} fill="transparent" />
+              {series.map((item) => {
+                const value = valueAt(item, globalIndex);
+                if (value <= 0) return null;
+                const y0 = yAt(stacked);
+                stacked += value;
+                const y1 = yAt(stacked);
+                return (
+                  <rect
+                    key={item.point.id}
+                    x={x}
+                    y={y1}
+                    width={colW}
+                    height={Math.max(0, y0 - y1)}
+                    fill={item.point.color}
+                    stroke="white"
+                    strokeWidth={series.length > 1 ? 0.5 : 0}
+                  />
+                );
+              })}
+            </g>
+          );
         })}
         {(() => {
           const maxLabels = Math.max(3, Math.floor(innerW / 46));
@@ -1574,26 +1625,43 @@ function MultiConsumptionBarChart({
             );
           });
         })()}
-        {hover != null && base[hover] ? (
-          <g transform={`translate(${Math.min(pad.l + (hover - range.start) * groupW + 12, W - 180)}, ${pad.t + 6})`}>
-            <rect width="168" height={20 + series.length * 16} rx="4" fill="white" stroke="#e2e8f0" />
-            <text x="10" y="16" className="fill-slate-500 font-semibold" fontSize="11">
-              {base[hover].label}
-            </text>
-            {series.map((item, i) => (
-              <text
-                key={item.point.id}
-                x="10"
-                y={34 + i * 16}
-                fontSize="11"
-                fontWeight="600"
-                fill={item.point.color}
-              >
-                {item.point.code}: {formatKwh(item.bars[hover]?.kwh ?? 0)} {unit}
-              </text>
-            ))}
-          </g>
-        ) : null}
+        {hover != null && base[hover]
+          ? (() => {
+              const total = totalAt(hover);
+              const colX = pad.l + (hover - range.start) * groupW;
+              // Cột ở nửa phải thì đặt tooltip bên trái cột để không che/tràn khung.
+              const tipX =
+                colX + groupW / 2 > W / 2 ? Math.max(pad.l, colX - tipW - 8) : Math.min(colX + groupW + 8, W - tipW - 4);
+              const shortName = (name: string) => (name.length > 16 ? `${name.slice(0, 15)}…` : name);
+              return (
+                <g transform={`translate(${tipX}, ${pad.t + 6})`} pointerEvents="none">
+                  <rect width={tipW} height={44 + series.length * 17} rx="6" fill="white" stroke="#e2e8f0" />
+                  <text x="10" y="17" className="fill-slate-500" fontSize="11" fontWeight="600">
+                    {base[hover].label}
+                  </text>
+                  <text x="10" y="35" className="fill-slate-800" fontSize="12" fontWeight="700">
+                    Tổng: {formatKwh(total)} {unit}
+                  </text>
+                  {series.map((item, i) => {
+                    const value = valueAt(item, hover);
+                    const pct = total > 0 ? (value / total) * 100 : 0;
+                    const y = 54 + i * 17;
+                    return (
+                      <g key={item.point.id}>
+                        <rect x="10" y={y - 9} width="9" height="9" rx="2" fill={item.point.color} />
+                        <text x="24" y={y} fontSize="11" className="fill-slate-600">
+                          {shortName(item.point.name || item.point.code)}
+                        </text>
+                        <text x={tipW - 10} y={y} fontSize="11" fontWeight="600" textAnchor="end" fill={item.point.color}>
+                          {formatKwh(value)} {unit} ({formatAppNumber(pct, { minDecimals: 1, maxDecimals: 1 })}%)
+                        </text>
+                      </g>
+                    );
+                  })}
+                </g>
+              );
+            })()
+          : null}
       </svg>
       ) : null}
     </div>
@@ -1651,7 +1719,7 @@ const TOU_COLORS = [
   { id: "peak", label: "Cao", color: "#e67e22" },
   { id: "normal", label: "Trung", color: "#27ae60" },
   { id: "off", label: "Thấp", color: "#7ec8e3" },
-  { id: "none", label: "Không", color: "#9aa3af" },
+  { id: "none", label: "Không xác định", color: "#9aa3af" },
 ] as const;
 
 function TouConsumptionChart({
@@ -1661,7 +1729,7 @@ function TouConsumptionChart({
 }) {
   const W = 300;
   const H = 180;
-  const pad = { l: 18, r: 18, t: 28, b: 28 };
+  const pad = { l: 18, r: 18, t: 28, b: 38 };
   const innerW = W - pad.l - pad.r;
   const yMax = Math.max(values.peak, values.normal, values.off, values.none, 1);
   const yAt = (v: number) => pad.t + ((yMax - v) / yMax) * (H - pad.t - pad.b);
@@ -1700,8 +1768,20 @@ function TouConsumptionChart({
               height={h}
               fill={item.color}
             />
-            <text x={x + barW / 2} y={H - 6} textAnchor="middle" className="fill-slate-600" fontSize="12">
-              {item.label}
+            <text x={x + barW / 2} y={H - 18} textAnchor="middle" className="fill-slate-600" fontSize="12">
+              {/* Nhãn dài (VD "Không xác định") xuống hai dòng để không chồng lên cột bên cạnh. */}
+              {item.label.length > 8 && item.label.includes(" ") ? (
+                <>
+                  <tspan x={x + barW / 2}>{item.label.split(" ")[0]}</tspan>
+                  <tspan x={x + barW / 2} dy="13">
+                    {item.label.split(" ").slice(1).join(" ")}
+                  </tspan>
+                </>
+              ) : (
+                <tspan x={x + barW / 2} dy="6">
+                  {item.label}
+                </tspan>
+              )}
             </text>
           </g>
         );
@@ -1997,6 +2077,25 @@ const SERIES_PALETTE = [
   "#ea7ccc",
 ];
 
+type EnergyRegisterKind = "P" | "Q" | "S";
+type EnergyRegisterDir = "in" | "out";
+
+/** Chỉ số điện năng 2 chiều: P (tác dụng), Q (phản kháng), S (biểu kiến) × điện vào (nhận) / điện ra (phát). */
+const ENERGY_REGISTERS: { key: string; kind: EnergyRegisterKind; dir: EnergyRegisterDir; unit: string; color: string }[] = [
+  { key: "EPaed", kind: "P", dir: "in", unit: "kWh", color: "#5470c6" },
+  { key: "EPaer", kind: "P", dir: "out", unit: "kWh", color: "#91cc75" },
+  { key: "EQred", kind: "Q", dir: "in", unit: "kVARh", color: "#fac858" },
+  { key: "EQrer", kind: "Q", dir: "out", unit: "kVARh", color: "#ee6666" },
+  { key: "ESaed", kind: "S", dir: "in", unit: "kVAh", color: "#73c0de" },
+  { key: "ESaer", kind: "S", dir: "out", unit: "kVAh", color: "#9a60b4" },
+];
+
+/** Bật/tắt một lựa chọn (cho phép bỏ chọn hết). */
+function toggleItem<T>(list: T[], value: T) {
+  if (list.includes(value)) return list.filter((item) => item !== value);
+  return [...list, value];
+}
+
 function BidirectionalEnergyTrend({
   samples,
   nodeName,
@@ -2007,70 +2106,23 @@ function BidirectionalEnergyTrend({
   nodeName?: string;
   onRefresh?: () => void;
 }) {
-  const [group, setGroup] = useState<"active" | "reactive" | "apparent" | "all">("active");
+  const [kinds, setKinds] = useState<EnergyRegisterKind[]>(["P"]);
+  const [dirs, setDirs] = useState<EnergyRegisterDir[]>(["in", "out"]);
 
-  const series = useMemo<TrendSeriesConfig[]>(() => {
-    const all: TrendSeriesConfig[] = [
-      {
-        key: "EPaed",
-        label: "Điện năng tiêu thụ - EPaed (kWh)",
-        tableLabel: "Điện năng nhận (kWh)",
-        color: "#5470c6",
-        unit: "kWh",
+  const series = useMemo<TrendSeriesConfig[]>(
+    () =>
+      ENERGY_REGISTERS.filter((item) => kinds.includes(item.kind) && dirs.includes(item.dir)).map((item) => ({
+        key: item.key,
+        label: `${item.dir === "in" ? "Điện vào" : "Điện ra"} ${item.kind} - ${item.key} (${item.unit})`,
+        tableLabel: `${item.dir === "in" ? "Vào" : "Ra"} ${item.kind} (${item.unit})`,
+        color: item.color,
+        unit: item.unit,
         digits: 3,
-        extract: (s) => (typeof s.values.EPaed === "number" ? registerToKwh(s.values.EPaed) : null),
-      },
-      {
-        key: "EPaer",
-        label: "Điện năng phát ngược - EPaer (kWh)",
-        tableLabel: "Điện năng phát (kWh)",
-        color: "#91cc75",
-        unit: "kWh",
-        digits: 3,
-        extract: (s) => (typeof s.values.EPaer === "number" ? registerToKwh(s.values.EPaer) : null),
-      },
-      {
-        key: "EQred",
-        label: "Phản kháng nhận - EQred (kVARh)",
-        tableLabel: "Phản kháng nhận (kVARh)",
-        color: "#fac858",
-        unit: "kVARh",
-        digits: 3,
-        extract: (s) => (typeof s.values.EQred === "number" ? registerToKwh(s.values.EQred) : null),
-      },
-      {
-        key: "EQrer",
-        label: "Phản kháng phát - EQrer (kVARh)",
-        tableLabel: "Phản kháng phát (kVARh)",
-        color: "#ee6666",
-        unit: "kVARh",
-        digits: 3,
-        extract: (s) => (typeof s.values.EQrer === "number" ? registerToKwh(s.values.EQrer) : null),
-      },
-      {
-        key: "ESaed",
-        label: "Biểu kiến nhận - ESaed (kVAh)",
-        tableLabel: "Biểu kiến nhận (kVAh)",
-        color: "#73c0de",
-        unit: "kVAh",
-        digits: 3,
-        extract: (s) => (typeof s.values.ESaed === "number" ? registerToKwh(s.values.ESaed) : null),
-      },
-      {
-        key: "ESaer",
-        label: "Biểu kiến phát - ESaer (kVAh)",
-        tableLabel: "Biểu kiến phát (kVAh)",
-        color: "#9a60b4",
-        unit: "kVAh",
-        digits: 3,
-        extract: (s) => (typeof s.values.ESaer === "number" ? registerToKwh(s.values.ESaer) : null),
-      },
-    ];
-    if (group === "active") return all.slice(0, 2);
-    if (group === "reactive") return all.slice(2, 4);
-    if (group === "apparent") return all.slice(4, 6);
-    return all;
-  }, [group]);
+        extract: (sample) =>
+          typeof sample.values[item.key] === "number" ? registerToKwh(sample.values[item.key]) : null,
+      })),
+    [kinds, dirs],
+  );
 
   return (
     <SampleTrendChart
@@ -2080,16 +2132,34 @@ function BidirectionalEnergyTrend({
       samples={samples}
       onRefresh={onRefresh}
       headerControls={
-        <CustomSelect
-          value={group}
-          onChange={(e) => setGroup(e.target.value as "active" | "reactive" | "apparent" | "all")}
-          className="h-8 min-w-[240px] rounded-md border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-700 outline-none focus:border-emerald-500"
-        >
-          <option value="active">Điện năng tiêu thụ & phát ngược (kWh)</option>
-          <option value="reactive">Điện năng phản kháng nhận & phát (kVARh)</option>
-          <option value="apparent">Điện năng biểu kiến nhận & phát (kVAh)</option>
-          <option value="all">Tất cả 6 chỉ số điện năng</option>
-        </CustomSelect>
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[12px] font-medium text-slate-700">
+          <div className="inline-flex items-center gap-3 rounded-lg border border-slate-200 bg-slate-50/70 px-2.5 py-1 shadow-2xs">
+            {(["P", "Q", "S"] as EnergyRegisterKind[]).map((kind) => (
+              <label key={kind} className="inline-flex cursor-pointer items-center gap-1.5">
+                <input
+                  type="checkbox"
+                  checked={kinds.includes(kind)}
+                  onChange={() => setKinds((list) => toggleItem(list, kind))}
+                  className="accent-emerald-600"
+                />
+                {kind === "P" ? "P (kWh)" : kind === "Q" ? "Q (kVARh)" : "S (kVAh)"}
+              </label>
+            ))}
+          </div>
+          <div className="inline-flex items-center gap-3 rounded-lg border border-slate-200 bg-slate-50/70 px-2.5 py-1 shadow-2xs">
+            {(["in", "out"] as EnergyRegisterDir[]).map((dir) => (
+              <label key={dir} className="inline-flex cursor-pointer items-center gap-1.5">
+                <input
+                  type="checkbox"
+                  checked={dirs.includes(dir)}
+                  onChange={() => setDirs((list) => toggleItem(list, dir))}
+                  className="accent-emerald-600"
+                />
+                {dir === "in" ? "Điện vào" : "Điện ra"}
+              </label>
+            ))}
+          </div>
+        </div>
       }
     />
   );
@@ -2140,156 +2210,46 @@ function DynamicUtilityTrend({
   );
 }
 
-function AllParametersExplorer({
+/** Khoá chỉ số nháy sáng (Pst / Plt, theo pha) có trong bản tin gateway. */
+function flickerKeys(samples: ProjectGatewaySample[]) {
+  const found = new Set<string>();
+  for (const sample of samples) {
+    for (const [key, value] of Object.entries(sample.values)) {
+      if (/^p(st|lt)/i.test(key) && typeof value === "number" && Number.isFinite(value)) found.add(key);
+    }
+  }
+  // Pst trước Plt, rồi theo tên (Psta, Pstb, Pstc...).
+  return [...found].sort((a, b) => a.slice(0, 3).toLowerCase().localeCompare(b.slice(0, 3).toLowerCase()) * -1 || a.localeCompare(b));
+}
+
+const FLICKER_COLORS = ["#5470c6", "#91cc75", "#fac858", "#ee6666", "#73c0de", "#3ba272", "#fc8452", "#9a60b4"];
+
+function PstTrend({
+  keys,
   samples,
   onRefresh,
 }: {
-  samples?: ProjectGatewaySample[];
+  keys: string[];
+  samples: ProjectGatewaySample[];
   onRefresh?: () => void;
 }) {
-  const knownKeySet = useMemo(() => new Set(METER_PARAMETERS.map((p) => p.key)), []);
-
-  // Phát hiện mọi tham số động (VD: Pressure, Flow, WaterFlow, Temp...) mà Gateway bắn lên ngoài 97 tham số chuẩn
-  const dynamicKeys = useMemo(() => {
-    const found = new Set<string>();
-    for (const sample of samples ?? []) {
-      for (const [k, v] of Object.entries(sample.values)) {
-        if (typeof v === "number" && Number.isFinite(v) && !knownKeySet.has(k)) {
-          found.add(k);
-        }
-      }
-    }
-    return Array.from(found);
-  }, [knownKeySet, samples]);
-
-  const groups = useMemo(() => {
-    const base = Array.from(new Set(METER_PARAMETERS.map((p) => p.group)));
-    return [...base, "Tham số động / Mở rộng từ Gateway"];
-  }, []);
-
-  const [selectedGroup, setSelectedGroup] = useState<string>(() => groups[0] ?? "Trạng thái lưới điện");
-  const [selectedKeys, setSelectedKeys] = useState<string[]>(["Van", "Vbn", "Vcn", "VLNavg"]);
-
-  const groupItems = useMemo(() => {
-    if (selectedGroup === "Tham số động / Mở rộng từ Gateway") {
-      return dynamicKeys.map((k, idx) => ({
-        id: 1000 + idx,
-        key: k,
-        name: `Tham số mở rộng (${k})`,
-        unit: "",
-      }));
-    }
-    return METER_PARAMETERS.filter((p) => p.group === selectedGroup);
-  }, [dynamicKeys, selectedGroup]);
-
-  useEffect(() => {
-    if (!groupItems.length) return;
-    setSelectedKeys(groupItems.slice(0, Math.min(4, groupItems.length)).map((item) => item.key));
-  }, [selectedGroup, groupItems]);
-
-  const toggleKey = (key: string) => {
-    setSelectedKeys((prev) => {
-      if (prev.includes(key)) {
-        return prev.length <= 1 ? prev : prev.filter((item) => item !== key);
-      }
-      return [...prev, key];
-    });
-  };
-
-  const activeSeries = useMemo<TrendSeriesConfig[]>(() => {
-    return selectedKeys.map((key, idx) => {
-      const meta = METER_PARAMETERS.find((p) => p.key === key);
-      return {
+  const series = useMemo<TrendSeriesConfig[]>(
+    () =>
+      keys.map((key, index) => ({
         key,
-        label: meta ? `${key} (${meta.name})` : key,
-        color: SERIES_PALETTE[idx % SERIES_PALETTE.length],
-        unit: meta?.unit ?? "",
-        digits: 2,
-      };
-    });
-  }, [selectedKeys]);
-
-  const unitLabel = activeSeries[0]?.unit || "Giá trị";
-
+        label: key,
+        color: FLICKER_COLORS[index % FLICKER_COLORS.length],
+        digits: 3,
+      })),
+    [keys],
+  );
   return (
-    <div className="space-y-4">
-      <div className="rounded-lg border border-slate-200 bg-white p-3.5 shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
-        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-3">
-          <div>
-            <h3 className="text-[14px] font-bold text-slate-800">
-              Danh mục đầy đủ {METER_PARAMETERS.length} tham số chuẩn + {dynamicKeys.length} tham số mở rộng
-            </h3>
-            <p className="text-[11.5px] text-slate-500">
-              Chọn nhóm thông số và tick các kênh cần kiểm tra trên biểu đồ hoặc xem trong Table Data.
-            </p>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <CustomSelect
-              value={selectedGroup}
-              onChange={(e) => setSelectedGroup(e.target.value)}
-              className="h-8 min-w-[230px] rounded-md border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-700 outline-none focus:border-emerald-500"
-            >
-              {groups.map((g) => (
-                <option key={g} value={g}>
-                  {g}
-                </option>
-              ))}
-            </CustomSelect>
-            <button
-              type="button"
-              onClick={() => setSelectedKeys(groupItems.map((i) => i.key))}
-              className="h-8 rounded border border-emerald-200 bg-emerald-50 px-2.5 text-xs font-semibold text-emerald-700 hover:bg-emerald-100"
-            >
-              Chọn cả nhóm ({groupItems.length})
-            </button>
-          </div>
-        </div>
-
-        {groupItems.length === 0 ? (
-          <p className="py-4 text-center text-xs text-slate-400">
-            Hiện chưa có tham số mở rộng ngoài 97 tham số chuẩn. Khi Gateway bắn thêm khóa mới trong{" "}
-            <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-slate-700">VAL</code> (ví dụ:{" "}
-            <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-slate-700">Pressure</code>,{" "}
-            <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-slate-700">Flow</code>,{" "}
-            <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-slate-700">Temp</code>...), hệ thống sẽ tự động nhận diện và hiển thị tại đây.
-          </p>
-        ) : (
-          <div className="mt-3 grid max-h-40 grid-cols-2 gap-1.5 overflow-y-auto sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6">
-            {groupItems.map((item) => {
-              const checked = selectedKeys.includes(item.key);
-              return (
-                <label
-                  key={item.key}
-                  className={`flex cursor-pointer items-center gap-1.5 rounded border px-2 py-1.5 text-[11.5px] transition-colors ${
-                    checked
-                      ? "border-emerald-500 bg-emerald-50 font-semibold text-emerald-900"
-                      : "border-slate-200 bg-slate-50/60 text-slate-600 hover:bg-slate-100"
-                  }`}
-                >
-                  <input
-                    type="checkbox"
-                    checked={checked}
-                    onChange={() => toggleKey(item.key)}
-                    className="h-3.5 w-3.5 shrink-0 accent-emerald-600"
-                  />
-                  <span className="truncate" title={`${item.key} — ${item.name}`}>
-                    <span className="font-mono font-bold">{item.key}</span>{" "}
-                    <span className="text-[10.5px] text-slate-500">{item.name}</span>
-                  </span>
-                </label>
-              );
-            })}
-          </div>
-        )}
-      </div>
-
-      <SampleTrendChart
-        title={`Biểu đồ chi tiết — ${selectedGroup}`}
-        unitLabel={unitLabel}
-        series={activeSeries}
-        samples={samples}
-        onRefresh={onRefresh}
-      />
-    </div>
+    <SampleTrendChart
+      title="Nháy sáng Pst/Plt theo thời gian thực"
+      unitLabel="Chỉ số"
+      series={series}
+      samples={samples}
+      onRefresh={onRefresh}
+    />
   );
 }

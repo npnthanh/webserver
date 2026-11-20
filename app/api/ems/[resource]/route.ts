@@ -6,6 +6,13 @@ import { getProjectsListTelemetry } from "@/lib/gateway-store";
 import { PROTOCOL_VERSION } from "@/lib/gateway-protocol";
 import { canAccessAdminProject, canManageAccountRole, isAdminRole } from "@/lib/permissions";
 import { ensureAccountProjectsSchema, ensureCustomerAccountsSchema, getServerSession, requirePermission } from "@/lib/server-auth";
+import {
+  dismissResetSuspect,
+  listMeterReplacements,
+  MeterReplacementError,
+  recordMeterReplacement,
+  undoMeterReplacement,
+} from "@/lib/server-meter-replacement";
 import { emsDb, jsonField, queryRows } from "@/lib/server-db";
 import {
   ensureNotifierSchema,
@@ -76,6 +83,7 @@ const RESOURCE_NAMES = new Set([
   "telegram-chats",
   "notifications",
   "project-deletions",
+  "meter-replacements",
 ]);
 
 /** Lỗi nghiệp vụ: thông điệp được trả nguyên văn cho người dùng với HTTP 400. */
@@ -1209,6 +1217,30 @@ async function saveResource(resource: string, body: Row) {
         .filter((serial, index) => serial && currentSerial.get(asString(meters[index].id)) !== serial.toLowerCase());
       const [conflict] = await findSerialConflicts(projectId, serials);
       if (conflict) throw new UserFacingError(serialConflictMessage(conflict));
+
+      // Trong cùng dự án: một đồng hồ chỉ được gắn cho MỘT điểm đo (gắn 2 điểm đo thì dữ liệu bị tính 2 lần).
+      // Chỉ chặn khi có điểm đo vừa gắn / vừa đổi sang đồng hồ đó, để dữ liệu cũ đã trùng không chặn lần lưu khác.
+      const pointsBySerial = new Map<string, { name: string; changed: boolean }[]>();
+      meters.forEach((meter) => {
+        const serial = effectiveSerial(meter.serialNumber, meter.deviceId);
+        if (!serial) return;
+        const key = serial.toLowerCase();
+        const list = pointsBySerial.get(key) ?? [];
+        list.push({
+          name: asString(meter.name) || asString(meter.code) || asString(meter.id),
+          changed: currentSerial.get(asString(meter.id)) !== key,
+        });
+        pointsBySerial.set(key, list);
+      });
+      for (const [serial, points] of pointsBySerial) {
+        if (points.length > 1 && points.some((point) => point.changed)) {
+          throw new UserFacingError(
+            `Đồng hồ serial ${serial} đang được gắn cho ${points.length} điểm đo (${points
+              .map((point) => `"${point.name}"`)
+              .join(", ")}). Mỗi đồng hồ chỉ được gắn cho một điểm đo.`,
+          );
+        }
+      }
     }
     await emsDb
       .query(
@@ -1522,6 +1554,12 @@ export async function GET(request: NextRequest, context: Params) {
       const projectId = request.nextUrl.searchParams.get("projectId") ?? "";
       if (!gate.ok || !canAccessAdminProject(gate.session, projectId)) return forbidden();
     }
+    if (resource === "meter-replacements") {
+      const gate = await requirePermission("viewProjects");
+      const projectId = request.nextUrl.searchParams.get("projectId") ?? "";
+      if (!gate.ok || !canAccessAdminProject(gate.session, projectId)) return forbidden();
+      return Response.json(await listMeterReplacements(projectId));
+    }
     return Response.json(await getResource(resource, request));
   } catch (error) {
     return serverError(error);
@@ -1566,6 +1604,23 @@ export async function POST(request: NextRequest, context: Params) {
         return badRequest("Quyết định không hợp lệ.");
       }
       return Response.json(await decideProjectDeletion(gate.session, Number(body.requestId), decision));
+    }
+    if (resource === "meter-replacements") {
+      const gate = await requirePermission("manageProjects");
+      const projectId = asString(body.projectId).trim();
+      if (!gate.ok || !canAccessAdminProject(gate.session, projectId)) {
+        return forbidden("Bạn không có quyền ghi biên bản thay đồng hồ cho dự án này.");
+      }
+      try {
+        const action = asString(body.action);
+        if (action === "undo") return Response.json(await undoMeterReplacement(projectId, Number(body.id)));
+        if (action === "dismiss") return Response.json(await dismissResetSuspect(projectId, Number(body.id)));
+        if (action === "replace") return Response.json(await recordMeterReplacement(gate.session, projectId, body));
+        return badRequest("Thao tác không hợp lệ.");
+      } catch (error) {
+        if (error instanceof MeterReplacementError) return badRequest(error.message);
+        throw error;
+      }
     }
     if (resource === "meter-models") {
       const gate = await requirePermission("manageDevices");

@@ -2,10 +2,17 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useChartSize } from "@/components/client/useChartSize";
+import { useChartShowMarkers } from "@/lib/chart-display";
 import { exportToExcel } from "@/lib/excel-export";
 import type { ChartSample } from "@/lib/gateway-series";
 import { formatAppNumber } from "@/lib/number-format";
 import { vietnamFromDate } from "@/lib/vietnam-time";
+
+/**
+ * Chiều cao vùng vẽ cho tab chỉ có MỘT biểu đồ (Tần số, Công suất, Hệ số công suất): cao theo màn hình
+ * để không thừa khoảng trống bên dưới; tối thiểu bằng chiều cao mặc định.
+ */
+export const TREND_FILL_HEIGHT = "h-[360px] sm:h-[max(430px,calc(100dvh-420px))]";
 
 export type TrendSeriesConfig = {
   key: string;
@@ -114,6 +121,8 @@ export function SampleTrendChart({
   /** Khoảng cách tối đa giữa 2 bản tin liên tiếp (phút) trước khi ngắt nét để hiển thị mất dữ liệu (loss data). */
   gapMinutes?: number;
 }) {
+  // Dấu chấm tại từng điểm dữ liệu: bật / tắt ở Cấu hình → Tham số biểu đồ (mặc định ẩn).
+  const showMarkers = useChartShowMarkers();
   const [tableMode, setTableMode] = useState(false);
   const [tableScope, setTableScope] = useState<"all" | "zoom">("all");
   const [tableScrollTop, setTableScrollTop] = useState(0);
@@ -306,7 +315,7 @@ export function SampleTrendChart({
   const toggleSeries = (key: string) => {
     setHiddenKeys((prev) => {
       if (prev.includes(key)) return prev.filter((item) => item !== key);
-      if (prev.length >= series.length - 1) return prev;
+      // Cho phép ẩn hết các đường.
       return [...prev, key];
     });
   };
@@ -684,14 +693,16 @@ export function SampleTrendChart({
                   >
                     <svg viewBox="0 0 26 12" className="h-3 w-6 shrink-0" aria-hidden>
                       <line x1="1" y1="6" x2="25" y2="6" stroke={s.color} strokeWidth="1.8" />
-                      <circle
-                        cx="13"
-                        cy="6"
-                        r="3.2"
-                        fill="#ffffff"
-                        stroke={s.color}
-                        strokeWidth="1.8"
-                      />
+                      {showMarkers ? (
+                        <circle
+                          cx="13"
+                          cy="6"
+                          r="3.2"
+                          fill="#ffffff"
+                          stroke={s.color}
+                          strokeWidth="1.8"
+                        />
+                      ) : null}
                     </svg>
                     <span className="text-slate-700">{s.label}</span>
                   </button>
@@ -778,7 +789,8 @@ export function SampleTrendChart({
                 }}
               >
                 {/* Đơn vị trục tung (V, A, Hz, kW, ...) */}
-                <text x={pad.l - 8} y={15} textAnchor="end" className="fill-slate-500" fontSize="11">
+                {/* Canh trái từ mép khung: đơn vị dài (VD "kW / kVAR / kVA" khi tích nhiều nhóm) không bị cắt. */}
+                <text x={4} y={15} textAnchor="start" className="fill-slate-500" fontSize="11">
                   ({unitLabel})
                 </text>
 
@@ -923,7 +935,7 @@ export function SampleTrendChart({
                           strokeLinejoin="round"
                         />
                       ) : null}
-                      {dots.map((pt, i) => {
+                      {(showMarkers ? dots : []).map((pt, i) => {
                         const prev = dots[i - 1];
                         const next = dots[i + 1];
                         const boundary =

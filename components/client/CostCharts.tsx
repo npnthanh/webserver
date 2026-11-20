@@ -27,6 +27,10 @@ import {
   type SavedElectricityCostConfig,
   type TouPrices,
   type VoltageLevelId,
+  bandForGap,
+  inferSlotMs,
+  resolveUnknownPriceAt,
+  type VietnamClockParts,
 } from "@/lib/industrial-electricity";
 import { registerToKwh } from "@/lib/meter-parameters";
 import { hydrateProjectSettings } from "@/lib/project-settings";
@@ -55,7 +59,7 @@ const TOU = [
   { id: "peak", label: "Cao", color: "#e67e22" },
   { id: "normal", label: "Thường", color: "#27ae60" },
   { id: "off", label: "Thấp", color: "#7ec8e3" },
-  { id: "none", label: "Không", color: "#9aa3af" },
+  { id: "none", label: "Không xác định", color: "#9aa3af" },
 ] as const;
 
 type Band = "peak" | "normal" | "off" | "none";
@@ -77,13 +81,32 @@ function emptyKwh(): TouKwh {
   return { peak: 0, normal: 0, off: 0, none: 0 };
 }
 
-function rateAt(source: RateSource, parts: VietnamParts): { price: number; band: Band; label?: string } {
+function sourceConfig(source: Extract<RateSource, { kind: "tou" }>): SavedElectricityCostConfig {
+  return (
+    source.costConfig ?? {
+      electricity: {
+        prices: {
+          normal: String(source.prices.normal),
+          off: String(source.prices.off),
+          peak: String(source.prices.peak),
+        },
+      },
+    }
+  );
+}
+
+function rateAt(
+  source: RateSource,
+  parts: VietnamParts | VietnamClockParts,
+): { price: number; band: Band; label?: string } {
   if (source.kind === "flat") return { price: source.price, band: "normal" };
-  return resolveElectricityRateAt(source.costConfig ?? { electricity: { prices: {
-    normal: String(source.prices.normal),
-    off: String(source.prices.off),
-    peak: String(source.prices.peak),
-  } } }, parts);
+  return resolveElectricityRateAt(sourceConfig(source), parts);
+}
+
+/** Đơn giá phần điện năng "Không xác định" khung giờ (mặc định = giá giờ bình thường). */
+function unknownRateAt(source: RateSource, parts: VietnamParts | VietnamClockParts) {
+  if (source.kind === "flat") return source.price;
+  return resolveUnknownPriceAt(sourceConfig(source), parts);
 }
 
 function slotStoredAt(day: string, hour: number, minute: number) {
@@ -99,12 +122,14 @@ function addSlotCost(
   source: RateSource,
   at: string,
   deltaKwh: number,
+  /** "none": phần điện năng không xác định được khung giờ (khoảng mất dữ liệu vắt qua nhiều khung giờ). */
+  forceBand?: "none",
 ) {
   if (deltaKwh <= 0) return false;
   const parts = vietnamFromStored(at);
   const bucket = periodIndexForInstant(filter, at, bars.length);
   if (!parts || bucket < 0) return false;
-  const rate = rateAt(source, parts);
+  const rate = forceBand ? { price: unknownRateAt(source, parts), band: forceBand } : rateAt(source, parts);
   const cost = deltaKwh * rate.price;
   bars[bucket].dark += cost;
   tou[rate.band] += cost;
@@ -128,6 +153,9 @@ function costBarsFromSlots(filter: TimeFilterValue, slots: GatewayEnergySlot[], 
   let previous: number | null = null;
   let lastMeterId: string | undefined;
   let lastIndexKwh = 0;
+  let prevAt: string | null = null;
+  const slotMs = inferSlotMs(ordered.map((slot) => slotStoredAt(slot.day, slot.hour, slot.minute)));
+  const bandAt = (parts: VietnamClockParts) => rateAt(source, parts).band;
   for (let i = 0; i < ordered.length; i++) {
     const slot = ordered[i];
     const startKwh = registerToKwh(slot.firstWh);
@@ -160,6 +188,7 @@ function costBarsFromSlots(filter: TimeFilterValue, slots: GatewayEnergySlot[], 
         }
         previous = Math.max(prevVal, endKwh);
         lastIndexKwh = previous;
+        prevAt = at;
         continue;
       }
     }
@@ -171,8 +200,12 @@ function costBarsFromSlots(filter: TimeFilterValue, slots: GatewayEnergySlot[], 
     }
     const within = Math.max(0, endKwh - startKwh);
     const gap = previous == null ? 0 : Math.max(0, startKwh - previous);
-    addSlotCost(filter, bars, tou, kwh, source, at, within + gap);
+    // Phần tích lại sau khoảng mất dữ liệu vắt qua nhiều khung giờ → Không xác định (tính theo đơn giá riêng).
+    const gapUnknown = gap > 0 && bandForGap(prevAt, at, slotMs, bandAt) === "none";
+    addSlotCost(filter, bars, tou, kwh, source, at, gapUnknown ? within : within + gap);
+    if (gapUnknown) addSlotCost(filter, bars, tou, kwh, source, at, gap, "none");
     previous = endKwh;
+    prevAt = at;
     if (slot.meterId) lastMeterId = slot.meterId;
     lastIndexKwh = endKwh;
   }
@@ -884,10 +917,10 @@ function MultiCostBarChart({
   const all = series[0]?.bars ?? [];
   const visibleLen = Math.max(range.end - range.start + 1, 1);
   const base = all.slice(range.start, range.end + 1);
-  const maxValue = Math.max(
-    0,
-    ...series.flatMap((s) => s.bars.slice(range.start, range.end + 1).map((b) => b.dark)),
-  );
+  // Cột xếp chồng: mỗi kỳ một cột, mỗi điểm đo một đoạn.
+  const costAt = (item: { bars: CostBar[] }, index: number) => Math.max(0, item.bars[index]?.dark ?? 0);
+  const totalAt = (index: number) => series.reduce((sum, item) => sum + costAt(item, index), 0);
+  const maxValue = Math.max(0, ...base.map((_, i) => totalAt(range.start + i)));
   const yMax = maxValue <= 0
     ? 1000
     : maxValue < 1000
@@ -895,8 +928,8 @@ function MultiCostBarChart({
       : Math.ceil(maxValue / 2000) * 2000;
   const yAt = (v: number) => pad.t + ((yMax - v) / yMax) * innerH;
   const groupW = innerW / visibleLen;
-  const barCount = Math.max(series.length, 1);
-  const barW = Math.max(4, groupW / (barCount + 0.8));
+  const colW = Math.max(3, groupW * 0.7);
+  const tipW = 260;
   const maxLabels = Math.max(3, Math.floor(innerW / 46));
   const labelStep = Math.max(1, Math.ceil(visibleLen / maxLabels));
   const lastStepIdx = Math.floor(Math.max(0, visibleLen - 1) / labelStep) * labelStep;
@@ -929,60 +962,47 @@ function MultiCostBarChart({
         const globalIndex = range.start + i;
         const gx = pad.l + i * groupW;
         const hasSamples = series.some((item) => (item.bars[globalIndex]?.light ?? 0) > 0);
+        const x = gx + (groupW - colW) / 2;
+        const dim = hover == null || hover === globalIndex ? 1 : 0.4;
+        const total = totalAt(globalIndex);
+        let stacked = 0;
         return (
           <g key={bar.key} onMouseEnter={() => onHover(globalIndex)}>
-            {hasSamples ? (
-              <rect
-                x={gx + 2}
-                y={pad.t}
-                width={Math.max(groupW - 4, 2)}
-                height={innerH}
-                fill="#ecfdf5"
-                opacity={hover == null || hover === globalIndex ? 0.85 : 0.35}
-              />
-            ) : null}
-            {series.map((item, sIdx) => {
-              const value = item.bars[globalIndex]?.dark ?? 0;
-              const samples = item.bars[globalIndex]?.light ?? 0;
-              const x = gx + groupW * 0.15 + sIdx * barW;
-              const width = Math.max(3, barW * 0.85);
-              if (value > 0) {
-                return (
-                  <rect
-                    key={item.point.id}
-                    x={x}
-                    y={yAt(value)}
-                    width={width}
-                    height={Math.max(0, yAt(0) - yAt(value))}
-                    fill={item.point.color}
-                    opacity={hover == null || hover === globalIndex ? 1 : 0.4}
-                  />
-                );
-              }
-              if (samples > 0) {
-                return (
-                  <g key={item.point.id}>
-                    <line
-                      x1={x}
-                      x2={x + width}
-                      y1={yAt(0) - 1}
-                      y2={yAt(0) - 1}
-                      stroke={item.point.color}
-                      strokeWidth="3"
-                      opacity={hover == null || hover === globalIndex ? 1 : 0.4}
-                    />
-                    <circle
-                      cx={x + width / 2}
-                      cy={yAt(0) - 6}
-                      r="3.5"
-                      fill={item.point.color}
-                      opacity={hover == null || hover === globalIndex ? 1 : 0.4}
-                    />
-                  </g>
-                );
-              }
-              return null;
+            <rect
+              x={gx + 2}
+              y={pad.t}
+              width={Math.max(groupW - 4, 2)}
+              height={innerH}
+              fill={hasSamples ? "#ecfdf5" : "transparent"}
+              opacity={hover == null || hover === globalIndex ? 0.85 : 0.35}
+            />
+            {series.map((item) => {
+              const value = costAt(item, globalIndex);
+              if (value <= 0) return null;
+              const y0 = yAt(stacked);
+              stacked += value;
+              const y1 = yAt(stacked);
+              return (
+                <rect
+                  key={item.point.id}
+                  x={x}
+                  y={y1}
+                  width={colW}
+                  height={Math.max(0, y0 - y1)}
+                  fill={item.point.color}
+                  stroke="white"
+                  strokeWidth={series.length > 1 ? 0.5 : 0}
+                  opacity={dim}
+                />
+              );
             })}
+            {/* Có bản tin nhưng chi phí = 0: đánh dấu sát trục để phân biệt với "không có dữ liệu". */}
+            {total <= 0 && hasSamples ? (
+              <g opacity={dim}>
+                <line x1={x} x2={x + colW} y1={yAt(0) - 1} y2={yAt(0) - 1} stroke="#10b981" strokeWidth="3" />
+                <circle cx={x + colW / 2} cy={yAt(0) - 6} r="3.5" fill="#10b981" />
+              </g>
+            ) : null}
             {i % labelStep === 0 ||
             (i === base.length - 1 && innerW >= 90 && (base.length - 1 - lastStepIdx) * groupW >= 42) ? (
               <text
@@ -998,34 +1018,47 @@ function MultiCostBarChart({
           </g>
         );
       })}
-      {hover != null && all[hover] ? (
-        <g transform={`translate(${Math.min(pad.l + (hover - range.start) * groupW + 12, W - 200)}, ${pad.t + 6})`}>
-          <rect
-            width="188"
-            height={28 + series.length * 28}
-            rx="4"
-            fill="white"
-            stroke="#e2e8f0"
-          />
-          <text x="10" y="16" className="fill-slate-500" fontSize="11">
-            {all[hover].label}
-          </text>
-          {series.map((item, i) => {
-            const samples = item.bars[hover]?.light ?? 0;
-            const cost = item.bars[hover]?.dark ?? 0;
+      {hover != null && all[hover]
+        ? (() => {
+            const total = totalAt(hover);
+            const colX = pad.l + (hover - range.start) * groupW;
+            // Cột ở nửa phải thì đặt tooltip bên trái cột.
+            const tipX =
+              colX + groupW / 2 > W / 2 ? Math.max(pad.l, colX - tipW - 8) : Math.min(colX + groupW + 8, W - tipW - 4);
+            const shortName = (name: string) => (name.length > 16 ? `${name.slice(0, 15)}…` : name);
             return (
-              <g key={item.point.id}>
-                <text x="10" y={34 + i * 28} fontSize="11" fontWeight="600" fill={item.point.color}>
-                  {item.point.code}: {formatVnd(cost)} VND
+              <g transform={`translate(${tipX}, ${pad.t + 6})`} pointerEvents="none">
+                <rect width={tipW} height={44 + series.length * 30} rx="6" fill="white" stroke="#e2e8f0" />
+                <text x="10" y="17" className="fill-slate-500" fontSize="11" fontWeight="600">
+                  {all[hover].label}
                 </text>
-                <text x="10" y={48 + i * 28} fontSize="10" fill="#64748b">
-                  {samples > 0 ? `${samples} khung đo` : "Không có bản tin"}
+                <text x="10" y="35" className="fill-slate-800" fontSize="12" fontWeight="700">
+                  Tổng: {formatVnd(total)} VND
                 </text>
+                {series.map((item, i) => {
+                  const samples = item.bars[hover]?.light ?? 0;
+                  const cost = costAt(item, hover);
+                  const pct = total > 0 ? (cost / total) * 100 : 0;
+                  const y = 54 + i * 30;
+                  return (
+                    <g key={item.point.id}>
+                      <rect x="10" y={y - 9} width="9" height="9" rx="2" fill={item.point.color} />
+                      <text x="24" y={y} fontSize="11" className="fill-slate-600">
+                        {shortName(item.point.name || item.point.code)}
+                      </text>
+                      <text x={tipW - 10} y={y} fontSize="11" fontWeight="600" textAnchor="end" fill={item.point.color}>
+                        {formatVnd(cost)} VND ({formatAppNumber(pct, { minDecimals: 1, maxDecimals: 1 })}%)
+                      </text>
+                      <text x="24" y={y + 13} fontSize="10" fill="#64748b">
+                        {samples > 0 ? `${samples} khung đo` : "Không có bản tin"}
+                      </text>
+                    </g>
+                  );
+                })}
               </g>
             );
-          })}
-        </g>
-      ) : null}
+          })()
+        : null}
     </svg>
     ) : null}
     </div>
@@ -1080,7 +1113,7 @@ function Donut({
 function TouChart({ values }: { values: { peak: number; normal: number; off: number; none: number } }) {
   const W = 300;
   const H = 180;
-  const pad = { l: 18, r: 18, t: 28, b: 28 };
+  const pad = { l: 18, r: 18, t: 28, b: 38 };
   const innerW = W - pad.l - pad.r;
   const yMax = Math.max(values.peak, values.normal, values.off, values.none, 1);
   const yAt = (v: number) => pad.t + ((yMax - v) / yMax) * (H - pad.t - pad.b);
@@ -1088,8 +1121,8 @@ function TouChart({ values }: { values: { peak: number; normal: number; off: num
     { label: "Cao", color: TOU[0].color, value: values.peak },
     { label: "Thường", color: TOU[1].color, value: values.normal },
     { label: "Thấp", color: TOU[2].color, value: values.off },
-    { label: "Không", color: TOU[3].color, value: values.none },
-  ].filter((item) => item.label !== "Không" || item.value > 0);
+    { label: "Không xác định", color: TOU[3].color, value: values.none },
+  ].filter((item) => item.label !== "Không xác định" || item.value > 0);
   const groupW = innerW / items.length;
   const barW = 28;
 
@@ -1119,8 +1152,20 @@ function TouChart({ values }: { values: { peak: number; normal: number; off: num
               height={h}
               fill={item.color}
             />
-            <text x={x + barW / 2} y={H - 6} textAnchor="middle" className="fill-slate-600" fontSize="12">
-              {item.label}
+            <text x={x + barW / 2} y={H - 18} textAnchor="middle" className="fill-slate-600" fontSize="12">
+              {/* Nhãn dài (VD "Không xác định") xuống hai dòng để không chồng lên cột bên cạnh. */}
+              {item.label.length > 8 && item.label.includes(" ") ? (
+                <>
+                  <tspan x={x + barW / 2}>{item.label.split(" ")[0]}</tspan>
+                  <tspan x={x + barW / 2} dy="13">
+                    {item.label.split(" ").slice(1).join(" ")}
+                  </tspan>
+                </>
+              ) : (
+                <tspan x={x + barW / 2} dy="6">
+                  {item.label}
+                </tspan>
+              )}
             </text>
           </g>
         );

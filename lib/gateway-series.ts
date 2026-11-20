@@ -93,13 +93,30 @@ export type GatewayEnergySlot = {
   day: string;
   hour: number;
   minute: number;
+  /** Chỉ số quy đổi (nối liên tục qua các lần thay đồng hồ) — dùng để tính điện năng. */
   firstWh: number;
   lastWh: number;
+  /** Chỉ số thực trên mặt đồng hồ — dùng để hiển thị (báo cáo). */
+  rawFirstWh?: number;
+  rawLastWh?: number;
+};
+
+/** Một lần thay đồng hồ / reset chỉ số trong kỳ (at: giờ tường UTC). */
+export type GatewayMeterSwap = {
+  meterPointId: string;
+  at: string;
+  oldSerial: string;
+  newSerial: string;
+  finalIndex: number | null;
+  initialIndex: number | null;
+  /** true: hệ thống tự phát hiện, chưa có biên bản. */
+  auto: boolean;
 };
 
 export type GatewayEnergySlotSummary = {
   slots: GatewayEnergySlot[];
   latest: ProjectGatewaySample | null;
+  swaps?: GatewayMeterSwap[];
 };
 
 export async function loadProjectGatewayEnergySlots(
@@ -119,6 +136,7 @@ export async function loadProjectGatewayEnergySlots(
     const result: GatewayEnergySlotSummary = {
       slots: Array.isArray(body.slots) ? body.slots : [],
       latest: body.latest ?? null,
+      swaps: Array.isArray(body.swaps) ? body.swaps : [],
     };
     if (result.slots.length > 0 || result.latest) {
       lastGoodSlots.set(key, result);

@@ -23,18 +23,42 @@ export type UserAlertCategoryTab = {
   label: string;
 };
 
+/** Cấu hình riêng của một điểm đo cho một ngưỡng. Min/Max để trống = dùng ngưỡng mặc định. */
+export type AlertPointSetting = {
+  enabled: boolean;
+  minValue: string;
+  maxValue: string;
+};
+
 export type UserAlertRule = {
   id: string;
   groupId: UserAlertGroupId;
   name: string;
   parameterKey: string;
+  /** Ngưỡng mặc định áp cho các điểm đo (lấy từ thư viện cảnh báo của dự án). */
   minValue: string;
   maxValue: string;
   unit: string;
   severity: AlertSeverityLevel;
   enabled: boolean;
+  /** Dữ liệu cũ: ngưỡng chỉ áp cho một điểm đo. */
   meterPointId?: string;
   description?: string;
+  /** Ngưỡng gốc trong thư viện (để biết khách có chỉnh khác thư viện không). */
+  libraryMin?: string;
+  libraryMax?: string;
+  /** Cấu hình theo từng điểm đo; điểm đo không có trong danh sách = áp dụng với ngưỡng mặc định. */
+  points?: Record<string, AlertPointSetting>;
+};
+
+/** Phần khách hàng chỉnh trên một ngưỡng của thư viện (lưu trong alertsConfig.ruleOverrides). */
+export type AlertRuleOverride = {
+  enabled: boolean;
+  severity: AlertSeverityLevel;
+  /** Chỉ có khi chuyển từ dữ liệu cũ mà khách đã đặt ngưỡng khác thư viện. */
+  minValue?: string;
+  maxValue?: string;
+  points?: Record<string, AlertPointSetting>;
 };
 
 export type NotificationChannelsConfig = {
@@ -461,101 +485,55 @@ export function normalizeAlertConfig(raw: unknown, fallbackAdminRaw?: unknown): 
     }
   }
 
-  let categories: UserAlertCategoryTab[] = DEFAULT_USER_ALERT_CATEGORIES.map((item) => ({ ...item }));
-  if (Array.isArray(source.categories) && source.categories.length > 0) {
-    categories = source.categories
-      .map((item) => {
+  // Danh sách ngưỡng LUÔN lấy từ thư viện cảnh báo của dự án (trang quản trị → Cấu hình cảnh báo tức thời
+  // đồng hồ); khách hàng chỉ bật / tắt, chọn mức độ và đặt ngưỡng riêng cho từng điểm đo.
+  const libraryByGroup = readLibraryRules(adminSource);
+  const overrides = readRuleOverrides(source, libraryByGroup);
+
+  const labelById = new Map<string, string>(DEFAULT_USER_ALERT_CATEGORIES.map((item) => [item.id, item.label]));
+  const adminCategories = adminSource.categoriesByUtility;
+  if (adminCategories && typeof adminCategories === "object" && !Array.isArray(adminCategories)) {
+    for (const list of Object.values(adminCategories as Record<string, unknown>)) {
+      if (!Array.isArray(list)) continue;
+      for (const item of list) {
         if (item && typeof item === "object" && "id" in item && "label" in item) {
-          return {
-            id: String((item as { id: unknown }).id),
-            label: String((item as { label: unknown }).label),
-          };
+          const id = String((item as { id: unknown }).id);
+          if (!labelById.has(id)) labelById.set(id, String((item as { label: unknown }).label));
         }
-        return null;
-      })
-      .filter((item): item is UserAlertCategoryTab => Boolean(item));
-  } else if (Array.isArray(source.tags) && source.tags.length > 0) {
-    categories = source.tags
-      .filter((tag): tag is string => typeof tag === "string" && tag.trim().length > 0)
-      .map(mapTagToCategory);
+      }
+    }
   }
+
+  const rulesByGroup: Record<string, UserAlertRule[]> = {};
+  for (const [groupId, rules] of Object.entries(libraryByGroup)) {
+    rulesByGroup[groupId] = rules.map((rule) => {
+      const override = overrides[rule.id];
+      return {
+        ...rule,
+        libraryMin: rule.minValue,
+        libraryMax: rule.maxValue,
+        enabled: override?.enabled ?? rule.enabled,
+        severity: override?.severity ?? rule.severity,
+        minValue: override?.minValue ?? rule.minValue,
+        maxValue: override?.maxValue ?? rule.maxValue,
+        ...(override?.points && Object.keys(override.points).length ? { points: override.points } : {}),
+      };
+    });
+  }
+
+  // Nhóm hiển thị = nhóm của thư viện có ngưỡng (theo thứ tự mặc định, nhóm thêm của admin xếp sau).
+  const order = DEFAULT_USER_ALERT_CATEGORIES.map((item) => item.id as string);
+  let categories: UserAlertCategoryTab[] = Object.keys(rulesByGroup)
+    .filter((groupId) => rulesByGroup[groupId].length > 0)
+    .sort((x, y) => {
+      const ix = order.indexOf(x);
+      const iy = order.indexOf(y);
+      return (ix < 0 ? 99 : ix) - (iy < 0 ? 99 : iy);
+    })
+    .map((id) => ({ id, label: labelById.get(id) ?? id }));
   if (categories.length === 0) {
     categories = DEFAULT_USER_ALERT_CATEGORIES.map((item) => ({ ...item }));
-  }
-
-  const rulesByGroup = cloneDefaultRulesByGroup();
-  const hasUserRules =
-    source.rulesByGroup &&
-    typeof source.rulesByGroup === "object" &&
-    !Array.isArray(source.rulesByGroup) &&
-    Object.keys(source.rulesByGroup as Record<string, unknown>).length > 0;
-
-  if (hasUserRules) {
-    for (const [groupId, rawList] of Object.entries(source.rulesByGroup as Record<string, unknown>)) {
-      if (!Array.isArray(rawList) || rawList.length === 0) continue;
-      const parsed: UserAlertRule[] = [];
-      for (const rawRule of rawList) {
-        if (!rawRule || typeof rawRule !== "object") continue;
-        const r = rawRule as Record<string, unknown>;
-        const severity: AlertSeverityLevel =
-          r.severity === "critical" || r.severity === "info" ? r.severity : "warning";
-        parsed.push({
-          id: typeof r.id === "string" && r.id ? r.id : `rule-${groupId}-${parsed.length + 1}`,
-          groupId,
-          name: typeof r.name === "string" ? r.name : "",
-          parameterKey: typeof r.parameterKey === "string" ? r.parameterKey : "",
-          minValue: typeof r.minValue === "string" ? r.minValue : "",
-          maxValue: typeof r.maxValue === "string" ? r.maxValue : "",
-          unit: typeof r.unit === "string" ? r.unit : "",
-          severity,
-          enabled: typeof r.enabled === "boolean" ? r.enabled : true,
-          meterPointId: typeof r.meterPointId === "string" ? r.meterPointId : undefined,
-          description: typeof r.description === "string" ? r.description : undefined,
-        });
-      }
-      if (parsed.length > 0) {
-        rulesByGroup[groupId] = parsed;
-      }
-    }
-  } else if (
-    adminSource.alarmsByCategory &&
-    typeof adminSource.alarmsByCategory === "object" &&
-    !Array.isArray(adminSource.alarmsByCategory)
-  ) {
-    for (const [groupId, rawList] of Object.entries(adminSource.alarmsByCategory as Record<string, unknown>)) {
-      if (!Array.isArray(rawList) || rawList.length === 0) continue;
-      const parsed: UserAlertRule[] = [];
-      for (const rawRule of rawList) {
-        if (!rawRule || typeof rawRule !== "object") continue;
-        const r = rawRule as Record<string, unknown>;
-        parsed.push({
-          id: typeof r.id === "string" && r.id ? r.id : `rule-${groupId}-${parsed.length + 1}`,
-          groupId,
-          name: typeof r.name === "string" ? r.name : "",
-          parameterKey: typeof r.parameterKey === "string" ? r.parameterKey : "",
-          minValue: typeof r.minValue === "string" ? r.minValue : "",
-          maxValue:
-            typeof r.threshold === "string"
-              ? r.threshold
-              : typeof r.maxValue === "string"
-                ? r.maxValue
-                : "",
-          unit: typeof r.unit === "string" ? r.unit : "",
-          severity: "warning",
-          enabled: true,
-          description: typeof r.description === "string" ? r.description : undefined,
-        });
-      }
-      if (parsed.length > 0) {
-        rulesByGroup[groupId] = parsed;
-      }
-    }
-  }
-
-  for (const cat of categories) {
-    if (!rulesByGroup[cat.id]) {
-      rulesByGroup[cat.id] = DEFAULT_USER_ALERT_RULES[cat.id]?.map((r) => ({ ...r })) ?? [];
-    }
+    for (const cat of categories) rulesByGroup[cat.id] ??= [];
   }
 
   let activeGroupId: UserAlertGroupId = categories[0]?.id ?? "energy";
@@ -626,6 +604,143 @@ export function normalizeAlertConfig(raw: unknown, fallbackAdminRaw?: unknown): 
     overConsumptionKwh,
     dailyLimit,
     peakHourWarning,
+  };
+}
+
+function textField(value: unknown) {
+  return typeof value === "string" ? value : typeof value === "number" && Number.isFinite(value) ? String(value) : "";
+}
+
+/** Thư viện ngưỡng của dự án (alertConfig.alarmsByCategory do admin cấu hình); chưa cấu hình thì dùng bộ mặc định. */
+function readLibraryRules(adminSource: Record<string, unknown>): Record<string, UserAlertRule[]> {
+  const raw = adminSource.alarmsByCategory;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return cloneDefaultRulesByGroup();
+  const result: Record<string, UserAlertRule[]> = {};
+  for (const [groupId, rawList] of Object.entries(raw as Record<string, unknown>)) {
+    if (!Array.isArray(rawList)) continue;
+    const parsed: UserAlertRule[] = [];
+    for (const rawRule of rawList) {
+      if (!rawRule || typeof rawRule !== "object") continue;
+      const r = rawRule as Record<string, unknown>;
+      const parameterKey = textField(r.parameterKey);
+      if (!parameterKey) continue;
+      parsed.push({
+        id: textField(r.id) || `rule-${groupId}-${parsed.length + 1}`,
+        groupId,
+        name: textField(r.name) || parameterKey,
+        parameterKey,
+        minValue: textField(r.minValue),
+        maxValue: textField(r.threshold) || textField(r.maxValue),
+        unit: textField(r.unit),
+        severity: r.severity === "critical" || r.severity === "info" ? r.severity : "warning",
+        enabled: true,
+        description: textField(r.description) || undefined,
+      });
+    }
+    // Danh sách rỗng đã lưu = admin đã xoá hết ngưỡng của nhóm này.
+    result[groupId] = parsed;
+  }
+  return result;
+}
+
+function readPointSettings(raw: unknown): Record<string, AlertPointSetting> | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const points: Record<string, AlertPointSetting> = {};
+  for (const [pointId, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!value || typeof value !== "object") continue;
+    const v = value as Record<string, unknown>;
+    points[pointId] = {
+      enabled: v.enabled !== false,
+      minValue: textField(v.minValue),
+      maxValue: textField(v.maxValue),
+    };
+  }
+  return Object.keys(points).length ? points : undefined;
+}
+
+/**
+ * Phần khách hàng chỉnh trên từng ngưỡng thư viện. Dữ liệu cũ (alertsConfig.rulesByGroup — danh sách ngưỡng
+ * khách tự tạo) được chuyển sang: khớp theo nhóm + tham số đo với ngưỡng thư viện.
+ */
+function readRuleOverrides(
+  source: Record<string, unknown>,
+  libraryByGroup: Record<string, UserAlertRule[]>,
+): Record<string, AlertRuleOverride> {
+  const raw = source.ruleOverrides;
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    const result: Record<string, AlertRuleOverride> = {};
+    for (const [ruleId, value] of Object.entries(raw as Record<string, unknown>)) {
+      if (!value || typeof value !== "object") continue;
+      const v = value as Record<string, unknown>;
+      result[ruleId] = {
+        enabled: v.enabled !== false,
+        severity: v.severity === "critical" || v.severity === "info" ? v.severity : "warning",
+        ...(typeof v.minValue === "string" ? { minValue: v.minValue } : {}),
+        ...(typeof v.maxValue === "string" ? { maxValue: v.maxValue } : {}),
+        ...(readPointSettings(v.points) ? { points: readPointSettings(v.points) } : {}),
+      };
+    }
+    return result;
+  }
+
+  const legacy = source.rulesByGroup;
+  if (!legacy || typeof legacy !== "object" || Array.isArray(legacy)) return {};
+  const result: Record<string, AlertRuleOverride> = {};
+  for (const [groupId, rawList] of Object.entries(legacy as Record<string, unknown>)) {
+    if (!Array.isArray(rawList)) continue;
+    for (const rawRule of rawList) {
+      if (!rawRule || typeof rawRule !== "object") continue;
+      const r = rawRule as Record<string, unknown>;
+      const library = (libraryByGroup[groupId] ?? []).find((rule) => rule.parameterKey === r.parameterKey);
+      if (!library) continue;
+      const severity: AlertSeverityLevel = r.severity === "critical" || r.severity === "info" ? r.severity : "warning";
+      const enabled = r.enabled !== false;
+      const minValue = textField(r.minValue);
+      const maxValue = textField(r.maxValue);
+      const current = result[library.id] ?? { enabled, severity };
+      if (typeof r.meterPointId === "string" && r.meterPointId) {
+        current.points = { ...(current.points ?? {}), [r.meterPointId]: { enabled, minValue, maxValue } };
+      } else {
+        current.enabled = enabled;
+        current.severity = severity;
+        if (minValue !== library.minValue) current.minValue = minValue;
+        if (maxValue !== library.maxValue) current.maxValue = maxValue;
+      }
+      result[library.id] = current;
+    }
+  }
+  return result;
+}
+
+/** Phần cần lưu (alertsConfig.ruleOverrides) từ danh sách ngưỡng đang chỉnh. */
+export function buildRuleOverrides(rulesByGroup: Record<string, UserAlertRule[]>) {
+  const result: Record<string, AlertRuleOverride> = {};
+  for (const rules of Object.values(rulesByGroup)) {
+    for (const rule of rules) {
+      result[rule.id] = {
+        enabled: rule.enabled,
+        severity: rule.severity,
+        ...(rule.libraryMin !== undefined && rule.minValue !== rule.libraryMin ? { minValue: rule.minValue } : {}),
+        ...(rule.libraryMax !== undefined && rule.maxValue !== rule.libraryMax ? { maxValue: rule.maxValue } : {}),
+        ...(rule.points && Object.keys(rule.points).length ? { points: rule.points } : {}),
+      };
+    }
+  }
+  return result;
+}
+
+/**
+ * Ngưỡng của `rule` áp cho điểm đo `pointId`, hoặc null nếu ngưỡng tắt / không áp dụng cho điểm đo này.
+ * Min/Max riêng của điểm đo để trống thì dùng ngưỡng mặc định của ngưỡng.
+ */
+export function ruleThresholdsForPoint(rule: UserAlertRule, pointId: string) {
+  if (!rule.enabled) return null;
+  if (rule.meterPointId && rule.meterPointId !== pointId) return null;
+  const point = rule.points?.[pointId];
+  if (point && !point.enabled) return null;
+  return {
+    minValue: point?.minValue.trim() ? point.minValue : rule.minValue,
+    maxValue: point?.maxValue.trim() ? point.maxValue : rule.maxValue,
   };
 }
 

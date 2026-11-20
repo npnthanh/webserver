@@ -13,6 +13,12 @@ import { hydrateMeterReadings } from "@/lib/meter-readings";
 import { formatAppNumber } from "@/lib/number-format";
 import { loadProjectGatewayLatest, type ProjectGatewaySample } from "@/lib/gateway-series";
 import { DIAGRAM_ONLINE_MS } from "@/components/client/diagram/metrics";
+import { MeterReplacementDialog, type ReplacementDeviceOption } from "@/components/MeterReplacementDialog";
+import {
+  loadMeterReplacements,
+  type MeterReplacementState,
+  type MeterResetSuspect,
+} from "@/lib/meter-replacement";
 
 type Energy = string;
 type DeviceKind = "meter" | "inverter" | "thermo" | "water" | "wind" | "steam" | "air";
@@ -40,6 +46,9 @@ type MeterPoint = {
   id: string;
   name: string;
   sn: string;
+  /** Có gắn đồng hồ (thiết bị hoặc serial) — mới ghi được biên bản thay đồng hồ. */
+  hasMeter: boolean;
+  deviceId: string | null;
   type: string;
   energy: Energy;
   kind: DeviceKind;
@@ -82,6 +91,8 @@ function fromDbMeters(meters: ClientMeter[], devices: CatalogDevice[], readings:
       id: meter.id,
       name: meter.name,
       sn: device?.sn ?? meter.serialNumber ?? "Chưa gán thiết bị",
+      hasMeter: Boolean(device?.sn || meter.serialNumber),
+      deviceId: meter.deviceId ?? null,
       type: meter.type,
       energy: meter.utility,
       kind: meterKind(meter),
@@ -107,6 +118,10 @@ export function ProjectMeterConfig({ project }: { project: Project }) {
   const [reloadTick, setReloadTick] = useState(0);
   const [pointToDelete, setPointToDelete] = useState<MeterPoint | null>(null);
   const [deleteError, setDeleteError] = useState("");
+  const [devices, setDevices] = useState<CatalogDevice[]>([]);
+  const [latestSamples, setLatestSamples] = useState<ProjectGatewaySample[]>([]);
+  const [replacements, setReplacements] = useState<MeterReplacementState>({ replacements: [], suspects: [] });
+  const [replacing, setReplacing] = useState<{ point: MeterPoint; suspect: MeterResetSuspect | null } | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -119,6 +134,8 @@ export function ProjectMeterConfig({ project }: { project: Project }) {
     ]).then(([meters, devices, readings, alerts, latest]) => {
       if (!active) return;
       setRawMeters(meters);
+      setDevices(devices);
+      setLatestSamples(latest);
       setBasePoints(fromDbMeters(meters, devices, readings));
       setOnlineIds(onlinePointIds(latest));
       setMeterDataReady(true);
@@ -133,12 +150,31 @@ export function ProjectMeterConfig({ project }: { project: Project }) {
     };
   }, [project.id, reloadTick]);
 
+  // Biên bản thay đồng hồ + các lần hệ thống nghi thay đồng hồ.
+  useEffect(() => {
+    let active = true;
+    const load = () =>
+      void loadMeterReplacements(project.id)
+        .then((state) => {
+          if (active) setReplacements(state);
+        })
+        .catch(() => undefined);
+    load();
+    window.addEventListener("ems-meter-replacements-changed", load);
+    return () => {
+      active = false;
+      window.removeEventListener("ems-meter-replacements-changed", load);
+    };
+  }, [project.id]);
+
   // Làm mới trạng thái kết nối định kỳ.
   useEffect(() => {
     let active = true;
     const timer = window.setInterval(() => {
       void loadProjectGatewayLatest(project.id).then((latest) => {
-        if (active) setOnlineIds(onlinePointIds(latest));
+        if (!active) return;
+        setOnlineIds(onlinePointIds(latest));
+        setLatestSamples(latest);
       });
     }, 30_000);
     return () => {
@@ -220,6 +256,36 @@ export function ProjectMeterConfig({ project }: { project: Project }) {
   const currentPage = Math.min(page, totalPages);
   const start = (currentPage - 1) * PAGE_SIZE;
   const pageRows = filteredRoots.slice(start, start + PAGE_SIZE);
+
+  const suspectByPoint = useMemo(() => {
+    const map = new Map<string, MeterResetSuspect>();
+    // Danh sách đã sắp mới nhất trước: giữ lần nghi gần nhất của mỗi điểm đo.
+    for (const suspect of replacements.suspects) {
+      if (!map.has(suspect.meterPointId)) map.set(suspect.meterPointId, suspect);
+    }
+    return map;
+  }, [replacements.suspects]);
+
+  /** Đồng hồ có thể lắp thay (đồng hồ đang gắn ở điểm đo / dự án khác thì không chọn được). */
+  const replacementDevices = useMemo<ReplacementDeviceOption[]>(() => {
+    if (!replacing) return [];
+    return devices
+      .filter((device) => device.id !== replacing.point.deviceId && device.sn)
+      .map((device) => {
+        const links = (device.projects ?? []).filter((link) => link.meterId !== replacing.point.id);
+        const otherProject = links.find((link) => link.projectId !== project.id);
+        const otherPoint = links.find((link) => link.projectId === project.id);
+        const usedBy = otherProject
+          ? `đang gắn ở dự án ${otherProject.projectName}`
+          : otherPoint
+            ? `đang gắn ở điểm đo ${otherPoint.meterName}`
+            : "";
+        return { id: device.id, label: `${device.sn} · ${device.brandModel || device.name}`, usedBy };
+      })
+      .sort((a, b) => Number(Boolean(a.usedBy)) - Number(Boolean(b.usedBy)) || a.label.localeCompare(b.label));
+  }, [devices, project.id, replacing]);
+
+  const replacingLatest = replacing ? latestSamples.find((item) => item.meterPointId === replacing.point.id) : undefined;
 
   function toggleExpand(id: string) {
     setExpanded((current) => {
@@ -337,6 +403,10 @@ export function ProjectMeterConfig({ project }: { project: Project }) {
                           setDeleteError("");
                           setPointToDelete(target);
                         }}
+                        suspectByPoint={suspectByPoint}
+                        onReplace={(target) =>
+                          setReplacing({ point: target, suspect: suspectByPoint.get(target.id) ?? null })
+                        }
                       />
                     );
                   })}
@@ -379,6 +449,24 @@ export function ProjectMeterConfig({ project }: { project: Project }) {
             </div>
           </section>
 
+      {replacing ? (
+        <MeterReplacementDialog
+          key={replacing.point.id}
+          projectId={project.id}
+          point={replacing.point}
+          devices={replacementDevices}
+          latestKwh={typeof replacingLatest?.values.EPaed === "number" ? replacingLatest.values.EPaed : null}
+          latestAt={replacingLatest?.at ?? null}
+          suspect={replacing.suspect}
+          history={replacements.replacements.filter((item) => item.meterPointId === replacing.point.id)}
+          onClose={() => setReplacing(null)}
+          onChanged={(state) => {
+            setReplacements(state);
+            setReloadTick((tick) => tick + 1);
+          }}
+        />
+      ) : null}
+
       <ConfirmDialog
         open={Boolean(pointToDelete)}
         title="Xác nhận xóa điểm đo"
@@ -409,6 +497,8 @@ function DeviceRows({
   isOpen,
   onToggle,
   onDelete,
+  suspectByPoint,
+  onReplace,
 }: {
   projectId: string;
   point: MeterPoint;
@@ -417,8 +507,12 @@ function DeviceRows({
   isOpen: boolean;
   onToggle: () => void;
   onDelete: (point: MeterPoint) => void;
+  suspectByPoint: Map<string, MeterResetSuspect>;
+  onReplace: (point: MeterPoint) => void;
 }) {
   const Icon = kindIcons[point.kind];
+  const suspect = suspectByPoint.get(point.id);
+  const canReplace = point.hasMeter && point.energy === "Điện";
 
   return (
     <>
@@ -452,6 +546,16 @@ function DeviceRows({
             <span className={`h-2 w-2 rounded-full ${STATUS_STYLE[point.status].dot}`} />
             <span className={STATUS_STYLE[point.status].text}>{STATUS_STYLE[point.status].label}</span>
           </span>
+          {suspect && canReplace ? (
+            <button
+              type="button"
+              onClick={() => onReplace(point)}
+              className="mt-1 flex items-center gap-1 rounded-md bg-amber-50 px-1.5 py-0.5 text-[11px] font-semibold text-amber-700 ring-1 ring-amber-200 hover:bg-amber-100"
+              title="Chỉ số tụt và không hồi lại — bấm để nhập biên bản thay đồng hồ"
+            >
+              Nghi thay đồng hồ {suspect.at.slice(8, 10)}/{suspect.at.slice(5, 7)} {suspect.at.slice(11, 16)}
+            </button>
+          ) : null}
         </td>
         <td className="px-5 py-3.5">
           {point.value == null ? (
@@ -467,6 +571,17 @@ function DeviceRows({
         </td>
         <td className="px-5 py-3.5">
           <div className="flex justify-end">
+            {canReplace ? (
+              <button
+                type="button"
+                onClick={() => onReplace(point)}
+                className="flex h-8 w-8 items-center justify-center rounded-md text-slate-400 hover:bg-slate-100 hover:text-emerald-600"
+                aria-label="Thay đồng hồ"
+                title="Thay đồng hồ (biên bản chỉ số chốt / ban đầu)"
+              >
+                <SwapIcon className="h-4 w-4" />
+              </button>
+            ) : null}
             <Link
               href={`/chinh-sua-du-an/${encodeURIComponent(projectId)}/diem-do/${encodeURIComponent(point.id)}`}
               className="flex h-8 w-8 items-center justify-center rounded-md text-slate-400 hover:bg-slate-100 hover:text-emerald-600"
@@ -499,6 +614,8 @@ function DeviceRows({
             isOpen={false}
             onToggle={() => undefined}
             onDelete={onDelete}
+            suspectByPoint={suspectByPoint}
+            onReplace={onReplace}
           />
         ))}
     </>
@@ -629,6 +746,15 @@ function SteamIcon({ className }: { className?: string }) {
   return (
     <svg className={className} viewBox="0 0 24 24" fill="none" aria-hidden>
       <path d="M5 18h14M8 18V9l4-4 4 4v9M9.5 12h5M9.5 15h5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function SwapIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M4 7h13l-3-3" />
+      <path d="M20 17H7l3 3" />
     </svg>
   );
 }

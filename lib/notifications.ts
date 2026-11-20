@@ -5,7 +5,8 @@ export type NotificationType =
   | "project_delete_requested"
   | "project_deleted"
   | "project_delete_rejected"
-  | "project_delete_cancelled";
+  | "project_delete_cancelled"
+  | "meter_reset_suspected";
 
 export type AdminNotification = {
   id: number;
@@ -13,6 +14,8 @@ export type AdminNotification = {
   projectId: string;
   projectName: string;
   actorName: string;
+  /** Nội dung thêm (thông báo hệ thống). */
+  detail?: string;
   /** "YYYY-MM-DD HH:MM:SS" theo UTC. */
   createdAt: string;
   unread: boolean;

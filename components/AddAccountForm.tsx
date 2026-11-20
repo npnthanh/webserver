@@ -209,7 +209,6 @@ export function AddAccountForm() {
         <h1 className="text-2xl font-bold tracking-tight text-slate-900">
           {isEdit ? "Cập nhật tài khoản" : "Thêm tài khoản"}
         </h1>
-        <p className="mt-1 text-sm text-slate-500">Quản trị người dùng — đăng nhập và phân quyền theo vai trò</p>
       </div>
 
       <form
@@ -223,9 +222,6 @@ export function AddAccountForm() {
           <h2 className="text-[15px] font-semibold text-slate-800">
             {isEdit ? "Thông tin tài khoản nội bộ" : "Thêm tài khoản nội bộ mới"}
           </h2>
-          <p className="mt-1 text-sm text-slate-500">
-            Cấp tài khoản nội bộ để quản trị hệ thống và quản lý các dự án khách hàng.
-          </p>
         </div>
 
         {error ? (
@@ -381,11 +377,11 @@ export function AddAccountForm() {
               <h3 className="text-[14px] font-semibold text-slate-800">
                 Các dự án / khách hàng được quản trị
               </h3>
-              <p className="mt-0.5 text-xs text-slate-500">
-                {role === "Admin"
-                  ? "Tài khoản Admin có toàn quyền truy cập và cấu hình tất cả các dự án trên hệ thống."
-                  : "Chọn các dự án (khách hàng) mà tài khoản Manage này được phép truy cập và cấu hình."}
-              </p>
+              {role === "Admin" ? (
+                <p className="mt-0.5 text-xs text-slate-500">
+                  Tài khoản Admin có toàn quyền truy cập và cấu hình tất cả các dự án trên hệ thống.
+                </p>
+              ) : null}
             </div>
             {role === "Admin" ? (
               <span className="inline-flex items-center gap-1.5 rounded-full bg-slate-900 px-3 py-1 text-xs font-semibold text-white">
@@ -506,17 +502,6 @@ export function AddAccountForm() {
           </button>
         </div>
       </form>
-
-      <div className="mt-5 flex gap-3 rounded-xl border border-emerald-200 bg-emerald-50/50 px-4 py-3 text-sm text-slate-700">
-        <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-emerald-600 text-[11px] font-bold text-white shadow-xs">
-          i
-        </span>
-        <p>
-          <span className="font-semibold text-emerald-900">Phân cấp quyền:</span> Hệ thống chỉ gồm 2 cấp là{" "}
-          <strong>Admin</strong> (truy cập toàn bộ dự án &amp; quản trị người dùng) và{" "}
-          <strong>Manage</strong> (truy cập các dự án được cấp phép ở trên). Cả 2 cấp đều có quyền cấu hình đầy đủ các thông tin phần quản trị.
-        </p>
-      </div>
     </div>
   );
 }

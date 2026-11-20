@@ -137,6 +137,20 @@ export function NotificationBell() {
                   <li key={item.id} className={`flex gap-3 px-4 py-3 ${highlight ? "bg-emerald-50/50" : ""}`}>
                     <span className={`mt-1.5 h-2 w-2 shrink-0 rounded-full ${meta.dot}`} />
                     <div className="min-w-0 flex-1">
+                      {item.type === "meter_reset_suspected" ? (
+                        <p className="text-xs leading-relaxed text-slate-700">
+                          <span className="font-semibold text-slate-900">Hệ thống</span> {meta.verb}{" "}
+                          {item.detail ? <span>{item.detail}</span> : null} · dự án{" "}
+                          <Link
+                            href={`/chinh-sua-du-an/${encodeURIComponent(item.projectId)}`}
+                            className="font-semibold text-emerald-700 hover:underline"
+                            onClick={() => setOpen(false)}
+                          >
+                            {item.projectName}
+                          </Link>
+                          <span className="text-slate-500">. Vào Điểm đo để nhập biên bản thay đồng hồ.</span>
+                        </p>
+                      ) : (
                       <p className="text-xs leading-relaxed text-slate-700">
                         <span className="font-semibold text-slate-900">{item.actorName}</span> {meta.verb}{" "}
                         {item.type === "project_deleted" ? (
@@ -154,6 +168,7 @@ export function NotificationBell() {
                           <span className="text-slate-500"> (theo yêu cầu của {item.request.requestedByName})</span>
                         ) : null}
                       </p>
+                      )}
                       <p className="mt-0.5 text-[11px] text-slate-400">
                         {formatStoredVietnam(item.createdAt) ?? item.createdAt}
                       </p>
@@ -186,6 +201,7 @@ const TYPE_META: Record<AdminNotification["type"], { verb: string; dot: string }
   project_deleted: { verb: "đã duyệt xoá dự án", dot: "bg-rose-500" },
   project_delete_rejected: { verb: "đã từ chối xoá dự án", dot: "bg-slate-400" },
   project_delete_cancelled: { verb: "đã huỷ yêu cầu xoá dự án", dot: "bg-slate-400" },
+  meter_reset_suspected: { verb: "nghi thay đồng hồ (chỉ số tụt, không hồi lại) ở", dot: "bg-amber-500" },
 };
 
 function RequestActions({

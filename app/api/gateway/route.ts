@@ -3,14 +3,18 @@ import { ingestGateway } from "@/lib/gateway-store";
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
+/**
+ * ACK cho gateway. Không gửi header "Connection: close" (khách hàng không muốn thấy từ này):
+ * gateway biết hết ACK nhờ Content-Length, còn server.js tự đóng kết nối ngay sau khi gửi xong ACK.
+ */
 function ackResponse(payload: unknown, status = 200) {
   const body = `${JSON.stringify(payload)}\n`;
   return new Response(body, {
     status,
     headers: {
       "Content-Type": "application/json; charset=utf-8",
+      "Content-Length": String(Buffer.byteLength(body)),
       "Cache-Control": "no-store",
-      Connection: "close",
     },
   });
 }

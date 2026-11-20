@@ -1,6 +1,6 @@
 import "server-only";
 import type { ResultSetHeader } from "mysql2";
-import { normalizeAlertConfig } from "@/lib/alert-config";
+import { normalizeAlertConfig, ruleThresholdsForPoint } from "@/lib/alert-config";
 import { alertCategory } from "@/lib/alert-events";
 import { getProjectGatewayLatest } from "@/lib/gateway-store";
 import { METER_PARAMETERS, readMeterValue } from "@/lib/meter-parameters";
@@ -167,12 +167,14 @@ export async function evaluateProjectAlerts(targetProjectId?: string) {
         const shortPoint = sample.meterPointId.replace(/[^a-zA-Z0-9]/g, "").slice(-14) || "pt";
 
         for (const rule of allRules) {
-          if (rule.meterPointId && rule.meterPointId !== sample.meterPointId) continue;
+          // Ngưỡng riêng của điểm đo (hoặc ngưỡng mặc định); null = ngưỡng không áp cho điểm đo này.
+          const limits = ruleThresholdsForPoint(rule, sample.meterPointId);
+          if (!limits) continue;
           const actual = readMeterValue(sample.values, rule.parameterKey);
           if (actual === null || !Number.isFinite(actual)) continue;
 
-          const minNum = rule.minValue.trim() !== "" ? Number(rule.minValue) : null;
-          const maxNum = rule.maxValue.trim() !== "" ? Number(rule.maxValue) : null;
+          const minNum = limits.minValue.trim() !== "" ? Number(limits.minValue) : null;
+          const maxNum = limits.maxValue.trim() !== "" ? Number(limits.maxValue) : null;
           const belowMin = minNum !== null && Number.isFinite(minNum) && actual < minNum;
           const aboveMax = maxNum !== null && Number.isFinite(maxNum) && actual > maxNum;
           if (!belowMin && !aboveMax) continue;

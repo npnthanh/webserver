@@ -1,5 +1,6 @@
 "use client";
 
+import { EmissionTabs } from "@/components/EmissionTabs";
 import Link from "next/link";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import {
@@ -55,6 +56,7 @@ export function EmissionFactors() {
 
   return (
     <div className="mx-auto max-w-[1400px] p-4 sm:p-6 lg:p-8 font-sans">
+      <EmissionTabs />
       {/* Header */}
       <div className="mb-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-slate-900">

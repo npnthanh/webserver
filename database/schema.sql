@@ -517,10 +517,44 @@ CREATE TABLE IF NOT EXISTS admin_notifications (
   actor_id VARCHAR(64) NULL,
   actor_name VARCHAR(100) NULL,
   request_id BIGINT UNSIGNED NULL,
+  detail VARCHAR(255) NULL,
   created_at DATETIME(3) NOT NULL,
   PRIMARY KEY (id),
   KEY idx_admin_notifications_created (created_at),
   KEY idx_admin_notifications_project (project_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Lịch sử gắn / thay đồng hồ của điểm đo (UTC). Biên bản thay đồng hồ: final_index = chỉ số chốt đồng hồ cũ,
+-- initial_index = chỉ số ban đầu đồng hồ mới (kWh). Điện năng được nối liên tục qua các lần thay (lib/meter-continuity.ts).
+CREATE TABLE IF NOT EXISTS meter_point_history (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  project_id VARCHAR(64) NOT NULL,
+  meter_point_id VARCHAR(100) NOT NULL,
+  category VARCHAR(100) NULL,
+  serial_number VARCHAR(100) NOT NULL,
+  valid_from DATETIME NOT NULL DEFAULT '2020-01-01 00:00:00',
+  valid_to DATETIME NULL,
+  final_index DECIMAL(18,6) NULL,
+  initial_index DECIMAL(18,6) NULL,
+  replaced_by VARCHAR(100) NULL,
+  recorded_at DATETIME NULL,
+  PRIMARY KEY (id),
+  KEY idx_mph_point (project_id, meter_point_id, valid_from)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Các lần hệ thống nghi thay đồng hồ (chỉ số tụt, không hồi lại) chờ quản trị viên nhập biên bản / bỏ qua.
+CREATE TABLE IF NOT EXISTS meter_reset_suspects (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  project_id VARCHAR(64) NOT NULL,
+  meter_point_id VARCHAR(100) NOT NULL,
+  serial_number VARCHAR(100) NOT NULL,
+  detected_at DATETIME NOT NULL,
+  before_index DECIMAL(18,6) NOT NULL,
+  after_index DECIMAL(18,6) NOT NULL,
+  status VARCHAR(20) NOT NULL DEFAULT 'open',
+  created_at DATETIME NOT NULL,
+  PRIMARY KEY (id),
+  KEY idx_mrs_point (project_id, meter_point_id, detected_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS admin_notification_seen (

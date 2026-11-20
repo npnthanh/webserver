@@ -18,6 +18,7 @@ import {
   resolveConfiguredSeverity,
   type AlertConfig,
   type NotificationChannelsConfig,
+  ruleThresholdsForPoint,
 } from "@/lib/alert-config";
 import { hydrateClientMeters, loadClientMeters } from "@/lib/client-meters";
 import { exportToExcel } from "@/lib/excel-export";
@@ -176,12 +177,14 @@ export function ClientAlerts({ project }: { project: Project }) {
           const meterPointId = sample.meterPointId;
           const meter = meterList.find((m) => m.id === meterPointId);
           for (const rule of allRules) {
-            if (!rule.enabled || !rule.parameterKey) continue;
-            if (rule.meterPointId && rule.meterPointId !== meterPointId) continue;
+            if (!rule.parameterKey) continue;
+            // Ngưỡng riêng của điểm đo (hoặc ngưỡng mặc định); null = không áp cho điểm đo này.
+            const limits = ruleThresholdsForPoint(rule, meterPointId);
+            if (!limits) continue;
             const actual = readMeterValue(sample.values, rule.parameterKey);
             if (actual === null) continue;
-            const minNum = rule.minValue.trim() !== "" ? Number(rule.minValue) : null;
-            const maxNum = rule.maxValue.trim() !== "" ? Number(rule.maxValue) : null;
+            const minNum = limits.minValue.trim() !== "" ? Number(limits.minValue) : null;
+            const maxNum = limits.maxValue.trim() !== "" ? Number(limits.maxValue) : null;
             const belowMin = minNum !== null && Number.isFinite(minNum) && actual < minNum;
             const aboveMax = maxNum !== null && Number.isFinite(maxNum) && actual > maxNum;
             if (!belowMin && !aboveMax) continue;

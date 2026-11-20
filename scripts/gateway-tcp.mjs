@@ -86,7 +86,7 @@ function wrapHttpAck(jsonText) {
     "HTTP/1.1 200 OK\r\n" +
     "Content-Type: application/json\r\n" +
     `Content-Length: ${Buffer.byteLength(body)}\r\n` +
-    "Connection: close\r\n" +
+    // Không ghi "Connection: close": socket.end() (hàm reply) vẫn đóng kết nối ngay sau ACK.
     "\r\n" +
     body
   );

@@ -69,12 +69,6 @@ const navGroups: {
         permission: "manageDevices",
       },
       {
-        href: "/cau-hinh/nguon-phat-thai",
-        label: "Nguồn phát thải thủ công",
-        icon: EmissionIcon,
-        permission: "manageEmissionFactors",
-      },
-      {
         href: "/cau-hinh/thong-bao",
         label: "Cấu hình thông báo",
         icon: AlertConfigIcon,
@@ -89,6 +83,7 @@ const configItems: { module: ProjectConfigModule; label: string; icon: typeof Ch
   { module: "points", label: "Cấu hình điểm đo", icon: MeterConfigIcon },
   { module: "ghg", label: "Cấu hình khí nhà kính", icon: EmissionIcon },
   { module: "alerts", label: "Cấu hình cảnh báo", icon: AlertConfigIcon },
+  { module: "reports", label: "Cấu hình báo cáo", icon: ReportConfigIcon },
 ];
 
 export function Sidebar() {
@@ -459,6 +454,15 @@ function AlertConfigIcon({ className }: { className?: string }) {
     <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
       <path d="M12 4 3.5 19h17L12 4Z" />
       <path d="M12 10v5M12 17.4v.01" />
+    </svg>
+  );
+}
+
+function ReportConfigIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5Z" />
+      <path d="M14 3v5h5M9 13h6M9 17h4" />
     </svg>
   );
 }

@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { CustomSelect } from "@/components/ui/CustomSelect";
 import type { Project } from "@/lib/projects";
-import { normalizeAlertConfig } from "@/lib/alert-config";
+import { normalizeAlertConfig, ruleThresholdsForPoint } from "@/lib/alert-config";
 import { alertValueText, hydrateAlertEvents, type AlertEvent } from "@/lib/alert-events";
 import { hydrateClientMeters } from "@/lib/client-meters";
 import { computeSourceTons, hydrateGhgSources, type GhgEmissionSource } from "@/lib/ghg-sources";
@@ -13,6 +13,10 @@ import {
   resolveTouPrices,
   type SavedElectricityCostConfig,
   type TouPrices,
+  bandForGap,
+  inferSlotMs,
+  resolveUnknownPriceAt,
+  type VietnamClockParts,
 } from "@/lib/industrial-electricity";
 import { readMeterValue, registerToKwh } from "@/lib/meter-parameters";
 import { formatAppNumber } from "@/lib/number-format";
@@ -95,7 +99,19 @@ function monthlyCostFromSlots(
     const ordered = [...list].sort(
       (a, b) => a.day.localeCompare(b.day) || a.hour - b.hour || a.minute - b.minute,
     );
+    const config: SavedElectricityCostConfig = costConfig ?? {
+      electricity: {
+        prices: {
+          normal: String(prices.normal),
+          off: String(prices.off),
+          peak: String(prices.peak),
+        },
+      },
+    };
+    const bandAt = (parts: VietnamClockParts) => resolveElectricityRateAt(config, parts).band;
+    const slotMs = inferSlotMs(ordered.map((slot) => slotStoredAt(slot.day, slot.hour, slot.minute)));
     let previous: number | null = null;
+    let prevAt: string | null = null;
     for (const slot of ordered) {
       const startKwh = registerToKwh(slot.firstWh);
       const endKwh = registerToKwh(slot.lastWh);
@@ -105,29 +121,18 @@ function monthlyCostFromSlots(
       }
       const within = Math.max(0, endKwh - startKwh);
       const gap = previous == null ? 0 : Math.max(0, startKwh - previous);
-      const delta = within + gap;
       previous = endKwh >= startKwh ? endKwh : startKwh;
-      if (delta <= 0) continue;
-      const parts = vietnamFromStored(slotStoredAt(slot.day, slot.hour, slot.minute));
+      const at = slotStoredAt(slot.day, slot.hour, slot.minute);
+      const gapFrom = prevAt;
+      prevAt = at;
+      if (within + gap <= 0) continue;
+      const parts = vietnamFromStored(at);
       if (!parts) continue;
-      if (costConfig) {
-        const rate = resolveElectricityRateAt(costConfig, parts);
-        total += delta * rate.price;
-      } else {
-        const rate = resolveElectricityRateAt(
-          {
-            electricity: {
-              prices: {
-                normal: String(prices.normal),
-                off: String(prices.off),
-                peak: String(prices.peak),
-              },
-            },
-          },
-          parts,
-        );
-        total += delta * rate.price;
-      }
+      const rate = resolveElectricityRateAt(config, parts);
+      // Phần tích lại sau khoảng mất dữ liệu vắt qua nhiều khung giờ → đơn giá "Không xác định".
+      const gapUnknown = gap > 0 && bandForGap(gapFrom, at, slotMs, bandAt) === "none";
+      total += (gapUnknown ? within : within + gap) * rate.price;
+      if (gapUnknown) total += gap * resolveUnknownPriceAt(config, parts);
     }
   }
   return total;
@@ -231,11 +236,12 @@ export function ClientDashboard({ project }: { project: Project }) {
         for (const sample of latestList) {
           const meter = meters.find((m) => m.id === sample.meterPointId);
           for (const rule of enabledRules) {
-            if (rule.meterPointId && rule.meterPointId !== sample.meterPointId) continue;
+            const limits = ruleThresholdsForPoint(rule, sample.meterPointId);
+            if (!limits) continue;
             const actual = readMeterValue(sample.values, rule.parameterKey);
             if (actual === null) continue;
-            const minNum = rule.minValue.trim() !== "" ? Number(rule.minValue) : null;
-            const maxNum = rule.maxValue.trim() !== "" ? Number(rule.maxValue) : null;
+            const minNum = limits.minValue.trim() !== "" ? Number(limits.minValue) : null;
+            const maxNum = limits.maxValue.trim() !== "" ? Number(limits.maxValue) : null;
             const belowMin = minNum !== null && Number.isFinite(minNum) && actual < minNum;
             const aboveMax = maxNum !== null && Number.isFinite(maxNum) && actual > maxNum;
             if (!belowMin && !aboveMax) continue;
@@ -648,10 +654,44 @@ function EnergyChart({ data }: { data: { day: string; kwh: number; hasSample?: b
       </div>
     );
   }
-  const max = Math.max(...data.map((item) => item.kwh), 0.001);
+  // Trục tung: 4 khoảng chia tròn số (1, 2, 2.5, 5 × 10ⁿ), đơn vị kWh.
+  const rawMax = Math.max(...data.map((item) => item.kwh), 0.001);
+  const rawStep = rawMax / 4;
+  const magnitude = 10 ** Math.floor(Math.log10(rawStep));
+  const step = ([1, 2, 2.5, 5, 10].find((m) => m * magnitude >= rawStep) ?? 10) * magnitude;
+  const max = step * 4;
+  const ticks = [4, 3, 2, 1, 0].map((i) => step * i);
+  const tickDigits = step < 1 ? 2 : step < 10 && !Number.isInteger(step) ? 1 : 0;
 
   return (
-    <div className="flex h-[220px] sm:h-[250px] w-full min-w-0 items-end gap-[2px] pb-1">
+    <div className="flex w-full min-w-0 gap-1.5">
+      {/* Trục tung */}
+      <div className="flex shrink-0 flex-col">
+        <span className="mb-1 text-[10px] font-semibold leading-none text-slate-400">kWh</span>
+        <div className="relative h-[185px] sm:h-[210px] w-9">
+          {ticks.map((value) => (
+            <span
+              key={value}
+              className="absolute right-0 -translate-y-1/2 text-[9px] leading-none text-slate-400"
+              style={{ top: `${100 - (value / max) * 100}%` }}
+            >
+              {formatAppNumber(value, { maxDecimals: tickDigits, minDecimals: tickDigits })}
+            </span>
+          ))}
+        </div>
+      </div>
+      <div className="relative min-w-0 flex-1 pt-[14px]">
+        {/* Đường lưới ngang theo vạch chia */}
+        <div className="pointer-events-none absolute inset-x-0 top-[14px] h-[185px] sm:h-[210px]">
+          {ticks.map((value) => (
+            <span
+              key={value}
+              className={`absolute inset-x-0 border-t ${value === 0 ? "border-slate-200" : "border-dashed border-slate-100"}`}
+              style={{ top: `${100 - (value / max) * 100}%` }}
+            />
+          ))}
+        </div>
+    <div className="relative flex w-full min-w-0 items-end gap-[2px] pb-1">
       {data.map((item, idx) => {
         const heightPct = item.kwh > 0 ? Math.max((item.kwh / max) * 100, 4) : 0;
         const showMobileLabel = idx % 2 === 0 || idx === data.length - 1;
@@ -685,6 +725,8 @@ function EnergyChart({ data }: { data: { day: string; kwh: number; hasSample?: b
           </div>
         );
       })}
+    </div>
+      </div>
     </div>
   );
 }

@@ -84,13 +84,7 @@ export function AccountList() {
             <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-slate-900">
               Quản trị người dùng
             </h1>
-            <span className="rounded-full bg-slate-100 px-2.5 py-0.5 text-xs font-semibold text-slate-600">
-              {accounts.length} tài khoản
-            </span>
           </div>
-          <p className="mt-1 text-xs text-slate-500">
-            Quản lý danh sách tài khoản nội bộ của đơn vị vận hành để quản trị hệ thống và các dự án khách hàng.
-          </p>
         </div>
         {canManage ? (
           <Link
@@ -267,18 +261,6 @@ export function AccountList() {
           </div>
         </div>
       </section>
-
-      {/* Bottom Info Note */}
-      <div className="mt-5 flex items-start gap-3 rounded-2xl border border-emerald-100 bg-emerald-50/40 p-4 text-xs text-emerald-900">
-        <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-emerald-600 text-[10px] font-bold text-white">
-          i
-        </span>
-        <p className="leading-relaxed">
-          <strong className="font-semibold">Phân cấp tài khoản quản trị:</strong> Chỉ hiển thị các tài khoản nội bộ để quản lý các dự án khách hàng, gồm 2 cấp:{" "}
-          <strong>Admin</strong> (có quyền truy cập toàn bộ dự án &amp; quản trị người dùng) và{" "}
-          <strong>Manage</strong> (truy cập các dự án được cho phép quản trị). Cả 2 cấp đều có quyền cấu hình các thông tin phần quản trị.
-        </p>
-      </div>
 
       <ConfirmDialog
         open={Boolean(accountToDelete)}

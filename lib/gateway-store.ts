@@ -27,6 +27,14 @@ import {
   rawRetentionCutoffWall,
   vietnamParts,
 } from "@/lib/server-gateway-rollup";
+import {
+  aggregateNormalized,
+  normalizeRegisterStream,
+  type MeterSwapEvent,
+  type NormalizedEntry,
+  type RegisterEntry,
+} from "@/lib/meter-continuity";
+import { ensureMeterReplacementSchema, recordResetSuspects } from "@/lib/server-meter-replacement";
 
 type ThresholdRow = {
   gateway_id: string;
@@ -403,6 +411,7 @@ async function createSchema() {
   await emsDb.query(
     `DELETE FROM gateway_samples
       WHERE meter_id = 250384934
+        AND received_at < '2026-11-19 00:00:00'
         AND JSON_EXTRACT(values_json, '$.EPaed') IS NOT NULL
         AND CAST(JSON_UNQUOTE(JSON_EXTRACT(values_json, '$.EPaed')) AS DECIMAL(18,6)) < 500`,
   ).catch(() => undefined);
@@ -1547,7 +1556,16 @@ type MeterHistorySegment = {
   meterId: string;
   validFrom: string | null;
   validTo: string | null;
+  /** Biên bản thay đồng hồ: chỉ số chốt khi tháo (đoạn cũ) / chỉ số ban đầu khi lắp (đoạn mới), kWh. */
+  finalIndex?: number | null;
+  initialIndex?: number | null;
 };
+
+function indexOrNull(value: unknown) {
+  if (value == null || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
 
 async function loadProjectMeterSegments(projectId: string): Promise<MeterHistorySegment[]> {
   let points: Array<{
@@ -1562,7 +1580,10 @@ async function loadProjectMeterSegments(projectId: string): Promise<MeterHistory
     serialNumber: string;
     validFrom: string | Date | null;
     validTo: string | Date | null;
+    finalIndex: string | number | null;
+    initialIndex: string | number | null;
   }> = [];
+  await ensureMeterReplacementSchema().catch(() => undefined);
   try {
     [points, historyRows] = await Promise.all([
       queryRows<{
@@ -1583,10 +1604,13 @@ async function loadProjectMeterSegments(projectId: string): Promise<MeterHistory
         serialNumber: string;
         validFrom: string | Date | null;
         validTo: string | Date | null;
+        finalIndex: string | number | null;
+        initialIndex: string | number | null;
       }>(
         `SELECT meter_point_id AS meterPointId, category, serial_number AS serialNumber,
                 DATE_FORMAT(valid_from, '%Y-%m-%d %H:%i:%s') AS validFrom,
-                DATE_FORMAT(valid_to, '%Y-%m-%d %H:%i:%s') AS validTo
+                DATE_FORMAT(valid_to, '%Y-%m-%d %H:%i:%s') AS validTo,
+                final_index AS finalIndex, initial_index AS initialIndex
            FROM meter_point_history
           WHERE project_id = ?
           ORDER BY valid_from ASC, id ASC`,
@@ -1628,6 +1652,8 @@ async function loadProjectMeterSegments(projectId: string): Promise<MeterHistory
           meterId: hMeterId,
           validFrom: vFrom && vFrom > "2020-01-02 00:00:00" ? vFrom : null,
           validTo: vTo,
+          finalIndex: indexOrNull(h.finalIndex),
+          initialIndex: indexOrNull(h.initialIndex),
         });
       }
       if (currentMeterId && !hasCurrentActive) {
@@ -2094,6 +2120,230 @@ function vietnamMonthBounds(year: number, month: number) {
   return vietnamRangeBounds(from, to);
 }
 
+type EnergyMode = "day" | 15 | 30;
+
+function pad2(value: number) {
+  return String(value).padStart(2, "0");
+}
+
+/** Khoá ngày / khung giờ Việt Nam → giờ tường UTC của đầu khoá (dùng cho dữ liệu không có bảng tổng hợp). */
+function vietnamKeyToWall(key: string) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})(?: (\d{2}):(\d{2}))?$/.exec(key);
+  if (!match) return null;
+  const ms = Date.UTC(
+    Number(match[1]),
+    Number(match[2]) - 1,
+    Number(match[3]),
+    Number(match[4] ?? 0),
+    Number(match[5] ?? 0),
+  ) - 7 * 3600_000;
+  return sqlDateTime(new Date(ms));
+}
+
+/** Các khung chỉ số EPaed của một đoạn đồng hồ: khung 15 phút của bảng tổng hợp, hoặc ngày / khung từ bảng mẫu gốc. */
+async function energyEntriesForSegment(
+  seg: MeterHistorySegment,
+  segment: number,
+  startBound: string,
+  endBound: string,
+  useRollup: boolean,
+  mode: EnergyMode,
+): Promise<RegisterEntry[]> {
+  if (useRollup) {
+    const buckets = await loadRollupBuckets(seg.meterId, startBound, endBound);
+    const entries: RegisterEntry[] = [];
+    for (const bucket of buckets) {
+      if (bucket.epaedFirst == null || bucket.epaedLast == null) continue;
+      const { day, hour, minute } = vietnamParts(bucket.bucketStart);
+      const key = mode === "day" ? day : `${day} ${pad2(hour)}:${pad2(minute - (minute % mode))}`;
+      entries.push({
+        at: bucket.bucketStart,
+        key,
+        first: bucket.epaedFirst,
+        last: bucket.epaedLast,
+        meterId: seg.meterId,
+        segment,
+      });
+    }
+    return entries;
+  }
+
+  // Luôn đọc theo khung nhỏ (15 phút khi xem theo ngày): chỉ một cặp đầu / cuối của cả ngày
+  // thì không đủ căn cứ nhận ra chỗ thay đồng hồ / reset nằm ở đâu trong ngày.
+  const slotMinutes = mode === "day" ? 15 : mode;
+  const rows = await queryRows<RowDataPacket>(
+    `SELECT slot_vn AS key_vn,
+            MAX(CASE WHEN rn_asc = 1 THEN epaed END) AS first_wh,
+            MAX(CASE WHEN rn_desc = 1 THEN epaed END) AS last_wh
+       FROM (
+         SELECT slot_vn,
+                epaed,
+                ROW_NUMBER() OVER (PARTITION BY slot_vn ORDER BY received_at ASC, id ASC) AS rn_asc,
+                ROW_NUMBER() OVER (PARTITION BY slot_vn ORDER BY received_at DESC, id DESC) AS rn_desc
+           FROM (
+             SELECT DATE_FORMAT(
+                      DATE_SUB(
+                        DATE_ADD(received_at, INTERVAL 7 HOUR),
+                        INTERVAL MOD(MINUTE(DATE_ADD(received_at, INTERVAL 7 HOUR)), ${slotMinutes}) MINUTE
+                      ),
+                      '%Y-%m-%d %H:%i'
+                    ) AS slot_vn,
+                    CAST(JSON_UNQUOTE(JSON_EXTRACT(values_json, '$.EPaed')) AS DECIMAL(18,6)) AS epaed,
+                    received_at,
+                    id
+               FROM gateway_samples
+              WHERE meter_id = ?
+                AND received_at >= ? AND received_at < ?
+                AND JSON_EXTRACT(values_json, '$.EPaed') IS NOT NULL
+                AND CAST(JSON_UNQUOTE(JSON_EXTRACT(values_json, '$.EPaed')) AS DECIMAL(18,6)) > 0
+           ) stamped
+       ) ranked
+      WHERE rn_asc = 1 OR rn_desc = 1
+      GROUP BY slot_vn
+      ORDER BY slot_vn`,
+    [seg.meterId, startBound, endBound],
+  );
+  const entries: RegisterEntry[] = [];
+  for (const row of rows) {
+    const slotKey = String(row.key_vn ?? "");
+    const at = vietnamKeyToWall(slotKey);
+    const key = mode === "day" ? slotKey.slice(0, 10) : slotKey;
+    const first = Number(row.first_wh);
+    const last = Number(row.last_wh);
+    if (!at || !Number.isFinite(first) || !Number.isFinite(last)) continue;
+    entries.push({ at, key, first, last, meterId: seg.meterId, segment });
+  }
+  return entries;
+}
+
+/** Một lần thay đồng hồ trong kỳ đang xem (biên bản hoặc tự phát hiện) — báo cáo dùng để ghi chú chỉ số. */
+export type GatewayMeterSwap = {
+  meterPointId: string;
+  /** Giờ tường UTC. */
+  at: string;
+  oldSerial: string;
+  newSerial: string;
+  finalIndex: number | null;
+  initialIndex: number | null;
+  /** true: hệ thống tự phát hiện (chưa có biên bản). */
+  auto: boolean;
+};
+
+/**
+ * Chỉ số điện năng của từng điểm đo trong kỳ, đã ghép các đồng hồ (thay / reset) thành chuỗi liên tục.
+ * Xem lib/meter-continuity.ts.
+ */
+async function loadProjectEnergyStreams(
+  projectId: string,
+  bounds: { start: string; end: string },
+  mode: EnergyMode,
+) {
+  const segments = await loadProjectMeterSegments(projectId);
+  const useRollup = await isRollupReady();
+  const segmentsByPoint = new Map<string, MeterHistorySegment[]>();
+  for (const seg of segments) {
+    const list = segmentsByPoint.get(seg.pointId) ?? [];
+    list.push(seg);
+    segmentsByPoint.set(seg.pointId, list);
+  }
+
+  const points: Array<{ pointId: string; entries: NormalizedEntry[] }> = [];
+  const swaps: GatewayMeterSwap[] = [];
+  let latest: ProjectGatewaySample | null = null;
+
+  for (const [pointId, pointSegments] of segmentsByPoint) {
+    const loaded = await Promise.all(
+      pointSegments.map(async (seg, index) => {
+        const startBound = seg.validFrom && seg.validFrom > bounds.start ? seg.validFrom : bounds.start;
+        const endBound = seg.validTo && seg.validTo < bounds.end ? seg.validTo : bounds.end;
+        if (startBound >= endBound) return { entries: [] as RegisterEntry[], latestRow: null as RowDataPacket | null };
+        const [entries, latestRows] = await Promise.all([
+          energyEntriesForSegment(seg, index, startBound, endBound, useRollup, mode),
+          !seg.validTo
+            ? queryRows<RowDataPacket>(
+                `SELECT received_at, values_json
+                   FROM gateway_samples
+                  WHERE meter_id = ?
+                  ORDER BY received_at DESC, id DESC
+                  LIMIT 1`,
+                [seg.meterId],
+              )
+            : Promise.resolve([] as RowDataPacket[]),
+        ]);
+        return { entries, latestRow: latestRows[0] ?? null };
+      }),
+    );
+
+    // Đồng hồ dùng lại serial cũ: khung chứa mốc thay thuộc cả hai đoạn — chỉ giữ một lần.
+    const seen = new Set<string>();
+    const entries: RegisterEntry[] = [];
+    for (const item of loaded) {
+      for (const entry of item.entries) {
+        const key = `${entry.meterId}|${entry.at}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        entries.push(entry);
+      }
+      if (item.latestRow) {
+        const sample = {
+          meterPointId: pointId,
+          at: receivedAtText(item.latestRow.received_at),
+          values: numericValues(item.latestRow.values_json),
+        };
+        if (!latest || sample.at > latest.at) latest = sample;
+      }
+    }
+    entries.sort((a, b) => a.segment - b.segment || a.at.localeCompare(b.at));
+
+    const events: MeterSwapEvent[] = [];
+    for (let index = 1; index < pointSegments.length; index++) {
+      const previous = pointSegments[index - 1];
+      const current = pointSegments[index];
+      const at = current.validFrom ?? previous.validTo;
+      if (!at) continue;
+      events.push({
+        at,
+        toSegment: index,
+        sameMeter: previous.meterId === current.meterId,
+        finalIndex: previous.finalIndex ?? null,
+        initialIndex: current.initialIndex ?? null,
+      });
+      if (at >= bounds.start && at < bounds.end) {
+        swaps.push({
+          meterPointId: pointId,
+          at,
+          oldSerial: previous.meterId,
+          newSerial: current.meterId,
+          finalIndex: previous.finalIndex ?? null,
+          initialIndex: current.initialIndex ?? null,
+          auto: false,
+        });
+      }
+    }
+
+    const normalized = normalizeRegisterStream(entries, events, bounds.start);
+    for (const reset of normalized.detected) {
+      swaps.push({
+        meterPointId: pointId,
+        at: reset.at,
+        oldSerial: reset.meterId,
+        newSerial: reset.meterId,
+        finalIndex: reset.before,
+        initialIndex: reset.after,
+        auto: true,
+      });
+    }
+    if (normalized.detected.length) {
+      void recordResetSuspects(projectId, pointId, normalized.detected).catch((error) => {
+        console.error("Record meter reset suspects failed", error);
+      });
+    }
+    points.push({ pointId, entries: normalized.entries });
+  }
+  swaps.sort((a, b) => a.at.localeCompare(b.at));
+  return { points, latest: latest as ProjectGatewaySample | null, swaps };
+}
+
 async function queryProjectGatewayDaily(
   projectId: string,
   bounds: { start: string; end: string },
@@ -2108,102 +2358,17 @@ async function queryProjectGatewayDaily(
   const cached = getCachedQuery<GatewayDailySummary>(cacheKey);
   if (cached) return cached;
 
-  const segments = await loadProjectMeterSegments(id);
-  const rawDays: Array<GatewayDailyEnergy & { meterId: string }> = [];
-  let latest: ProjectGatewaySample | null = null;
-  const useRollup = await isRollupReady();
-
-  for (const seg of segments) {
-    const startBound = seg.validFrom && seg.validFrom > bounds.start ? seg.validFrom : bounds.start;
-    const endBound = seg.validTo && seg.validTo < bounds.end ? seg.validTo : bounds.end;
-    if (startBound >= endBound) continue;
-
-    const [rows, latestRows] = await Promise.all([
-      useRollup
-        ? dailyRowsFromRollup(seg.meterId, startBound, endBound)
-        : queryRows<RowDataPacket>(
-        `SELECT day_vn,
-                MAX(CASE WHEN rn_asc = 1 THEN epaed END) AS first_wh,
-                MAX(CASE WHEN rn_desc = 1 THEN epaed END) AS last_wh
-           FROM (
-             SELECT DATE_FORMAT(DATE(DATE_ADD(received_at, INTERVAL 7 HOUR)), '%Y-%m-%d') AS day_vn,
-                    CAST(JSON_UNQUOTE(JSON_EXTRACT(values_json, '$.EPaed')) AS DECIMAL(18,6)) AS epaed,
-                    ROW_NUMBER() OVER (
-                      PARTITION BY DATE(DATE_ADD(received_at, INTERVAL 7 HOUR))
-                      ORDER BY received_at ASC, id ASC
-                    ) AS rn_asc,
-                    ROW_NUMBER() OVER (
-                      PARTITION BY DATE(DATE_ADD(received_at, INTERVAL 7 HOUR))
-                      ORDER BY received_at DESC, id DESC
-                    ) AS rn_desc
-               FROM gateway_samples
-              WHERE meter_id = ?
-                AND received_at >= ? AND received_at < ?
-                AND JSON_EXTRACT(values_json, '$.EPaed') IS NOT NULL
-                AND CAST(JSON_UNQUOTE(JSON_EXTRACT(values_json, '$.EPaed')) AS DECIMAL(18,6)) > 0
-           ) ranked
-          WHERE rn_asc = 1 OR rn_desc = 1
-          GROUP BY day_vn
-          ORDER BY day_vn`,
-        [seg.meterId, startBound, endBound],
-          ),
-      !seg.validTo
-        ? queryRows<RowDataPacket>(
-            `SELECT received_at, values_json
-               FROM gateway_samples
-              WHERE meter_id = ?
-              ORDER BY received_at DESC, id DESC
-              LIMIT 1`,
-            [seg.meterId],
-          )
-        : Promise.resolve([] as RowDataPacket[]),
-    ]);
-    for (const row of rows) {
-      const day = String(row.day_vn ?? "");
-      const firstWh = Number(row.first_wh);
-      const lastWh = Number(row.last_wh);
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || !Number.isFinite(firstWh) || !Number.isFinite(lastWh)) continue;
-      rawDays.push({ meterPointId: seg.pointId, day, firstWh, lastWh, meterId: seg.meterId });
-    }
-    const latestRow = latestRows[0];
-    if (latestRow) {
-      const sample = {
-        meterPointId: seg.pointId,
-        at: receivedAtText(latestRow.received_at),
-        values: numericValues(latestRow.values_json),
-      };
-      if (!latest || sample.at > latest.at) latest = sample;
-    }
-  }
-
-  // Gộp theo (meterPointId, day): nếu trong cùng 1 ngày điểm đo có thay thế đồng hồ (nhiều meterId), cộng tổng ΔWh của từng đồng hồ
-  const groupedDays = new Map<string, Array<GatewayDailyEnergy & { meterId: string }>>();
-  for (const item of rawDays) {
-    const key = `${item.meterPointId}:${item.day}`;
-    const list = groupedDays.get(key) ?? [];
-    list.push(item);
-    groupedDays.set(key, list);
-  }
+  const { points, latest } = await loadProjectEnergyStreams(id, bounds, "day");
   const days: GatewayDailyEnergy[] = [];
-  for (const list of groupedDays.values()) {
-    if (list.length === 1) {
-      const single = list[0];
+  for (const point of points) {
+    for (const [day, group] of aggregateNormalized(point.entries)) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) continue;
       days.push({
-        meterPointId: single.meterPointId,
-        day: single.day,
-        firstWh: single.firstWh,
-        lastWh: single.lastWh >= single.firstWh ? single.lastWh : single.firstWh + Math.max(0, single.lastWh),
-      });
-    } else {
-      const totalDeltaWh = list.reduce(
-        (sum, r) => sum + (r.lastWh >= r.firstWh ? r.lastWh - r.firstWh : Math.max(0, r.lastWh)),
-        0,
-      );
-      days.push({
-        meterPointId: list[0].meterPointId,
-        day: list[0].day,
-        firstWh: 0,
-        lastWh: totalDeltaWh,
+        meterPointId: point.pointId,
+        day,
+        firstWh: group.firstWh,
+        // Chỉ số đã nối liên tục qua các lần thay đồng hồ; phần tụt chưa đủ căn cứ (nhiễu) không tính âm.
+        lastWh: Math.max(group.lastWh, group.firstWh),
       });
     }
   }
@@ -2240,13 +2405,19 @@ export type GatewayEnergySlot = {
   day: string;
   hour: number;
   minute: number;
+  /** Chỉ số quy đổi (liên tục qua các lần thay đồng hồ) — dùng để tính điện năng. */
   firstWh: number;
   lastWh: number;
+  /** Chỉ số thực trên mặt đồng hồ — dùng để hiển thị trong báo cáo. */
+  rawFirstWh: number;
+  rawLastWh: number;
 };
 
 export type GatewayEnergySlotSummary = {
   slots: GatewayEnergySlot[];
   latest: ProjectGatewaySample | null;
+  /** Các lần thay đồng hồ / reset chỉ số trong kỳ. */
+  swaps: GatewayMeterSwap[];
 };
 
 export async function getProjectGatewayEnergySlots(
@@ -2255,7 +2426,7 @@ export async function getProjectGatewayEnergySlots(
   to: string,
   slotMinutes: 15 | 30 = 30,
 ): Promise<GatewayEnergySlotSummary> {
-  const empty = { slots: [], latest: null };
+  const empty = { slots: [], latest: null, swaps: [] };
   const bounds = vietnamRangeBounds(from, to);
   const id = projectId.trim();
   if (!id || !bounds) return empty;
@@ -2266,88 +2437,26 @@ export async function getProjectGatewayEnergySlots(
   const cached = getCachedQuery<GatewayEnergySlotSummary>(cacheKey);
   if (cached) return cached;
 
-  const segments = await loadProjectMeterSegments(id);
+  const { points, latest, swaps } = await loadProjectEnergyStreams(id, bounds, slotMinutes);
   const slots: GatewayEnergySlot[] = [];
-  let latest: ProjectGatewaySample | null = null;
-  const useRollup = await isRollupReady();
-
-  for (const seg of segments) {
-    const startBound = seg.validFrom && seg.validFrom > bounds.start ? seg.validFrom : bounds.start;
-    const endBound = seg.validTo && seg.validTo < bounds.end ? seg.validTo : bounds.end;
-    if (startBound >= endBound) continue;
-
-    const [rows, latestRows] = await Promise.all([
-      useRollup
-        ? slotRowsFromRollup(seg.meterId, startBound, endBound, slotMinutes)
-        : queryRows<RowDataPacket>(
-        `SELECT slot_vn,
-                MAX(CASE WHEN rn_asc = 1 THEN epaed END) AS first_wh,
-                MAX(CASE WHEN rn_desc = 1 THEN epaed END) AS last_wh
-           FROM (
-             SELECT slot_vn,
-                    epaed,
-                    ROW_NUMBER() OVER (PARTITION BY slot_vn ORDER BY received_at ASC, id ASC) AS rn_asc,
-                    ROW_NUMBER() OVER (PARTITION BY slot_vn ORDER BY received_at DESC, id DESC) AS rn_desc
-               FROM (
-                 SELECT DATE_FORMAT(
-                          DATE_SUB(
-                            DATE_ADD(received_at, INTERVAL 7 HOUR),
-                            INTERVAL MOD(MINUTE(DATE_ADD(received_at, INTERVAL 7 HOUR)), ${slotMinutes}) MINUTE
-                          ),
-                          '%Y-%m-%d %H:%i'
-                        ) AS slot_vn,
-                        CAST(JSON_UNQUOTE(JSON_EXTRACT(values_json, '$.EPaed')) AS DECIMAL(18,6)) AS epaed,
-                        received_at,
-                        id
-                   FROM gateway_samples
-                  WHERE meter_id = ?
-                    AND received_at >= ? AND received_at < ?
-                    AND JSON_EXTRACT(values_json, '$.EPaed') IS NOT NULL
-                    AND CAST(JSON_UNQUOTE(JSON_EXTRACT(values_json, '$.EPaed')) AS DECIMAL(18,6)) > 0
-               ) stamped
-           ) ranked
-          WHERE rn_asc = 1 OR rn_desc = 1
-          GROUP BY slot_vn
-          ORDER BY slot_vn`,
-        [seg.meterId, startBound, endBound],
-          ),
-      !seg.validTo
-        ? queryRows<RowDataPacket>(
-            `SELECT received_at, values_json
-               FROM gateway_samples
-              WHERE meter_id = ?
-              ORDER BY received_at DESC, id DESC
-              LIMIT 1`,
-            [seg.meterId],
-          )
-        : Promise.resolve([] as RowDataPacket[]),
-    ]);
-    for (const row of rows) {
-      const match = /^(\d{4}-\d{2}-\d{2}) (\d{2}):(\d{2})$/.exec(String(row.slot_vn ?? ""));
-      const firstWh = Number(row.first_wh);
-      const lastWh = Number(row.last_wh);
-      if (!match || !Number.isFinite(firstWh) || !Number.isFinite(lastWh)) continue;
+  for (const point of points) {
+    for (const [key, group] of aggregateNormalized(point.entries)) {
+      const match = /^(\d{4}-\d{2}-\d{2}) (\d{2}):(\d{2})$/.exec(key);
+      if (!match) continue;
       slots.push({
-        meterPointId: seg.pointId,
-        meterId: seg.meterId,
+        meterPointId: point.pointId,
+        meterId: group.meterId,
         day: match[1],
         hour: Number(match[2]),
         minute: Number(match[3]),
-        firstWh,
-        lastWh,
+        firstWh: group.firstWh,
+        lastWh: group.lastWh,
+        rawFirstWh: group.rawFirstWh,
+        rawLastWh: group.rawLastWh,
       });
     }
-    const latestRow = latestRows[0];
-    if (latestRow) {
-      const sample = {
-        meterPointId: seg.pointId,
-        at: receivedAtText(latestRow.received_at),
-        values: numericValues(latestRow.values_json),
-      };
-      if (!latest || sample.at > latest.at) latest = sample;
-    }
   }
-  return setCachedQuery(cacheKey, { slots, latest }, 8000);
+  return setCachedQuery(cacheKey, { slots, latest, swaps }, 8000);
 }
 
 async function meterIsRegistered(packet: NormalizedPacket) {
@@ -2546,40 +2655,6 @@ function receivedAtText(value: unknown) {
 export type { PacketNumber };
 
 /* ---------------- Đọc từ bảng tổng hợp 15 phút (lib/server-gateway-rollup.ts) ---------------- */
-
-/** Cùng định dạng với truy vấn SQL cũ: { day_vn, first_wh, last_wh } theo ngày Việt Nam. */
-async function dailyRowsFromRollup(meterId: string, startWall: string, endWall: string) {
-  const buckets = await loadRollupBuckets(meterId, startWall, endWall);
-  const days = new Map<string, { first: number | null; last: number | null }>();
-  for (const bucket of buckets) {
-    const { day } = vietnamParts(bucket.bucketStart);
-    const entry = days.get(day) ?? { first: null, last: null };
-    if (entry.first == null && bucket.epaedFirst != null) entry.first = bucket.epaedFirst;
-    if (bucket.epaedLast != null) entry.last = bucket.epaedLast;
-    days.set(day, entry);
-  }
-  return [...days.entries()]
-    .filter(([, entry]) => entry.first != null && entry.last != null)
-    .map(([day, entry]) => ({ day_vn: day, first_wh: entry.first, last_wh: entry.last }) as unknown as RowDataPacket);
-}
-
-/** Cùng định dạng với truy vấn SQL cũ: { slot_vn: "YYYY-MM-DD HH:MM", first_wh, last_wh }. */
-async function slotRowsFromRollup(meterId: string, startWall: string, endWall: string, slotMinutes: number) {
-  const buckets = await loadRollupBuckets(meterId, startWall, endWall);
-  const slots = new Map<string, { first: number | null; last: number | null }>();
-  for (const bucket of buckets) {
-    const { day, hour, minute } = vietnamParts(bucket.bucketStart);
-    const slotMinute = minute - (minute % slotMinutes);
-    const key = `${day} ${String(hour).padStart(2, "0")}:${String(slotMinute).padStart(2, "0")}`;
-    const entry = slots.get(key) ?? { first: null, last: null };
-    if (entry.first == null && bucket.epaedFirst != null) entry.first = bucket.epaedFirst;
-    if (bucket.epaedLast != null) entry.last = bucket.epaedLast;
-    slots.set(key, entry);
-  }
-  return [...slots.entries()]
-    .filter(([, entry]) => entry.first != null && entry.last != null)
-    .map(([slot, entry]) => ({ slot_vn: slot, first_wh: entry.first, last_wh: entry.last }) as unknown as RowDataPacket);
-}
 
 /** Chuỗi mẫu đã gom nhóm cho biểu đồ nhiều ngày: giá trị cuối của mỗi khung bucketSeconds. */
 async function seriesRowsFromRollup(

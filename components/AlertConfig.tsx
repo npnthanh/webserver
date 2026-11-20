@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { CustomSelect } from "@/components/ui/CustomSelect";
 import { DEFAULT_USER_ALERT_RULES } from "@/lib/alert-config";
 import { alarmName, alarmUnitHint } from "@/lib/gateway-protocol";
@@ -192,6 +191,10 @@ function buildDefaultAlarmsByCategory(): Record<string, Alarm[]> {
 
 const initialAlarms: Record<string, Alarm[]> = buildDefaultAlarmsByCategory();
 
+function newAlarmId(categoryId: string) {
+  return `${categoryId}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+}
+
 function defaultUnitForCategory(categoryId: string) {
   return alarmUnitHint(null, categoryId) || "";
 }
@@ -258,18 +261,12 @@ export function AlertConfig({
   const [categoriesByUtility, setCategoriesByUtility] = useState<Record<string, Category[]>>(() =>
     buildCategoryMap(utilities.length ? utilities : [firstUtility]),
   );
-  const [activeId, setActiveId] = useState<CategoryId>(
-    categoriesForUtility(firstUtility)[0]?.id ?? "energy",
-  );
   const [alarmsByCategory, setAlarmsByCategory] = useState(initialAlarms);
   const [gateways, setGateways] = useState<GatewayDeviceSnapshot[]>([]);
   const [liveAlarms, setLiveAlarms] = useState<LiveGatewayAlarm[]>([]);
   const [gatewayThresholds, setGatewayThresholds] = useState<GatewayThresholdRow[]>([]);
   const [syncNotice, setSyncNotice] = useState("");
   const [settingsReady, setSettingsReady] = useState(false);
-  const [addingCategory, setAddingCategory] = useState(false);
-  const [categoryToDelete, setCategoryToDelete] = useState<{ id: CategoryId; label: string } | null>(null);
-  const [newCategoryName, setNewCategoryName] = useState("");
   const [showAllLiveParams, setShowAllLiveParams] = useState(false);
 
   async function loadGatewayLive() {
@@ -329,24 +326,16 @@ export function AlertConfig({
           saved?.activeUtility && utilities.includes(saved.activeUtility)
             ? saved.activeUtility
             : firstUtility;
-        const restoredCategories = defaults[restoredUtility] ?? categoriesForUtility(restoredUtility);
         setCategoriesByUtility(defaults);
         setActiveUtility(restoredUtility);
-        const savedActiveId = saved?.activeId;
-        setActiveId(
-          savedActiveId && restoredCategories.some((category) => category.id === savedActiveId)
-            ? savedActiveId
-            : (restoredCategories[0]?.id ?? ""),
-        );
         if (saved?.alarmsByCategory) {
           const next: Record<string, Alarm[]> = buildDefaultAlarmsByCategory();
           for (const [categoryId, rows] of Object.entries(saved.alarmsByCategory)) {
-            const normalizedRows = rows
+            if (!Array.isArray(rows)) continue;
+            // Danh sách rỗng đã lưu = người dùng đã xoá hết, không nạp lại ngưỡng mặc định.
+            next[categoryId] = rows
               .map((row, idx) => normalizeAlarm(row, categoryId, idx))
               .filter((row): row is Alarm => Boolean(row));
-            if (normalizedRows.length > 0) {
-              next[categoryId] = normalizedRows;
-            }
           }
           setAlarmsByCategory(next);
         }
@@ -372,19 +361,51 @@ export function AlertConfig({
           ]),
         ),
         activeUtility,
-        activeId,
         alarmsByCategory,
       },
     });
-  }, [activeId, activeUtility, alarmsByCategory, categoriesByUtility, projectId, settingsReady]);
+  }, [activeUtility, alarmsByCategory, categoriesByUtility, projectId, settingsReady]);
 
-  const categories = categoriesByUtility[activeUtility] ?? categoriesForUtility(activeUtility);
-  const active = categories.find((item) => item.id === activeId) ?? categories[0];
-  const alarms = alarmsByCategory[active?.id ?? "energy"] ?? [];
-  const categoryParameters = useMemo(
-    () => (active ? parametersForCategory(active.id) : []),
-    [active],
+  // Không chia nhóm trên giao diện: gộp mọi nhóm của loại năng lượng (kể cả nhóm đã ẩn trước đây).
+  // Dữ liệu vẫn lưu theo nhóm (suy ra từ tham số) để bộ đánh giá cảnh báo phía server giữ nguyên.
+  const utilityCategories = useMemo(() => {
+    const list = [...categoriesForUtility(activeUtility)];
+    for (const category of categoriesByUtility[activeUtility] ?? []) {
+      if (!list.some((item) => item.id === category.id)) list.push(category);
+    }
+    return list;
+  }, [activeUtility, categoriesByUtility]);
+  const utilityParameters = useMemo(() => {
+    const seen = new Set<string>();
+    const list: MeterParameter[] = [];
+    for (const category of utilityCategories) {
+      for (const param of parametersForCategory(category.id)) {
+        if (seen.has(param.key)) continue;
+        seen.add(param.key);
+        list.push(param);
+      }
+    }
+    return list;
+  }, [utilityCategories]);
+  const alarmEntries = useMemo(
+    () =>
+      utilityCategories.flatMap((category) =>
+        (alarmsByCategory[category.id] ?? []).map((alarm) => ({ alarm, categoryId: category.id })),
+      ),
+    [alarmsByCategory, utilityCategories],
   );
+  const alarms = alarmEntries.map((entry) => entry.alarm);
+  const fallbackCategoryId = utilityCategories[0]?.id ?? "energy";
+
+  /** Nhóm lưu trữ của một tham số (theo biểu đồ của tham số), mặc định nhóm đầu của loại năng lượng. */
+  function categoryForParameter(key: string | undefined) {
+    if (!key || key.startsWith("IDAlarm:")) return fallbackCategoryId;
+    const owner = utilityCategories.find(
+      (category) =>
+        chartIdForCategory(category.id) != null && parametersForCategory(category.id).some((p) => p.key === key),
+    );
+    return owner?.id ?? fallbackCategoryId;
+  }
 
   const latestValuesMap = useMemo(() => {
     const map = new Map<
@@ -407,24 +428,30 @@ export function AlertConfig({
     return map;
   }, [gateways]);
 
-  const unusedCatalog = useMemo(
-    () => catalogCategories.filter((item) => !categories.some((cat) => cat.id === item.id)),
-    [categories],
-  );
-
-  function updateAlarm(alarmKey: string, patch: Partial<Alarm>) {
-    if (!active) return;
-    setAlarmsByCategory((current) => ({
-      ...current,
-      [active.id]: (current[active.id] ?? []).map((item) =>
-        item.id === alarmKey ? { ...item, ...patch } : item,
-      ),
-    }));
+  function updateAlarm(categoryId: string, alarmKey: string, patch: Partial<Alarm>) {
+    // Đổi tham số sang nhóm khác thì chuyển dòng sang nhóm lưu trữ tương ứng.
+    const nextCategory =
+      patch.parameterKey !== undefined && !patch.parameterKey.startsWith("IDAlarm:")
+        ? categoryForParameter(patch.parameterKey)
+        : categoryId;
+    setAlarmsByCategory((current) => {
+      const source = current[categoryId] ?? [];
+      const target = source.find((item) => item.id === alarmKey);
+      if (!target) return current;
+      const updated = { ...target, ...patch };
+      if (nextCategory === categoryId) {
+        return { ...current, [categoryId]: source.map((item) => (item.id === alarmKey ? updated : item)) };
+      }
+      return {
+        ...current,
+        [categoryId]: source.filter((item) => item.id !== alarmKey),
+        [nextCategory]: [...(current[nextCategory] ?? []), updated],
+      };
+    });
   }
 
-  function removeAlarm(alarmKey: string) {
-    if (!active) return;
-    const target = (alarmsByCategory[active.id] ?? []).find((item) => item.id === alarmKey);
+  function removeAlarm(categoryId: string, alarmKey: string) {
+    const target = (alarmsByCategory[categoryId] ?? []).find((item) => item.id === alarmKey);
     if (target?.parameterKey) {
       const matchedThreshold = gatewayThresholds.find(
         (t) => t.parameterName === target.parameterKey,
@@ -439,7 +466,7 @@ export function AlertConfig({
     }
     setAlarmsByCategory((current) => ({
       ...current,
-      [active.id]: (current[active.id] ?? []).filter((item) => item.id !== alarmKey),
+      [categoryId]: (current[categoryId] ?? []).filter((item) => item.id !== alarmKey),
     }));
   }
 
@@ -475,16 +502,16 @@ export function AlertConfig({
   }
 
   function addAlarmForParameter(param?: MeterParameter) {
-    if (!active) return;
-    const existing = alarmsByCategory[active.id] ?? [];
     const chosen =
       param ??
-      categoryParameters.find((p) => !existing.some((a) => a.parameterKey === p.key)) ??
-      categoryParameters[0];
+      utilityParameters.find((p) => !alarms.some((a) => a.parameterKey === p.key)) ??
+      utilityParameters[0];
+    const categoryId = categoryForParameter(chosen?.key);
+    const existing = alarmsByCategory[categoryId] ?? [];
 
     const live = chosen ? latestValuesMap.get(chosen.key) : undefined;
     const row: Alarm = {
-      id: `${active.id}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      id: newAlarmId(categoryId),
       parameterKey: chosen?.key ?? "",
       alarmId: String(chosen?.id ?? existing.length + 1),
       name: chosen ? `Cảnh báo ${chosen.name}` : "",
@@ -493,71 +520,23 @@ export function AlertConfig({
         : "So sánh trực tiếp với giá trị tức thời gateway bắn về",
       minValue: "",
       threshold: "",
-      unit: chosen?.unit || defaultUnitForCategory(active.id),
+      unit: chosen?.unit || defaultUnitForCategory(categoryId),
       current: live != null ? String(live.value) : "",
     };
     setAlarmsByCategory((current) => ({
       ...current,
-      [active.id]: [...(current[active.id] ?? []), row],
+      [categoryId]: [...(current[categoryId] ?? []), row],
     }));
-  }
-
-  function removeCategory(id: CategoryId) {
-    setCategoriesByUtility((current) => ({
-      ...current,
-      [activeUtility]: (current[activeUtility] ?? []).filter((item) => item.id !== id),
-    }));
-    if (activeId === id) {
-      setActiveId(categories.find((item) => item.id !== id)?.id ?? "");
-    }
-  }
-
-  function addExistingCategory(category: Category) {
-    setCategoriesByUtility((current) => ({
-      ...current,
-      [activeUtility]: (current[activeUtility] ?? []).some((item) => item.id === category.id)
-        ? current[activeUtility]
-        : [...(current[activeUtility] ?? []), category],
-    }));
-    setAlarmsByCategory((current) =>
-      current[category.id] ? current : { ...current, [category.id]: [] },
-    );
-    setActiveId(category.id);
-    setAddingCategory(false);
-    setNewCategoryName("");
-  }
-
-  function addCustomCategory() {
-    const label = newCategoryName.trim();
-    if (!label) return;
-    const exists = categories.find((item) => item.label.toLowerCase() === label.toLowerCase());
-    if (exists) {
-      setActiveId(exists.id);
-      setAddingCategory(false);
-      setNewCategoryName("");
-      return;
-    }
-    const fromCatalog = catalogCategories.find((item) => item.label.toLowerCase() === label.toLowerCase());
-    if (fromCatalog) {
-      addExistingCategory(fromCatalog);
-      return;
-    }
-    addExistingCategory({ id: `custom-${Date.now()}`, label, icon: TagIcon });
   }
 
   function selectUtility(utility: MeterType) {
-    const nextCategories = categoriesByUtility[utility] ?? categoriesForUtility(utility);
     setActiveUtility(utility);
-    setActiveId((current) =>
-      nextCategories.some((category) => category.id === current)
-        ? current
-        : (nextCategories[0]?.id ?? ""),
-    );
+    setShowAllLiveParams(false);
   }
 
   const displayedLiveParams = showAllLiveParams
-    ? categoryParameters
-    : categoryParameters.slice(0, 12);
+    ? utilityParameters
+    : utilityParameters.slice(0, 12);
 
   return (
     <div className="space-y-5">
@@ -596,121 +575,12 @@ export function AlertConfig({
         </div>
       </section>
 
-      <div>
-        <div className="mb-2 px-1 text-[10px] font-bold uppercase tracking-[0.16em] text-slate-400">
-          Nhóm cảnh báo tức thời của {activeUtility}
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          {categories.map((category) => {
-            const selected = category.id === active?.id;
-            const Icon = category.icon;
-            return (
-              <div
-                key={category.id}
-                className={`inline-flex h-11 items-center gap-2 rounded-xl pr-1 pl-2.5 text-sm font-semibold transition-all ${
-                  selected
-                    ? "bg-emerald-50 text-emerald-700 shadow-xs ring-1 ring-emerald-500"
-                    : "bg-white text-slate-600 ring-1 ring-slate-200 hover:text-slate-900"
-                }`}
-              >
-                <span
-                  className={`flex h-7 w-7 items-center justify-center rounded-lg ${
-                    selected ? "bg-emerald-600 text-white shadow-xs" : "bg-slate-50 text-slate-500"
-                  }`}
-                >
-                  <Icon className="h-3.5 w-3.5" />
-                </span>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setActiveId(category.id);
-                    setShowAllLiveParams(false);
-                  }}
-                >
-                  {category.label}
-                </button>
-                <button
-                  type="button"
-                  aria-label={`Ẩn nhóm ${category.label}`}
-                  className={`px-2 text-base leading-none ${
-                    selected ? "text-emerald-700/70 hover:text-emerald-900" : "text-slate-400 hover:text-slate-600"
-                  }`}
-                  onClick={() => setCategoryToDelete({ id: category.id, label: category.label })}
-                >
-                  ×
-                </button>
-              </div>
-            );
-          })}
-          {addingCategory ? (
-            <div className="flex min-w-[280px] flex-1 flex-wrap items-center gap-2 rounded-xl border border-dashed border-emerald-500 bg-emerald-50/40 p-2">
-              {unusedCatalog.map((item) => (
-                <button
-                  key={item.id}
-                  type="button"
-                  onClick={() => addExistingCategory(item)}
-                  className="inline-flex h-8 items-center rounded-lg bg-white px-2.5 text-xs font-semibold text-slate-600 ring-1 ring-slate-200 transition-colors hover:text-emerald-600 hover:ring-emerald-500"
-                >
-                  {item.label}
-                </button>
-              ))}
-              <input
-                autoFocus
-                value={newCategoryName}
-                onChange={(e) => setNewCategoryName(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") addCustomCategory();
-                  if (e.key === "Escape") {
-                    setAddingCategory(false);
-                    setNewCategoryName("");
-                  }
-                }}
-                placeholder="Tên nhóm cảnh báo mới"
-                className="h-8 min-w-[160px] flex-1 rounded-lg border border-slate-200 bg-white px-2.5 text-sm outline-none focus:border-emerald-500"
-              />
-              <button
-                type="button"
-                onClick={addCustomCategory}
-                disabled={!newCategoryName.trim()}
-                className="h-8 rounded-lg bg-emerald-600 px-3 text-xs font-semibold text-white shadow-xs transition-colors hover:bg-emerald-700 disabled:opacity-40"
-              >
-                Thêm
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setAddingCategory(false);
-                  setNewCategoryName("");
-                }}
-                className="h-8 rounded-lg px-2 text-xs font-medium text-slate-500 hover:bg-white"
-              >
-                Hủy
-              </button>
-            </div>
-          ) : (
-            <button
-              type="button"
-              onClick={() => setAddingCategory(true)}
-              className="inline-flex h-11 items-center gap-1.5 rounded-xl border border-dashed border-slate-300 bg-white px-3 text-sm font-semibold text-slate-500 transition-colors hover:border-emerald-500 hover:text-emerald-600"
-            >
-              <span className="text-base leading-none text-emerald-600">+</span>
-              Thêm mới
-            </button>
-          )}
-        </div>
-      </div>
-
-      {!active ? (
-        <div className="rounded-xl border border-slate-200 bg-white p-10 text-center text-sm text-slate-500">
-          Chưa có nhóm cảnh báo. Thêm mới để bắt đầu cấu hình.
-        </div>
-      ) : (
-        <>
+      <>
           <section className="rounded-xl border border-slate-200 bg-white p-6 shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
             <div className="mb-5 flex flex-wrap items-start justify-between gap-3">
               <div>
                 <h2 className="text-lg font-semibold tracking-tight text-slate-900">
-                  Cấu hình Cảnh báo tức thời Gateway: {active.label}
+                  Cấu hình cảnh báo tức thời đồng hồ
                 </h2>
                 <p className="mt-1 max-w-3xl text-sm text-slate-500">
                   Trang này chỉ phục vụ cấu hình những cảnh báo tức thời từ dữ liệu Gateway bắn về (tham số{" "}
@@ -729,18 +599,18 @@ export function AlertConfig({
               </div>
             </div>
 
-            {categoryParameters.length > 0 ? (
+            {utilityParameters.length > 0 ? (
               <div className="mb-5 rounded-xl border border-slate-200 bg-slate-50/70 p-4">
                 <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2">
                   <div>
                     <h3 className="text-xs font-bold uppercase tracking-wider text-slate-700">
-                      Giá trị tức thời Gateway bắn về ({active.label})
+                      Giá trị tức thời Gateway bắn về ({activeUtility})
                     </h3>
                     <p className="mt-0.5 text-xs text-slate-500">
                       Xem giá trị thực tế từ gói tin <code className="font-mono">VAL</code> của Gateway để chọn và cài đặt ngưỡng Min / Max chính xác. Bấm vào tham số để thêm nhanh cấu hình ngưỡng.
                     </p>
                   </div>
-                  {categoryParameters.length > 12 ? (
+                  {utilityParameters.length > 12 ? (
                     <button
                       type="button"
                       onClick={() => setShowAllLiveParams((v) => !v)}
@@ -748,7 +618,7 @@ export function AlertConfig({
                     >
                       {showAllLiveParams
                         ? "Thu gọn"
-                        : `Xem tất cả ${categoryParameters.length} tham số`}
+                        : `Xem tất cả ${utilityParameters.length} tham số`}
                     </button>
                   ) : null}
                 </div>
@@ -806,7 +676,7 @@ export function AlertConfig({
             ) : null}
 
             <div className="space-y-3">
-              {alarms.map((alarm) => {
+              {alarmEntries.map(({ alarm, categoryId }) => {
                 const paramMeta = METER_PARAMETERS.find((p) => p.key === alarm.parameterKey);
                 const liveParam = alarm.parameterKey
                   ? latestValuesMap.get(alarm.parameterKey)
@@ -815,7 +685,7 @@ export function AlertConfig({
                 const liveHardwareAlarm = Number.isFinite(code)
                   ? liveAlarms.find((item) => item.source === "gateway" && item.alarmCode === code)
                   : undefined;
-                const resolvedUnit = alarm.unit || paramMeta?.unit || defaultUnitForCategory(active.id);
+                const resolvedUnit = alarm.unit || paramMeta?.unit || defaultUnitForCategory(categoryId);
                 const currentDisplay =
                   liveParam != null
                     ? `${liveParam.value}${resolvedUnit ? ` ${resolvedUnit}` : ""}`
@@ -842,8 +712,8 @@ export function AlertConfig({
                             if (nextKey.startsWith("IDAlarm:")) {
                               const idNum = Number(nextKey.split(":")[1]);
                               const hwName = alarmName(idNum) ?? `Cảnh báo #${idNum}`;
-                              const hwUnit = alarmUnitHint(idNum, active.id);
-                              updateAlarm(alarm.id, {
+                              const hwUnit = alarmUnitHint(idNum, categoryId);
+                              updateAlarm(categoryId, alarm.id, {
                                 parameterKey: nextKey,
                                 alarmId: String(idNum),
                                 name: hwName,
@@ -854,21 +724,21 @@ export function AlertConfig({
                             }
                             const picked = METER_PARAMETERS.find((p) => p.key === nextKey);
                             const live = latestValuesMap.get(nextKey);
-                            updateAlarm(alarm.id, {
+                            updateAlarm(categoryId, alarm.id, {
                               parameterKey: nextKey,
                               alarmId: String(picked?.id ?? alarm.alarmId),
                               name: picked ? `Cảnh báo ${picked.name}` : alarm.name,
                               description: picked
                                 ? `Tham số gateway: ${picked.key} (${picked.group})`
                                 : alarm.description,
-                              unit: picked?.unit ?? defaultUnitForCategory(active.id),
+                              unit: picked?.unit ?? defaultUnitForCategory(categoryForParameter(nextKey)),
                               current: live != null ? String(live.value) : "",
                             });
                           }}
                           className="h-10 w-full rounded-xl border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-800 outline-none focus:border-emerald-500"
                         >
                           <option value="">-- Chọn tham số từ Gateway --</option>
-                          {categoryParameters.map((p) => {
+                          {utilityParameters.map((p) => {
                             const live = latestValuesMap.get(p.key);
                             return (
                               <option key={p.key} value={p.key}>
@@ -889,7 +759,7 @@ export function AlertConfig({
                         </span>
                         <input
                           value={alarm.name}
-                          onChange={(e) => updateAlarm(alarm.id, { name: e.target.value })}
+                          onChange={(e) => updateAlarm(categoryId, alarm.id, { name: e.target.value })}
                           placeholder="Nhập tên cảnh báo"
                           className="h-10 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm font-medium outline-none placeholder:text-slate-400 focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/15"
                         />
@@ -904,7 +774,7 @@ export function AlertConfig({
                         </span>
                         <input
                           value={alarm.minValue ?? ""}
-                          onChange={(e) => updateAlarm(alarm.id, { minValue: e.target.value })}
+                          onChange={(e) => updateAlarm(categoryId, alarm.id, { minValue: e.target.value })}
                           onBlur={() => void syncThresholdToGateway(alarm)}
                           inputMode="decimal"
                           placeholder="Để trống = bỏ qua"
@@ -918,7 +788,7 @@ export function AlertConfig({
                         </span>
                         <input
                           value={alarm.threshold}
-                          onChange={(e) => updateAlarm(alarm.id, { threshold: e.target.value })}
+                          onChange={(e) => updateAlarm(categoryId, alarm.id, { threshold: e.target.value })}
                           onBlur={() => void syncThresholdToGateway(alarm)}
                           inputMode="decimal"
                           placeholder={
@@ -934,8 +804,8 @@ export function AlertConfig({
                         </span>
                         <input
                           value={alarm.unit}
-                          onChange={(e) => updateAlarm(alarm.id, { unit: e.target.value })}
-                          placeholder={defaultUnitForCategory(active.id) || "%"}
+                          onChange={(e) => updateAlarm(categoryId, alarm.id, { unit: e.target.value })}
+                          placeholder={defaultUnitForCategory(categoryId) || "%"}
                           className="h-10 w-full rounded-xl border border-slate-200 bg-slate-50 px-2 text-center text-sm font-bold text-slate-700 outline-none focus:border-emerald-500 focus:bg-white"
                         />
                       </label>
@@ -943,7 +813,7 @@ export function AlertConfig({
                       <div className="pt-5">
                         <button
                           type="button"
-                          onClick={() => removeAlarm(alarm.id)}
+                          onClick={() => removeAlarm(categoryId, alarm.id)}
                           title="Xóa cảnh báo này"
                           className="flex h-10 w-10 items-center justify-center rounded-xl border border-slate-200 text-slate-400 transition-colors hover:border-rose-200 hover:bg-rose-50 hover:text-rose-600"
                         >
@@ -981,7 +851,7 @@ export function AlertConfig({
 
               {alarms.length === 0 ? (
                 <p className="rounded-xl border border-dashed border-slate-200 bg-slate-50 px-4 py-8 text-center text-sm text-slate-400">
-                  Chưa có cảnh báo tức thời nào cho nhóm {active.label}. Bấm vào một tham số bên trên hoặc nút bên dưới để thêm ngưỡng cảnh báo.
+                  Chưa có cảnh báo tức thời nào cho {activeUtility}. Bấm vào một tham số bên trên hoặc nút bên dưới để thêm ngưỡng cảnh báo.
                 </p>
               ) : null}
             </div>
@@ -1043,22 +913,8 @@ export function AlertConfig({
               </div>
             )}
           </section>
-        </>
-      )}
+      </>
 
-      <ConfirmDialog
-        open={Boolean(categoryToDelete)}
-        title="Xác nhận xóa nhóm cảnh báo"
-        description={`Bạn có chắc chắn muốn xóa nhóm cảnh báo "${categoryToDelete?.label}" của ${activeUtility} không? Các cấu hình cảnh báo thuộc nhóm này sẽ bị loại bỏ.`}
-        confirmText="Xóa nhóm"
-        onConfirm={() => {
-          if (categoryToDelete) {
-            removeCategory(categoryToDelete.id);
-            setCategoryToDelete(null);
-          }
-        }}
-        onCancel={() => setCategoryToDelete(null)}
-      />
     </div>
   );
 }

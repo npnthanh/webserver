@@ -1,57 +1,41 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import { SampleTrendChart, type TrendSeriesConfig } from "@/components/client/SampleTrendChart";
-import { CustomSelect } from "@/components/ui/CustomSelect";
+import { SampleTrendChart, TREND_FILL_HEIGHT } from "@/components/client/SampleTrendChart";
+import { ChartParamEmpty } from "@/components/client/ChartParamEmpty";
+import { SectionChecks, useSectionSeries } from "@/components/client/ChartSectionChecks";
+import type { ChartParameterConfig } from "@/lib/chart-parameters";
 import type { ChartSample } from "@/lib/gateway-series";
 import type { TimeFilterValue } from "./TimeFilterBar";
 
-type PowerGroup = "P" | "Q" | "S";
-type FactorGroup = "PF" | "DPF";
+/** Công suất tác dụng P / phản kháng Q / biểu kiến S: tích một hoặc nhiều nhóm. */
+const POWER_SECTIONS = ["P", "Q", "S"];
+/** Hệ số công suất PF / hệ số công suất dịch pha DPF. */
+const FACTOR_SECTIONS = ["PF", "DPF"];
 
-/** Biểu đồ hệ số công suất PF / DPF — dùng trong tab "Công suất" và tab riêng "Hệ số công suất". */
+/** Biểu đồ hệ số công suất PF / DPF (tab "Hệ số công suất"). */
 export function PowerFactorChart({
   samples,
   onRefresh,
+  chartParams,
 }: {
+  timeFilter?: TimeFilterValue;
   samples?: ChartSample[];
   onRefresh?: () => void;
+  chartParams?: ChartParameterConfig;
 }) {
-  const [fGroup, setFGroup] = useState<FactorGroup>("PF");
-
-  const factorSeries = useMemo<TrendSeriesConfig[]>(() => {
-    if (fGroup === "PF") {
-      return [
-        { key: "PFa", label: "PF_Ph1 (PFa)", color: "#5470c6", digits: 3 },
-        { key: "PFb", label: "PF_Ph2 (PFb)", color: "#91cc75", digits: 3 },
-        { key: "PFc", label: "PF_Ph3 (PFc)", color: "#fac858", digits: 3 },
-        { key: "PFt", label: "PF_Total (PFt)", color: "#ee6666", digits: 3 },
-      ];
-    }
-    return [
-      { key: "DPFa", label: "DPF_Ph1 (DPFa)", color: "#5470c6", digits: 3 },
-      { key: "DPFb", label: "DPF_Ph2 (DPFb)", color: "#91cc75", digits: 3 },
-      { key: "DPFc", label: "DPF_Ph3 (DPFc)", color: "#fac858", digits: 3 },
-      { key: "DPFt", label: "DPF_Total (DPFt)", color: "#ee6666", digits: 3 },
-    ];
-  }, [fGroup]);
+  const factor = useSectionSeries("pf", FACTOR_SECTIONS, chartParams);
+  if (!factor.modes.length) return <ChartParamEmpty title="Hệ số công suất (PF / DPF)" />;
 
   return (
     <SampleTrendChart
       title="Hệ số công suất (PF / DPF)"
       unitLabel="cosφ"
-      series={factorSeries}
+      series={factor.series}
       samples={samples}
       onRefresh={onRefresh}
+      heightClass={TREND_FILL_HEIGHT}
       headerControls={
-        <CustomSelect
-          value={fGroup}
-          onChange={(e) => setFGroup(e.target.value as FactorGroup)}
-          className="h-8 min-w-[220px] rounded-md border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-700 outline-none focus:border-emerald-500"
-        >
-          <option value="PF">Hệ số công suất PF (PFa, PFb, PFc, PFt)</option>
-          <option value="DPF">Hệ số công suất dịch pha DPF (DPFa, DPFb, DPFc, DPFt)</option>
-        </CustomSelect>
+        <SectionChecks modes={factor.modes} selectedIds={factor.selectedIds} onToggle={factor.toggle} />
       }
     />
   );
@@ -60,61 +44,29 @@ export function PowerFactorChart({
 export function PowerChart({
   samples,
   onRefresh,
+  chartParams,
 }: {
-  timeFilter: TimeFilterValue;
+  timeFilter?: TimeFilterValue;
   samples?: ChartSample[];
   onRefresh?: () => void;
+  chartParams?: ChartParameterConfig;
 }) {
-  const [pGroup, setPGroup] = useState<PowerGroup>("P");
-
-  const powerSeries = useMemo<TrendSeriesConfig[]>(() => {
-    if (pGroup === "P") {
-      return [
-        { key: "Papa", label: "P_Ph1 (Papa)", color: "#5470c6", unit: "kW", digits: 3 },
-        { key: "Papb", label: "P_Ph2 (Papb)", color: "#91cc75", unit: "kW", digits: 3 },
-        { key: "Papc", label: "P_Ph3 (Papc)", color: "#fac858", unit: "kW", digits: 3 },
-        { key: "Papt", label: "P_Total (Papt)", color: "#ee6666", unit: "kW", digits: 3 },
-      ];
-    }
-    if (pGroup === "Q") {
-      return [
-        { key: "Qrpa", label: "Q_Ph1 (Qrpa)", color: "#5470c6", unit: "kVAR", digits: 3 },
-        { key: "Qrpb", label: "Q_Ph2 (Qrpb)", color: "#91cc75", unit: "kVAR", digits: 3 },
-        { key: "Qrpc", label: "Q_Ph3 (Qrpc)", color: "#fac858", unit: "kVAR", digits: 3 },
-        { key: "Qrpt", label: "Q_Total (Qrpt)", color: "#ee6666", unit: "kVAR", digits: 3 },
-      ];
-    }
-    return [
-      { key: "Sapa", label: "S_Ph1 (Sapa)", color: "#5470c6", unit: "kVA", digits: 3 },
-      { key: "Sapb", label: "S_Ph2 (Sapb)", color: "#91cc75", unit: "kVA", digits: 3 },
-      { key: "Sapc", label: "S_Ph3 (Sapc)", color: "#fac858", unit: "kVA", digits: 3 },
-      { key: "Sapt", label: "S_Total (Sapt)", color: "#ee6666", unit: "kVA", digits: 3 },
-    ];
-  }, [pGroup]);
-
-  const powerUnit = pGroup === "P" ? "kW" : pGroup === "Q" ? "kVAR" : "kVA";
+  const power = useSectionSeries("power", POWER_SECTIONS, chartParams);
+  if (!power.modes.length) return <ChartParamEmpty title="Công suất tức thời" />;
 
   return (
     <div className="space-y-4">
       <SampleTrendChart
         title="Công suất tức thời"
-        unitLabel={powerUnit}
-        series={powerSeries}
+        unitLabel={power.unitLabel || "kW"}
+        series={power.series}
         samples={samples}
         onRefresh={onRefresh}
+        heightClass={TREND_FILL_HEIGHT}
         headerControls={
-          <CustomSelect
-            value={pGroup}
-            onChange={(e) => setPGroup(e.target.value as PowerGroup)}
-            className="h-8 min-w-[220px] rounded-md border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-700 outline-none focus:border-emerald-500"
-          >
-            <option value="P">Công suất tác dụng P (Papa, Papb, Papc, Papt)</option>
-            <option value="Q">Công suất phản kháng Q (Qrpa, Qrpb, Qrpc, Qrpt)</option>
-            <option value="S">Công suất biểu kiến S (Sapa, Sapb, Sapc, Sapt)</option>
-          </CustomSelect>
+          <SectionChecks modes={power.modes} selectedIds={power.selectedIds} onToggle={power.toggle} />
         }
       />
-
     </div>
   );
 }

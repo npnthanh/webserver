@@ -20,6 +20,13 @@ app.prepare()
     const server = createServer((req, res) => {
       try {
         const parsedUrl = parse(req.url, true);
+        // Bản tin gateway (POST /api/gateway, hoặc POST / được middleware chuyển về đó): gửi xong ACK thì
+        // đóng kết nối luôn, thay cho header "Connection: close" (không còn ghi từ này vào ACK).
+        if (req.method === "POST" && (parsedUrl.pathname === "/api/gateway" || parsedUrl.pathname === "/")) {
+          res.on("finish", () => {
+            if (!req.socket.destroyed) req.socket.end();
+          });
+        }
         handle(req, res, parsedUrl);
       } catch (err) {
         console.error("Error handling request:", err);

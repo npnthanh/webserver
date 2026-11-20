@@ -29,7 +29,6 @@ import {
 } from "@/lib/number-format";
 import { vietnamNow } from "@/lib/vietnam-time";
 import { hydrateGhgTemplates, type GhgManualTemplate } from "@/lib/ghg-templates";
-import Link from "next/link";
 import {
   hydrateClientMeters,
   loadClientMeters,
@@ -139,7 +138,7 @@ export function GhgConfig({ projectId }: { projectId: string }) {
   const [formula, setFormula] = useState(DEFAULT_METER_FORMULA);
   const [appliedAt, setAppliedAt] = useState(() => vietnamNow().date);
   const [formError, setFormError] = useState("");
-  // Nhập thủ công: chọn nguồn phát thải đã cấu hình sẵn (Cấu hình → Nguồn phát thải thủ công).
+  // Nhập thủ công: chọn công thức phát thải đã cấu hình sẵn (Hệ số phát thải → Công thức phát thải).
   const [templates, setTemplates] = useState<GhgManualTemplate[]>([]);
   const [templateId, setTemplateId] = useState("");
 
@@ -546,8 +545,9 @@ export function GhgConfig({ projectId }: { projectId: string }) {
               <legend className="mb-2 text-[11px] font-semibold tracking-wide text-slate-500">
                 PHƯƠNG THỨC NHẬP SỐ LIỆU
               </legend>
-              <div className="grid gap-3 sm:grid-cols-3">
-                {METHODS.map((item) => {
+              <div className={`grid gap-3 ${method === "file" ? "sm:grid-cols-3" : "sm:grid-cols-2"}`}>
+                {/* "Tải file" đã bỏ: chỉ còn hiện khi sửa nguồn cũ tạo bằng phương thức này. */}
+                {METHODS.filter((item) => item.id !== "file" || method === "file").map((item) => {
                   const selected = method === item.id;
                   const Icon = methodIcons[item.id];
                   return (
@@ -612,9 +612,6 @@ export function GhgConfig({ projectId }: { projectId: string }) {
                   </CustomSelect>
                   <ChevronIcon className="pointer-events-none absolute top-1/2 right-3 h-4 w-4 -translate-y-1/2 text-slate-400" />
                 </div>
-                <p className="mt-1.5 text-xs text-slate-500">
-                  Chọn điểm đo thuộc dự án làm dữ liệu đầu vào cho nguồn phát thải.
-                </p>
                 {selectedMeter ? (
                   <div className="mt-3 grid gap-2 rounded-xl border border-emerald-100 bg-emerald-50/60 p-3 text-xs sm:grid-cols-3">
                     <div>
@@ -637,7 +634,7 @@ export function GhgConfig({ projectId }: { projectId: string }) {
             ) : null}
 
             {method === "manual" ? (
-              <Field label="NGUỒN PHÁT THẢI">
+              <Field label="CÔNG THỨC PHÁT THẢI">
                 <div className="relative">
                   <CustomSelect
                     value={templateId}
@@ -645,7 +642,7 @@ export function GhgConfig({ projectId }: { projectId: string }) {
                     className="input appearance-none pr-9"
                   >
                     <option value="">
-                      {templates.length ? "Chọn nguồn phát thải đã cấu hình" : "Chưa có nguồn phát thải nào được cấu hình"}
+                      {templates.length ? "Chọn công thức phát thải đã cấu hình" : "Chưa có công thức phát thải nào được cấu hình"}
                     </option>
                     {editingId && templateId === KEEP_CURRENT ? (
                       <option value={KEEP_CURRENT}>Giữ cấu hình hiện tại</option>
@@ -658,14 +655,6 @@ export function GhgConfig({ projectId }: { projectId: string }) {
                   </CustomSelect>
                   <ChevronIcon className="pointer-events-none absolute top-1/2 right-3 h-4 w-4 -translate-y-1/2 text-slate-400" />
                 </div>
-                {templates.length === 0 ? (
-                  <p className="mt-1.5 text-xs text-slate-500">
-                    <Link href="/cau-hinh/nguon-phat-thai" className="font-semibold text-emerald-700 hover:underline">
-                      Thêm nguồn phát thải
-                    </Link>{" "}
-                    ở Cấu hình → Nguồn phát thải thủ công.
-                  </p>
-                ) : null}
                 {templateId ? (
                   <div className="mt-3 grid gap-2 rounded-xl border border-emerald-100 bg-emerald-50/60 p-3 text-xs sm:grid-cols-2">
                     <div>
@@ -766,11 +755,7 @@ export function GhgConfig({ projectId }: { projectId: string }) {
                     ))}
                   </ul>
                 </div>
-              ) : (
-                <p className="mt-1.5 text-xs text-slate-500">
-                  Có thể bỏ trống nếu nguồn chỉ cần hệ số nhân (vd. nhiệt trị Q) để tính.
-                </p>
-              )}
+              ) : null}
             </Field>
 
             <div>
@@ -787,9 +772,6 @@ export function GhgConfig({ projectId }: { projectId: string }) {
                   Thêm hệ số nhân
                 </button>
               </div>
-              <p className="mb-2 text-[12px] text-slate-500">
-                Luôn dùng được — kể cả khi không chọn hệ số phát thải. Ký hiệu chèn vào công thức bên dưới.
-              </p>
               <div className="overflow-x-auto rounded-xl border border-slate-200">
                 <table className="w-full min-w-[560px] text-left text-xs">
                   <thead className="border-b border-slate-100 bg-slate-50 text-[10px] font-semibold uppercase tracking-wide text-slate-400">

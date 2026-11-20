@@ -15,7 +15,8 @@ export type ProjectEventType =
   | "project_delete_requested"
   | "project_deleted"
   | "project_delete_rejected"
-  | "project_delete_cancelled";
+  | "project_delete_cancelled"
+  | "meter_reset_suspected";
 
 export type AdminNotification = {
   id: number;
@@ -23,6 +24,8 @@ export type AdminNotification = {
   projectId: string;
   projectName: string;
   actorName: string;
+  /** Nội dung thêm (thông báo hệ thống). */
+  detail?: string;
   createdAt: string;
   unread: boolean;
   /** Có khi thông báo gắn với một yêu cầu xoá. */
@@ -81,6 +84,8 @@ export function ensureProjectEventsSchema() {
            PRIMARY KEY (account_id)
          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
       );
+      // Nội dung thêm của thông báo hệ thống (VD: nghi thay đồng hồ ở điểm đo nào, lúc nào).
+      await emsDb.query("ALTER TABLE admin_notifications ADD COLUMN detail VARCHAR(255) NULL").catch(() => undefined);
     })().catch((error) => {
       schemaReady = null;
       throw error;
@@ -260,7 +265,7 @@ export async function listNotifications(session: AuthSession, limit = 30) {
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
   const rows = await queryRows<RowDataPacket>(
     `SELECT n.id, n.type, n.project_id AS projectId, n.project_name AS projectName,
-            n.actor_id AS actorId, n.actor_name AS actorName, n.request_id AS requestId,
+            n.actor_id AS actorId, n.actor_name AS actorName, n.request_id AS requestId, n.detail AS detail,
             DATE_FORMAT(n.created_at, '%Y-%m-%d %H:%i:%s') AS createdAt,
             r.status AS requestStatus, r.requested_by AS requestedBy,
             r.requested_by_name AS requestedByName, r.decided_by_name AS decidedByName
@@ -285,6 +290,7 @@ export async function listNotifications(session: AuthSession, limit = 30) {
       projectId: String(row.projectId),
       projectName: String(row.projectName),
       actorName: String(row.actorName ?? "Hệ thống"),
+      ...(row.detail ? { detail: String(row.detail) } : {}),
       createdAt,
       // Cùng định dạng "YYYY-MM-DD HH:MM:SS" (UTC) nên so sánh chuỗi là đúng thứ tự thời gian.
       // Việc do chính mình làm không tính là thông báo mới.

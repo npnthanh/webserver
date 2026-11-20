@@ -248,10 +248,20 @@ export function GreenhouseCharts({ projectId = "default" }: { projectId?: string
       : getTimeFilterPeriods(effectiveTimeFilter);
 
     const len = periods.length || 1;
-    const buckets = Array<number>(len).fill(0);
+    // Lượng phát thải theo từng nguồn trong mỗi kỳ — để vẽ cột xếp chồng.
+    const bySource = new Map<string, number[]>();
+    const bucketOf = (id: string) => {
+      let list = bySource.get(id);
+      if (!list) {
+        list = Array<number>(len).fill(0);
+        bySource.set(id, list);
+      }
+      return list;
+    };
 
     if (meterSources.length > 0) {
       for (const src of meterSources) {
+        const buckets = bucketOf(src.id);
         const factor = Number.isFinite(src.factorValue) ? src.factorValue : 0;
         const mul = (src.multipliers ?? []).reduce(
           (acc, m) => acc * (Number.isFinite(m.value) ? m.value : 1),
@@ -271,22 +281,49 @@ export function GreenhouseCharts({ projectId = "default" }: { projectId?: string
     if (manualSources.length > 0) {
       if (effectiveTimeFilter.mode === "year" || force12MonthsForManual) {
         // Phân bổ đúng giá trị của từng tháng (T1..T12)
-        for (let m = 1; m <= Math.min(12, len); m += 1) {
-          let monthTons = 0;
-          for (const src of manualSources) {
+        for (const src of manualSources) {
+          const buckets = bucketOf(src.id);
+          for (let m = 1; m <= Math.min(12, len); m += 1) {
             const act = getSourceMonthActivity(src, activeYearAndMonth.year, m);
-            monthTons += computeManualTons(src, act) ?? 0;
+            buckets[m - 1] += computeManualTons(src, act) ?? 0;
           }
-          buckets[m - 1] += monthTons;
         }
       }
     }
 
-    return periods.map((p, idx) => ({
-      label: p.label,
-      value: Number(buckets[idx].toFixed(6)),
-    }));
-  }, [selectedRows, effectiveTimeFilter, meterReadings, activeYearAndMonth.year]);
+    // Nhóm đoạn cột giống biểu đồ tròn: Tất cả → theo Scope; còn lại → theo từng nguồn.
+    const groups: { id: string; label: string; color: string; buckets: number[] }[] =
+      selection.kind === "all"
+        ? GHG_SCOPES.map((sc) => {
+            const buckets = Array<number>(len).fill(0);
+            for (const row of selectedRows) {
+              if (row.scope !== sc.id) continue;
+              const list = bySource.get(row.id);
+              if (list) list.forEach((v, i) => (buckets[i] += v));
+            }
+            return { id: `scope-${sc.id}`, label: sc.label, color: SCOPE_COLORS[sc.id].bar, buckets };
+          })
+        : selectedRows.map((row, idx) => ({
+            id: row.id,
+            label: row.name,
+            color: SOURCE_PALETTE[idx % SOURCE_PALETTE.length],
+            buckets: bySource.get(row.id) ?? Array<number>(len).fill(0),
+          }));
+
+    return periods.map((p, idx) => {
+      const parts = groups.map((g) => ({
+        id: g.id,
+        label: g.label,
+        color: g.color,
+        value: Number(Math.max(0, g.buckets[idx]).toFixed(6)),
+      }));
+      return {
+        label: p.label,
+        value: Number(parts.reduce((s, part) => s + part.value, 0).toFixed(6)),
+        parts,
+      };
+    });
+  }, [selectedRows, selection.kind, effectiveTimeFilter, meterReadings, activeYearAndMonth.year]);
 
   const totalSelectedTons = useMemo(
     () => Number(selectedRows.reduce((s, r) => s + r.tons, 0).toFixed(6)),
@@ -1238,7 +1275,9 @@ function PieChart({
 }
 
 /* ---------- Biểu đồ cột thời gian ---------- */
-function BarChart({ data }: { data: { label: string; value: number }[] }) {
+type StackPart = { id: string; label: string; color: string; value: number };
+
+function BarChart({ data }: { data: { label: string; value: number; parts: StackPart[] }[] }) {
   const maxVal = Math.max(...data.map((d) => d.value), 0);
   const niceMax = maxVal <= 0 ? 1 : maxVal * 1.15;
   const ticks = [0, 0.25, 0.5, 0.75, 1].map((t) =>
@@ -1270,18 +1309,54 @@ function BarChart({ data }: { data: { label: string; value: number }[] }) {
             <div className="relative z-10 flex h-full items-end justify-around gap-1 px-2">
               {data.map((d, idx) => {
                 const heightPct = niceMax > 0 ? Math.min(100, (d.value / niceMax) * 100) : 0;
+                const parts = d.parts.filter((part) => part.value > 0);
+                const leftHalf = idx < data.length / 2;
                 return (
                   <div
                     key={idx}
                     className="group relative flex h-full flex-1 flex-col items-center justify-end"
                   >
-                    <div className="pointer-events-none absolute -top-6 hidden rounded bg-slate-900 px-1.5 py-0.5 font-mono text-[10px] whitespace-nowrap text-white shadow group-hover:block">
-                      {formatNumber(d.value)} t
-                    </div>
+                    {/* Tooltip: tổng + từng phần (giá trị, %) */}
                     <div
-                      className="w-full max-w-[26px] rounded-t-md bg-emerald-500 transition-all group-hover:bg-emerald-600"
+                      className={`pointer-events-none absolute top-1 z-20 hidden min-w-[190px] rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-[11px] whitespace-nowrap shadow-lg group-hover:block ${
+                        leftHalf ? "left-1/2 ml-3" : "right-1/2 mr-3"
+                      }`}
+                    >
+                      <p className="font-semibold text-slate-500">{d.label}</p>
+                      <p className="mt-0.5 font-bold text-slate-800">
+                        Tổng: <span className="font-mono">{formatNumber(d.value)}</span> tấn CO₂e
+                      </p>
+                      {d.parts.length > 1 || (d.parts.length === 1 && d.parts[0].label) ? (
+                        <div className="mt-1 space-y-0.5">
+                          {d.parts.map((part) => (
+                            <div key={part.id} className="flex items-center gap-1.5">
+                              <span className="h-2 w-2 shrink-0 rounded-xs" style={{ backgroundColor: part.color }} />
+                              <span className="max-w-[140px] truncate text-slate-600">{part.label}</span>
+                              <span className="ml-auto pl-2 font-mono font-semibold" style={{ color: part.color }}>
+                                {formatNumber(part.value)} t (
+                                {formatNumber(d.value > 0 ? (part.value / d.value) * 100 : 0, 1)}%)
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
+                    {/* Cột xếp chồng: phần đầu tiên nằm dưới cùng */}
+                    <div
+                      className="flex w-full max-w-[26px] flex-col-reverse overflow-hidden rounded-t-md transition-opacity group-hover:opacity-85"
                       style={{ height: `${heightPct}%` }}
-                    />
+                    >
+                      {parts.map((part) => (
+                        <div
+                          key={part.id}
+                          className="w-full shrink-0 border-t border-white/60 first:border-t-0"
+                          style={{
+                            height: `${d.value > 0 ? (part.value / d.value) * 100 : 0}%`,
+                            backgroundColor: part.color,
+                          }}
+                        />
+                      ))}
+                    </div>
                   </div>
                 );
               })}

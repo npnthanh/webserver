@@ -274,9 +274,6 @@ export function ProjectList() {
                             >
                               {project.name}
                             </Link>
-                            <span className="block font-mono text-[11px] text-slate-400">
-                              {project.id} • Khởi tạo: {project.startDate}
-                            </span>
                           </div>
                         </div>
                       </td>

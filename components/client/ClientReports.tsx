@@ -18,9 +18,22 @@ import { hydrateClientMeters, type ClientMeter } from "@/lib/client-meters";
 import { exportToExcel, type ExcelCellValue } from "@/lib/excel-export";
 import { formatAppNumber } from "@/lib/number-format";
 import {
+  DEFAULT_HEADER_FOOTER,
+  REPORTS,
+  REPORT_FIELDS,
+  defaultSelectedFieldsByReport,
+  readReportConfig,
+  reportTitle,
+  type ReportConfig,
+  type ReportFieldDef,
+  type ReportHeaderFooterConfig,
+  type ReportTypeId,
+} from "@/lib/report-config";
+import {
   loadProjectGatewayEnergySlots,
   loadProjectGatewayLatest,
   type GatewayEnergySlot,
+  type GatewayMeterSwap,
   type ProjectGatewaySample,
 } from "@/lib/gateway-series";
 import {
@@ -37,6 +50,9 @@ import {
   voltageLevelById,
   type TouPrices,
   type VoltageLevelId,
+  bandForGap,
+  industrialBandAt,
+  inferSlotMs,
 } from "@/lib/industrial-electricity";
 import { METER_PARAMETERS, readMeterValue, registerToKwh } from "@/lib/meter-parameters";
 import { hydrateProjectSettings, saveProjectSettings } from "@/lib/project-settings";
@@ -46,43 +62,7 @@ import { formatStoredVietnam, vietnamFromStored, vietnamNow } from "@/lib/vietna
 type YesNo = "Có" | "Không";
 type Format = ".pdf" | ".xlsx";
 
-export type ReportTypeId =
-  | "overview"
-  | "energy"
-  | "cost"
-  | "ghg"
-  | "alerts"
-  | "comparison";
-
 type ComparisonBaseline = "prev_period" | "prev_month" | "prev_year" | "between_meters";
-
-type ReportFieldDef = {
-  key: string;
-  label: string;
-  align?: "left" | "right";
-  defaultChecked?: boolean;
-};
-
-type ReportHeaderFooterConfig = {
-  companyName: string;
-  department: string;
-  formCode: string;
-  preparedByTitle: string;
-  reviewedByTitle: string;
-  approvedByTitle: string;
-  footerNote: string;
-};
-
-const DEFAULT_HEADER_FOOTER: ReportHeaderFooterConfig = {
-  companyName: "HỆ THỐNG QUẢN LÝ NĂNG LƯỢNG & PHÁT THẢI EMS",
-  department: "Phòng Kỹ thuật & Quản lý Năng lượng",
-  formCode: "BM-EMS-01/BC",
-  preparedByTitle: "Người lập biểu",
-  reviewedByTitle: "Kiểm soát kỹ thuật",
-  approvedByTitle: "Phê duyệt / Giám đốc",
-  footerNote:
-    "Báo cáo được trích xuất tự động từ Hệ thống Quản lý Năng lượng EMS — Dữ liệu đo đếm thời gian thực từ Gateway.",
-};
 
 const TEMPLATES = [
   "Mẫu báo cáo chuẩn EMS",
@@ -91,132 +71,24 @@ const TEMPLATES = [
   "Mẫu tùy chỉnh doanh nghiệp",
 ];
 
-const REPORTS: {
-  id: ReportTypeId;
-  name: string;
-  title: string;
-  subtitle: string;
-  formCode: string;
-}[] = [
-  {
-    id: "overview",
-    name: "Báo cáo tổng hợp",
-    title: "BÁO CÁO TỔNG HỢP NĂNG LƯỢNG & VẬN HÀNH",
-    subtitle: "Tổng hợp tiêu thụ năng lượng, công suất, chi phí, phát thải khí nhà kính và cảnh báo",
-    formCode: "BM-EMS-01/TH",
-  },
-  {
-    id: "energy",
-    name: "Báo cáo tiêu hao",
-    title: "BÁO CÁO TIÊU HAO NĂNG LƯỢNG",
-    subtitle: "Thống kê sản lượng tiêu thụ theo điểm đo, khung giờ bình thường / thấp điểm / cao điểm và thông số điện",
-    formCode: "BM-EMS-02/THN",
-  },
-  {
-    id: "cost",
-    name: "Báo cáo chi phí",
-    title: "BÁO CÁO CHI PHÍ NĂNG LƯỢNG",
-    subtitle: "Phân tích chi phí tiền điện theo biểu giá 3 khung giờ (Bình thường, Thấp điểm, Cao điểm) và tỷ trọng",
-    formCode: "BM-EMS-03/CP",
-  },
-  {
-    id: "ghg",
-    name: "Khí nhà kính",
-    title: "BÁO CÁO KIỂM KÊ KHÍ NHÀ KÍNH (GHG)",
-    subtitle: "Tổng hợp nguồn phát thải theo Phạm vi 1, Phạm vi 2, Phạm vi 3 và lượng phát thải quy đổi tCO₂e",
-    formCode: "BM-EMS-04/GHG",
-  },
-  {
-    id: "alerts",
-    name: "Cảnh báo",
-    title: "BÁO CÁO THỐNG KÊ CẢNH BÁO HỆ THỐNG",
-    subtitle: "Nhật ký thời điểm phát sinh cảnh báo vượt ngưỡng, phân loại mức độ và trạng thái gửi Zalo / Telegram",
-    formCode: "BM-EMS-05/CB",
-  },
-  {
-    id: "comparison",
-    name: "Báo cáo so sánh",
-    title: "BÁO CÁO SO SÁNH TIÊU THỤ & CHI PHÍ",
-    subtitle: "Đối chiếu biến động sản lượng tiêu hao và chi phí giữa kỳ báo cáo với kỳ đối chiếu hoặc giữa các điểm đo",
-    formCode: "BM-EMS-06/SS",
-  },
-];
 
-const REPORT_FIELDS: Record<ReportTypeId, ReportFieldDef[]> = {
-  overview: [
-    { key: "point", label: "Điểm đo / Mã thiết bị", align: "left", defaultChecked: true },
-    { key: "utility", label: "Loại năng lượng", align: "left", defaultChecked: true },
-    { key: "kwhTotal", label: "Tổng tiêu thụ (kWh)", align: "right", defaultChecked: true },
-    { key: "kwhPeak", label: "Tiêu thụ giờ cao điểm (kWh)", align: "right", defaultChecked: true },
-    { key: "powerAvg", label: "Công suất P hiện tại (kW)", align: "right", defaultChecked: true },
-    { key: "costVnd", label: "Chi phí ước tính (VNĐ)", align: "right", defaultChecked: true },
-    { key: "ghgTons", label: "Phát thải quy đổi (tCO₂e)", align: "right", defaultChecked: true },
-    { key: "alertCount", label: "Số lần cảnh báo", align: "right", defaultChecked: true },
-  ],
-  energy: [
-    { key: "period", label: "Thời điểm / Kỳ đo", align: "left", defaultChecked: true },
-    { key: "point", label: "Điểm đo", align: "left", defaultChecked: true },
-    { key: "firstKwh", label: "Chỉ số đầu kỳ (kWh)", align: "right", defaultChecked: true },
-    { key: "lastKwh", label: "Chỉ số cuối kỳ (kWh)", align: "right", defaultChecked: true },
-    { key: "deltaKwh", label: "Sản lượng tiêu hao (kWh)", align: "right", defaultChecked: true },
-    { key: "normalKwh", label: "Giờ bình thường (kWh)", align: "right", defaultChecked: true },
-    { key: "offKwh", label: "Giờ thấp điểm (kWh)", align: "right", defaultChecked: true },
-    { key: "peakKwh", label: "Giờ cao điểm (kWh)", align: "right", defaultChecked: true },
-    { key: "uAvg", label: "Điện áp pha TB (V)", align: "right", defaultChecked: false },
-    { key: "iAvg", label: "Dòng điện pha TB (A)", align: "right", defaultChecked: false },
-  ],
-  cost: [
-    { key: "period", label: "Thời điểm / Kỳ tính", align: "left", defaultChecked: true },
-    { key: "point", label: "Điểm đo", align: "left", defaultChecked: true },
-    { key: "kwhTotal", label: "Tổng điện năng (kWh)", align: "right", defaultChecked: true },
-    { key: "voltageLevel", label: "Cấp điện áp biểu giá", align: "left", defaultChecked: false },
-    { key: "normalVnd", label: "Tiền giờ bình thường (VNĐ)", align: "right", defaultChecked: true },
-    { key: "offVnd", label: "Tiền giờ thấp điểm (VNĐ)", align: "right", defaultChecked: true },
-    { key: "peakVnd", label: "Tiền giờ cao điểm (VNĐ)", align: "right", defaultChecked: true },
-    { key: "totalVnd", label: "Tổng thành tiền (VNĐ)", align: "right", defaultChecked: true },
-    { key: "sharePct", label: "Tỷ trọng chi phí (%)", align: "right", defaultChecked: true },
-  ],
-  ghg: [
-    { key: "scope", label: "Phạm vi (Scope)", align: "left", defaultChecked: true },
-    { key: "sourceName", label: "Tên nguồn phát thải", align: "left", defaultChecked: true },
-    { key: "method", label: "Phương thức thu thập", align: "left", defaultChecked: true },
-    { key: "activityVal", label: "Dữ liệu hoạt động / Tiêu thụ", align: "right", defaultChecked: true },
-    { key: "factorStr", label: "Hệ số phát thải", align: "left", defaultChecked: true },
-    { key: "multiplierStr", label: "Hệ số nhân", align: "left", defaultChecked: true },
-    { key: "formula", label: "Công thức tính", align: "left", defaultChecked: false },
-    { key: "tonsCo2e", label: "Phát thải (tCO₂e)", align: "right", defaultChecked: true },
-    { key: "sharePct", label: "Tỷ trọng (%)", align: "right", defaultChecked: true },
-  ],
-  alerts: [
-    { key: "timestamp", label: "Thời điểm phát sinh", align: "left", defaultChecked: true },
-    { key: "severity", label: "Mức độ cảnh báo", align: "left", defaultChecked: true },
-    { key: "point", label: "Điểm đo", align: "left", defaultChecked: true },
-    { key: "parameter", label: "Mã thông số", align: "left", defaultChecked: true },
-    { key: "value", label: "Giá trị thực tế", align: "right", defaultChecked: true },
-    { key: "threshold", label: "Ngưỡng cài đặt", align: "right", defaultChecked: true },
-    { key: "delivery", label: "Trạng thái gửi (Zalo / Telegram)", align: "left", defaultChecked: true },
-    { key: "message", label: "Nội dung cảnh báo", align: "left", defaultChecked: true },
-  ],
-  comparison: [
-    { key: "target", label: "Điểm đo / Chỉ tiêu so sánh", align: "left", defaultChecked: true },
-    { key: "currentKwh", label: "Sản lượng kỳ báo cáo (kWh)", align: "right", defaultChecked: true },
-    { key: "baseKwh", label: "Sản lượng kỳ đối chiếu (kWh)", align: "right", defaultChecked: true },
-    { key: "diffKwh", label: "Chênh lệch tiêu hao (kWh)", align: "right", defaultChecked: true },
-    { key: "diffPct", label: "Biến động (%)", align: "right", defaultChecked: true },
-    { key: "currentCost", label: "Chi phí kỳ báo cáo (VNĐ)", align: "right", defaultChecked: true },
-    { key: "baseCost", label: "Chi phí kỳ đối chiếu (VNĐ)", align: "right", defaultChecked: true },
-    { key: "diffCost", label: "Chênh lệch chi phí (VNĐ)", align: "right", defaultChecked: true },
-    { key: "trend", label: "Đánh giá xu hướng", align: "left", defaultChecked: true },
-  ],
-};
-
-function defaultSelectedFieldsByReport(): Record<ReportTypeId, string[]> {
-  return Object.fromEntries(
-    (Object.keys(REPORT_FIELDS) as ReportTypeId[]).map((id) => [
-      id,
-      REPORT_FIELDS[id].filter((f) => f.defaultChecked !== false).map((f) => f.key),
-    ]),
-  ) as Record<ReportTypeId, string[]>;
+/**
+ * Ghi chú thay đồng hồ cho báo cáo: thời điểm, chỉ số chốt đồng hồ cũ → chỉ số ban đầu đồng hồ mới.
+ * VD "14/11/2026 03:15: SN 123 chốt 10 500 → SN 456 bắt đầu 0".
+ */
+function swapNote(swaps: GatewayMeterSwap[]) {
+  return swaps
+    .map((swap) => {
+      const when = formatStoredVietnam(swap.at.replace(" ", "T"))?.slice(0, 16) ?? swap.at;
+      const oldPart = `${swap.oldSerial !== swap.newSerial ? `SN ${swap.oldSerial} ` : ""}chốt ${
+        swap.finalIndex == null ? "—" : formatNum(swap.finalIndex, 3)
+      }`;
+      const newPart = `${swap.oldSerial !== swap.newSerial ? `SN ${swap.newSerial} ` : ""}bắt đầu ${
+        swap.initialIndex == null ? "—" : formatNum(swap.initialIndex, 3)
+      }`;
+      return `${when}: ${oldPart} → ${newPart}${swap.auto ? " (tự phát hiện, chưa có biên bản)" : ""}`;
+    })
+    .join("; ");
 }
 
 function formatNum(value: number, digits = 2) {
@@ -247,6 +119,9 @@ export function ClientReports({
   );
   const report = REPORTS.find((item) => item.id === reportId) ?? REPORTS[0];
 
+  // Cấu hình báo cáo của dự án (Quản lý dự án → Cấu hình báo cáo): loại báo cáo được dùng, tiêu đề, bố cục mặc định.
+  const [reportConfig, setReportConfig] = useState<ReportConfig>(() => readReportConfig(null));
+  const visibleReports = REPORTS.filter((item) => reportConfig.enabledReports.includes(item.id));
   const [title, setTitle] = useState<string>(report.title);
   const [chart, setChart] = useState<YesNo>("Có");
   const [summary, setSummary] = useState<YesNo>("Có");
@@ -257,7 +132,6 @@ export function ClientReports({
 
   const [meters, setMeters] = useState<ClientMeter[]>([]);
   const [selectedMeterIds, setSelectedMeterIds] = useState<string[]>([]);
-  const [pickerOpen, setPickerOpen] = useState(false);
 
   const [fieldsByReport, setFieldsByReport] = useState<Record<ReportTypeId, string[]>>(
     defaultSelectedFieldsByReport,
@@ -270,11 +144,14 @@ export function ClientReports({
 
   // Dữ liệu thực của dự án
   const [slots, setSlots] = useState<GatewayEnergySlot[]>([]);
+  const [meterSwaps, setMeterSwaps] = useState<GatewayMeterSwap[]>([]);
   const [latestSamples, setLatestSamples] = useState<ProjectGatewaySample[]>([]);
   const [ghgSources, setGhgSources] = useState<GhgEmissionSource[]>([]);
   const [alertEvents, setAlertEvents] = useState<AlertEvent[]>([]);
   const [voltageLevel, setVoltageLevel] = useState<VoltageLevelId>("kv-under-6");
   const [touPrices, setTouPrices] = useState<TouPrices>(() => resolveTouPrices("kv-under-6").prices);
+  /** Đơn giá phần điện năng "Không xác định" khung giờ (bỏ trống ở Cấu hình = giá giờ bình thường). */
+  const [unknownPrice, setUnknownPrice] = useState<number | null>(null);
   const [userAlertSettings, setUserAlertSettings] = useState<unknown>(null);
 
   const monthAligned = useRef(false);
@@ -320,7 +197,7 @@ export function ClientReports({
         | {
             electricity?: {
               voltageLevel?: string;
-              prices?: Partial<Record<"normal" | "off" | "peak", string>>;
+              prices?: Partial<Record<"normal" | "off" | "peak" | "none", string>>;
             };
           }
         | undefined;
@@ -334,34 +211,29 @@ export function ClientReports({
         off: parseTariffPrice(String(tariff.prices.off)),
         peak: parseTariffPrice(String(tariff.prices.peak)),
       });
+      const customUnknown = parseTariffPrice(String(savedCost?.electricity?.prices?.none ?? ""));
+      setUnknownPrice(customUnknown > 0 ? customUnknown : null);
 
-      const savedReport = settingsObj.reportConfig as
-        | {
-            headerFooter?: Partial<ReportHeaderFooterConfig>;
-            fieldsByReport?: Partial<Record<ReportTypeId, string[]>>;
-          }
-        | undefined;
-      if (savedReport?.headerFooter) {
-        setHeaderFooter((prev) => ({ ...prev, ...savedReport.headerFooter }));
-      }
-      if (savedReport?.fieldsByReport) {
-        setFieldsByReport((prev) => {
-          const next = { ...prev };
-          for (const id of Object.keys(REPORT_FIELDS) as ReportTypeId[]) {
-            const list = savedReport.fieldsByReport?.[id];
-            if (Array.isArray(list) && list.length > 0) {
-              next[id] = list;
-            }
-          }
-          return next;
-        });
-      }
+      const config = readReportConfig(settingsObj);
+      setReportConfig(config);
+      setFieldsByReport(config.fieldsByReport);
+      setChart(config.layout.chart ? "Có" : "Không");
+      setSummary(config.layout.summary ? "Có" : "Không");
+      setDetail(config.layout.detail ? "Có" : "Không");
+      setFormat(config.layout.format);
+      // Loại báo cáo mở ban đầu không được bật cho dự án → chuyển sang loại đầu tiên được bật.
+      const startId = REPORTS.some((r) => r.id === initialId) ? initialId : "overview";
+      const openId = config.enabledReports.includes(startId) ? startId : config.enabledReports[0];
+      const openReport = REPORTS.find((item) => item.id === openId) ?? REPORTS[0];
+      setReportId(openReport.id);
+      setTitle(reportTitle(config, openReport.id));
+      setHeaderFooter({ ...config.headerFooter, formCode: openReport.formCode });
     });
 
     return () => {
       active = false;
     };
-  }, [projectId]);
+  }, [projectId, initialId]);
 
   // Tải dữ liệu điện năng theo kỳ thời gian đã chọn
   useEffect(() => {
@@ -370,6 +242,7 @@ export function ClientReports({
     void loadProjectGatewayEnergySlots(projectId, span.from, span.to).then((summary) => {
       if (!active) return;
       setSlots(summary.slots);
+      setMeterSwaps(summary.swaps ?? []);
       if (filterTouched.current) return;
       const days = [...new Set(summary.slots.map((s) => s.day))].sort();
       if (days.length > 0) {
@@ -410,7 +283,7 @@ export function ClientReports({
   const pickReport = (id: ReportTypeId) => {
     const next = REPORTS.find((item) => item.id === id) ?? REPORTS[0];
     setReportId(next.id);
-    setTitle(next.title);
+    setTitle(reportTitle(reportConfig, next.id));
     setHeaderFooter((prev) => ({
       ...prev,
       formCode: next.formCode,
@@ -426,7 +299,12 @@ export function ClientReports({
     });
   };
 
-  const activeFields = REPORT_FIELDS[reportId];
+  // Chỉ các trường quản trị viên cho phép xem (Quản lý dự án → Cấu hình báo cáo).
+  const allowedKeys = reportConfig.allowedFields[reportId];
+  const activeFields = useMemo(
+    () => REPORT_FIELDS[reportId].filter((field) => allowedKeys.includes(field.key)),
+    [reportId, allowedKeys],
+  );
   const selectedFieldKeys = fieldsByReport[reportId] ?? activeFields.map((f) => f.key);
   const visibleColumns = useMemo(
     () => activeFields.filter((f) => selectedFieldKeys.includes(f.key)),
@@ -455,9 +333,10 @@ export function ClientReports({
   };
 
   const resetDefaultFields = () => {
+    const defaults = activeFields.filter((f) => f.defaultChecked !== false).map((f) => f.key);
     setFieldsByReport((prev) => ({
       ...prev,
-      [reportId]: activeFields.filter((f) => f.defaultChecked !== false).map((f) => f.key),
+      [reportId]: defaults.length ? defaults : activeFields.map((f) => f.key),
     }));
   };
 
@@ -465,12 +344,10 @@ export function ClientReports({
     setSavingTemplate(true);
     setSaveNotice("");
     try {
-      await saveProjectSettings(projectId, {
-        reportConfig: {
-          headerFooter,
-          fieldsByReport,
-        },
-      });
+      // Giữ phần quản trị viên cấu hình (loại báo cáo, tiêu đề, bố cục), chỉ cập nhật Header/Footer + trường dữ liệu.
+      const nextConfig = { ...reportConfig, headerFooter, fieldsByReport };
+      await saveProjectSettings(projectId, { reportConfig: nextConfig });
+      setReportConfig(nextConfig);
       setSaveNotice("Đã lưu mẫu Header / Footer và trường dữ liệu báo cáo");
       window.setTimeout(() => setSaveNotice(""), 2500);
     } catch {
@@ -498,6 +375,8 @@ export function ClientReports({
           stamp: `${s.day} ${String(s.hour).padStart(2, "0")}:${String(s.minute).padStart(2, "0")}`,
           firstKwh: registerToKwh(s.firstWh),
           lastKwh: registerToKwh(s.lastWh),
+          rawFirstKwh: registerToKwh(s.rawFirstWh ?? s.firstWh),
+          rawLastKwh: registerToKwh(s.rawLastWh ?? s.lastWh),
         }))
         .filter((s) => Number.isFinite(s.firstKwh) && Number.isFinite(s.lastKwh))
         .sort((a, b) => a.stamp.localeCompare(b.stamp));
@@ -508,12 +387,17 @@ export function ClientReports({
       let normalVnd = 0;
       let offVnd = 0;
       let peakVnd = 0;
+      let noneKwh = 0;
+      let noneVnd = 0;
 
       const byPeriod = periods.map((p) => ({
         key: p.key,
         label: p.label,
         firstKwh: null as number | null,
         lastKwh: null as number | null,
+        /** Chỉ số thực trên mặt đồng hồ (đầu / cuối kỳ) — có thể nhỏ hơn đầu kỳ nếu trong kỳ có thay đồng hồ. */
+        rawFirstKwh: null as number | null,
+        rawLastKwh: null as number | null,
         deltaKwh: 0,
         normalKwh: 0,
         offKwh: 0,
@@ -521,57 +405,90 @@ export function ClientReports({
         normalVnd: 0,
         offVnd: 0,
         peakVnd: 0,
+        noneKwh: 0,
+        noneVnd: 0,
       }));
 
+      const slotAt = (slot: (typeof meterSlots)[number]) => {
+        const [y, m, d] = slot.day.split("-").map(Number);
+        return new Date(Date.UTC(y, m - 1, d, slot.hour, slot.minute) - 7 * 60 * 60 * 1000)
+          .toISOString()
+          .slice(0, 19);
+      };
+      const slotMs = inferSlotMs(meterSlots.map(slotAt));
+      const unknownRate = unknownPrice ?? touPrices.normal ?? 0;
       let previousKwh: number | null = null;
+      let prevAt: string | null = null;
       for (const slot of meterSlots) {
         const startKwh = previousKwh ?? slot.firstKwh;
         const delta = Math.max(0, slot.lastKwh - startKwh);
+        // Phần tích lại giữa khung trước và khung này (sau khoảng mất dữ liệu có thể lớn).
+        const gap = previousKwh == null ? 0 : Math.min(delta, Math.max(0, slot.firstKwh - previousKwh));
         previousKwh = slot.lastKwh;
 
         const [y, m, d] = slot.day.split("-").map(Number);
-        const at = new Date(Date.UTC(y, m - 1, d, slot.hour, slot.minute) - 7 * 60 * 60 * 1000)
-          .toISOString()
-          .slice(0, 19);
+        const at = slotAt(slot);
+        const gapFrom = prevAt;
+        prevAt = at;
         const pIdx = periodIndexForInstant(timeFilter, at, periods.length);
         const weekday = civilWeekday(y, m, d);
         const band = industrialBand(weekday, slot.hour, slot.minute);
         const rate = touPrices[band] ?? 0;
-        const cost = delta * rate;
+        // Khoảng mất dữ liệu vắt qua nhiều khung giờ: phần tích lại tính vào "Không xác định".
+        const unknownKwh = gap > 0 && bandForGap(gapFrom, at, slotMs, industrialBandAt) === "none" ? gap : 0;
+        const bandKwh = delta - unknownKwh;
+        const cost = bandKwh * rate;
+        const unknownCost = unknownKwh * unknownRate;
+        noneKwh += unknownKwh;
+        noneVnd += unknownCost;
 
         if (band === "normal") {
-          normalKwh += delta;
+          normalKwh += bandKwh;
           normalVnd += cost;
         } else if (band === "off") {
-          offKwh += delta;
+          offKwh += bandKwh;
           offVnd += cost;
         } else {
-          peakKwh += delta;
+          peakKwh += bandKwh;
           peakVnd += cost;
         }
 
         if (pIdx >= 0 && byPeriod[pIdx]) {
           const bucket = byPeriod[pIdx];
-          if (bucket.firstKwh === null) bucket.firstKwh = startKwh;
+          if (bucket.firstKwh === null) {
+            bucket.firstKwh = startKwh;
+            bucket.rawFirstKwh = slot.rawFirstKwh;
+          }
           bucket.lastKwh = slot.lastKwh;
+          bucket.rawLastKwh = slot.rawLastKwh;
           bucket.deltaKwh += delta;
+          bucket.noneKwh += unknownKwh;
+          bucket.noneVnd += unknownCost;
           if (band === "normal") {
-            bucket.normalKwh += delta;
+            bucket.normalKwh += bandKwh;
             bucket.normalVnd += cost;
           } else if (band === "off") {
-            bucket.offKwh += delta;
+            bucket.offKwh += bandKwh;
             bucket.offVnd += cost;
           } else {
-            bucket.peakKwh += delta;
+            bucket.peakKwh += bandKwh;
             bucket.peakVnd += cost;
           }
         }
       }
 
-      const firstKwh = meterSlots[0]?.firstKwh ?? 0;
-      const lastKwh = meterSlots[meterSlots.length - 1]?.lastKwh ?? 0;
-      const totalKwh = normalKwh + offKwh + peakKwh;
-      const totalVnd = normalVnd + offVnd + peakVnd;
+      // Hiển thị chỉ số thực trên mặt đồng hồ (sản lượng vẫn tính theo chỉ số quy đổi liên tục).
+      const firstKwh = meterSlots[0]?.rawFirstKwh ?? 0;
+      const lastKwh = meterSlots[meterSlots.length - 1]?.rawLastKwh ?? 0;
+      const swaps = meterSwaps.filter((swap) => swap.meterPointId === meter.id);
+      const swapsByPeriod = new Map<number, GatewayMeterSwap[]>();
+      for (const swap of swaps) {
+        const pIdx = periodIndexForInstant(timeFilter, swap.at.replace(" ", "T"), periods.length);
+        if (pIdx < 0) continue;
+        swapsByPeriod.set(pIdx, [...(swapsByPeriod.get(pIdx) ?? []), swap]);
+      }
+      const totalKwh = normalKwh + offKwh + peakKwh + noneKwh;
+      const totalVnd = normalVnd + offVnd + peakVnd + noneVnd;
 
       const latestSample = latestSamples.find((s) => s.meterPointId === meter.id);
       const liveValues = latestSample?.values ?? {};
@@ -600,15 +517,20 @@ export function ClientReports({
         normalVnd,
         offVnd,
         peakVnd,
+        noneKwh,
+        noneVnd,
         totalVnd,
         uAvg,
         iAvg,
         pNow,
-        byPeriod: byPeriod.filter((b) => b.deltaKwh > 0 || b.lastKwh !== null),
-        allPeriods: byPeriod,
+        swapNote: swapNote(swaps),
+        byPeriod: byPeriod
+          .map((b, index) => ({ ...b, swapNote: swapNote(swapsByPeriod.get(index) ?? []) }))
+          .filter((b) => b.deltaKwh > 0 || b.lastKwh !== null || b.swapNote),
+        allPeriods: byPeriod.map((b, index) => ({ ...b, swapNote: swapNote(swapsByPeriod.get(index) ?? []) })),
       };
     });
-  }, [selectedMeters, slots, timeFilter, touPrices, latestSamples]);
+  }, [selectedMeters, slots, meterSwaps, timeFilter, touPrices, unknownPrice, latestSamples]);
 
   // Xây dựng dữ liệu Bảng tổng hợp & Bảng chi tiết theo loại báo cáo đang chọn
   const builtReportData = useMemo(() => {
@@ -678,6 +600,8 @@ export function ClientReports({
           normalKwh: { display: formatNum(item.normalKwh, 3), raw: Number(item.normalKwh.toFixed(3)) },
           offKwh: { display: formatNum(item.offKwh, 3), raw: Number(item.offKwh.toFixed(3)) },
           peakKwh: { display: formatNum(item.peakKwh, 3), raw: Number(item.peakKwh.toFixed(3)) },
+          noneKwh: { display: formatNum(item.noneKwh, 3), raw: Number(item.noneKwh.toFixed(3)) },
+          meterSwap: { display: item.swapNote || "—", raw: item.swapNote },
           uAvg: { display: `${formatNum(item.uAvg, 1)} V`, raw: Number(item.uAvg.toFixed(1)) },
           iAvg: { display: `${formatNum(item.iAvg, 2)} A`, raw: Number(item.iAvg.toFixed(2)) },
         }));
@@ -691,17 +615,19 @@ export function ClientReports({
               raw: `(${item.meter.code}) ${item.meter.name}`,
             },
             firstKwh: {
-              display: formatNum(b.firstKwh ?? item.firstKwh, 3),
-              raw: Number((b.firstKwh ?? item.firstKwh).toFixed(3)),
+              display: formatNum(b.rawFirstKwh ?? item.firstKwh, 3),
+              raw: Number((b.rawFirstKwh ?? item.firstKwh).toFixed(3)),
             },
             lastKwh: {
-              display: formatNum(b.lastKwh ?? item.lastKwh, 3),
-              raw: Number((b.lastKwh ?? item.lastKwh).toFixed(3)),
+              display: formatNum(b.rawLastKwh ?? item.lastKwh, 3),
+              raw: Number((b.rawLastKwh ?? item.lastKwh).toFixed(3)),
             },
             deltaKwh: { display: formatNum(b.deltaKwh, 3), raw: Number(b.deltaKwh.toFixed(3)) },
             normalKwh: { display: formatNum(b.normalKwh, 3), raw: Number(b.normalKwh.toFixed(3)) },
             offKwh: { display: formatNum(b.offKwh, 3), raw: Number(b.offKwh.toFixed(3)) },
             peakKwh: { display: formatNum(b.peakKwh, 3), raw: Number(b.peakKwh.toFixed(3)) },
+            noneKwh: { display: formatNum(b.noneKwh, 3), raw: Number(b.noneKwh.toFixed(3)) },
+            meterSwap: { display: b.swapNote || "—", raw: b.swapNote },
             uAvg: { display: `${formatNum(item.uAvg, 1)} V`, raw: Number(item.uAvg.toFixed(1)) },
             iAvg: { display: `${formatNum(item.iAvg, 2)} A`, raw: Number(item.iAvg.toFixed(2)) },
           })),
@@ -760,6 +686,7 @@ export function ClientReports({
             normalVnd: { display: `${formatVnd(item.normalVnd)} VNĐ`, raw: Math.round(item.normalVnd) },
             offVnd: { display: `${formatVnd(item.offVnd)} VNĐ`, raw: Math.round(item.offVnd) },
             peakVnd: { display: `${formatVnd(item.peakVnd)} VNĐ`, raw: Math.round(item.peakVnd) },
+            noneVnd: { display: `${formatVnd(item.noneVnd)} VNĐ`, raw: Math.round(item.noneVnd) },
             totalVnd: { display: `${formatVnd(item.totalVnd)} VNĐ`, raw: Math.round(item.totalVnd) },
             sharePct: { display: `${formatNum(share, 1)}%`, raw: Number(share.toFixed(1)) },
           };
@@ -768,7 +695,7 @@ export function ClientReports({
       const detailRows: Record<string, { display: string; raw: ExcelCellValue }>[] =
         meterCalculations.flatMap((item) =>
           (item.byPeriod.length > 0 ? item.byPeriod : item.allPeriods.slice(0, 12)).map((b) => {
-            const rowTotal = b.normalVnd + b.offVnd + b.peakVnd;
+            const rowTotal = b.normalVnd + b.offVnd + b.peakVnd + b.noneVnd;
             const share = grandTotalVnd > 0 ? (rowTotal / grandTotalVnd) * 100 : 0;
             return {
               period: { display: b.label, raw: b.label },
@@ -781,6 +708,7 @@ export function ClientReports({
               normalVnd: { display: `${formatVnd(b.normalVnd)} VNĐ`, raw: Math.round(b.normalVnd) },
               offVnd: { display: `${formatVnd(b.offVnd)} VNĐ`, raw: Math.round(b.offVnd) },
               peakVnd: { display: `${formatVnd(b.peakVnd)} VNĐ`, raw: Math.round(b.peakVnd) },
+              noneVnd: { display: `${formatVnd(b.noneVnd)} VNĐ`, raw: Math.round(b.noneVnd) },
               totalVnd: { display: `${formatVnd(rowTotal)} VNĐ`, raw: Math.round(rowTotal) },
               sharePct: { display: `${formatNum(share, 1)}%`, raw: Number(share.toFixed(1)) },
             };
@@ -1271,7 +1199,7 @@ export function ClientReports({
           </CustomSelect>
         </div>
         <div className="flex items-center gap-1.5 overflow-x-auto pb-0.5 scrollbar-none">
-          {REPORTS.map((item, index) => {
+          {visibleReports.map((item, index) => {
             const active = item.id === reportId;
             return (
               <button
@@ -1319,9 +1247,9 @@ export function ClientReports({
         </div>
         <nav className="min-h-0 flex-1 overflow-y-auto px-3 pb-4">
           <p className="mb-1.5 px-2 text-[10px] font-bold tracking-wider text-slate-400 uppercase">
-            6 Loại báo cáo chuẩn
+            {visibleReports.length} loại báo cáo
           </p>
-          {REPORTS.map((item, index) => {
+          {visibleReports.map((item, index) => {
             const active = item.id === reportId;
             return (
               <button
@@ -1342,7 +1270,7 @@ export function ClientReports({
                     active ? "bg-white/20 text-white" : "bg-slate-100 text-slate-500"
                   }`}
                 >
-                  { (fieldsByReport[item.id] ?? REPORT_FIELDS[item.id]).length } trường
+                  { (fieldsByReport[item.id] ?? reportConfig.allowedFields[item.id]).length } trường
                 </span>
               </button>
             );
@@ -1439,58 +1367,55 @@ export function ClientReports({
               </div>
             </div>
 
-            {/* Chọn Điểm đo */}
-            <div className="relative">
-              <p className="mb-1 text-[10px] font-bold tracking-wider text-slate-400 uppercase">
-                Điểm đo đưa vào báo cáo
-              </p>
+          </div>
+
+          {/* Chọn điểm đo: hiển thị sẵn để tích chọn (không cần mở ô chọn) */}
+          <div className="mt-4 rounded-xl border border-slate-200 p-4">
+            <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <p className="text-xs font-bold tracking-wider text-slate-700 uppercase">
+                  Điểm đo đưa vào báo cáo ({selectedMeterIds.length}/{meters.length} điểm đo)
+                </p>
+                <p className="text-[11px] text-slate-500">Tích chọn các điểm đo cần đưa vào bản xem trước và file xuất</p>
+              </div>
               <button
                 type="button"
-                onClick={() => setPickerOpen((v) => !v)}
-                className="inline-flex h-9 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                onClick={() => setSelectedMeterIds(meters.map((m) => m.id))}
+                className="text-xs font-semibold text-emerald-600 hover:underline"
               >
-                Đã chọn {selectedMeterIds.length}/{meters.length} điểm đo
-                <Chevron />
+                Chọn tất cả
               </button>
-              {pickerOpen ? (
-                <div className="absolute left-0 sm:left-auto sm:right-0 top-14 z-20 w-[min(18rem,calc(100vw-2rem))] rounded-xl border border-slate-200 bg-white p-2 shadow-lg">
-                  <div className="mb-1.5 flex items-center justify-between border-b border-slate-100 px-2 pb-1.5 text-[11px]">
-                    <button
-                      type="button"
-                      onClick={() => setSelectedMeterIds(meters.map((m) => m.id))}
-                      className="font-semibold text-emerald-600 hover:underline"
-                    >
-                      Chọn tất cả
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setPickerOpen(false)}
-                      className="text-slate-400 hover:text-slate-600"
-                    >
-                      Đóng
-                    </button>
-                  </div>
-                  <div className="max-h-52 overflow-y-auto">
-                    {meters.map((item) => (
-                      <label
-                        key={item.id}
-                        className="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 text-xs text-slate-700 hover:bg-slate-50"
-                      >
-                        <input
-                          type="checkbox"
-                          checked={selectedMeterIds.includes(item.id)}
-                          onChange={() => toggleMeter(item.id)}
-                          className="accent-emerald-600"
-                        />
-                        <span className="truncate">
-                          ({item.code}) {item.name}
-                        </span>
-                      </label>
-                    ))}
-                  </div>
-                </div>
-              ) : null}
             </div>
+            {meters.length === 0 ? (
+              <p className="py-2 text-xs text-slate-400">Dự án chưa có điểm đo.</p>
+            ) : (
+              <div className="grid gap-2 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4">
+                {meters.map((item) => {
+                  const checked = selectedMeterIds.includes(item.id);
+                  return (
+                    <label
+                      key={item.id}
+                      title={`(${item.code}) ${item.name}`}
+                      className={`flex cursor-pointer items-center gap-2 rounded-lg border px-3 py-2 text-xs transition-colors ${
+                        checked
+                          ? "border-emerald-200 bg-emerald-50/70 font-semibold text-emerald-900"
+                          : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={() => toggleMeter(item.id)}
+                        className="h-3.5 w-3.5 rounded accent-emerald-600"
+                      />
+                      <span className="truncate">
+                        <span className="font-normal text-slate-500">({item.code})</span> {item.name}
+                      </span>
+                    </label>
+                  );
+                })}
+              </div>
+            )}
           </div>
 
           {/* Chọn các trường dữ liệu (cột) xuất vào file mẫu */}
@@ -1994,15 +1919,3 @@ function FileIcon() {
   );
 }
 
-function Chevron() {
-  return (
-    <svg viewBox="0 0 20 20" className="h-3.5 w-3.5" fill="none" aria-hidden>
-      <path
-        d="M5 7.5 10 12.5 15 7.5"
-        stroke="currentColor"
-        strokeWidth="1.7"
-        strokeLinecap="round"
-      />
-    </svg>
-  );
-}
