@@ -28,6 +28,7 @@ import {
   type CustomerBranchRole,
 } from "@/lib/customer-accounts";
 import { loadDevices, type CatalogDevice } from "@/lib/devices";
+import { vietnamNow } from "@/lib/vietnam-time";
 import { hasPermission, isAdminRole } from "@/lib/permissions";
 import { hydrateProjects, loadProjects, resolveMeterTypes } from "@/lib/projects";
 import {
@@ -158,6 +159,8 @@ export function ClientConfig() {
   const [devices, setDevices] = useState<CatalogDevice[]>([]);
   const [slots, setSlots] = useState<Slot[]>([]);
   const [tariffHistory, setTariffHistory] = useState<TariffHistoryEntry[]>([]);
+  /** Biểu giá điện đang lưu trước lần sửa này: dùng làm "biểu giá cũ" cho các ngày trước ngày áp dụng mới. */
+  const [savedTariffBaseline, setSavedTariffBaseline] = useState<TariffHistoryEntry | null>(null);
   const [applyDate, setApplyDate] = useState("");
   const [flatPrices, setFlatPrices] = useState<Record<string, string>>({});
   const [voltageLevel, setVoltageLevel] = useState<VoltageLevelId>(DEFAULT_VOLTAGE_LEVEL);
@@ -293,12 +296,28 @@ export function ClientConfig() {
       setApplyDate("");
       setSlots([]);
       setTariffHistory([]);
+      setSavedTariffBaseline(null);
       setFlatPrices({});
       setVoltageLevel(DEFAULT_VOLTAGE_LEVEL);
       setTouPrices(tariffInputs(DEFAULT_VOLTAGE_LEVEL));
       return;
     }
     setApplyDate(savedCost.applyDate ?? "");
+    {
+      const baseTariff = resolveTouPrices(savedCost.electricity?.voltageLevel, savedCost.electricity?.prices);
+      const baseUnknown = parseTariffPrice(savedCost.electricity?.prices?.none);
+      setSavedTariffBaseline({
+        applyDate: "",
+        voltageLevel: baseTariff.levelId,
+        prices: {
+          normal: formatTariffPrice(baseTariff.prices.normal),
+          off: formatTariffPrice(baseTariff.prices.off),
+          peak: formatTariffPrice(baseTariff.prices.peak),
+          ...(baseUnknown > 0 ? { none: formatTariffPrice(baseUnknown) } : {}),
+        },
+        ...(savedCost.slots?.length ? { slots: savedCost.slots.map((slot) => ({ ...slot })) } : {}),
+      });
+    }
     setSlots(savedCost.slots?.length ? savedCost.slots.map((slot) => ({ ...slot })) : []);
     setTariffHistory(savedCost.tariffHistory?.length ? savedCost.tariffHistory.map((h) => ({ ...h })) : []);
     setFlatPrices(savedCost.flatPrices ? { ...savedCost.flatPrices } : {});
@@ -428,27 +447,39 @@ export function ClientConfig() {
         const stored = await saveProjectSettings(projectId, { chartParameters: chartConfig, chartShowMarkers });
         applyCostSettings(stored);
       } else if (tab === "cost") {
-        // Tự động ghi mốc lịch sử biểu giá theo ngày bắt đầu áp dụng (applyDate) để bảo toàn kỳ tính giá trước đó
+        // Ghi mốc lịch sử biểu giá theo ngày bắt đầu áp dụng để các ngày TRƯỚC mốc vẫn tính theo biểu giá cũ.
+        // Bỏ trống ngày => áp dụng từ hôm nay (giờ Việt Nam), không áp ngược cho dữ liệu cũ.
+        const effectiveDate = applyDate || vietnamNow().date.slice(0, 10);
         let nextHistory = [...tariffHistory];
-        if (applyDate) {
-          const entry: TariffHistoryEntry = {
-            applyDate,
-            voltageLevel,
-            prices: { ...touPrices },
-            slots: slots.map((s) => ({ ...s })),
-          };
-          const existingIdx = nextHistory.findIndex((item) => item.applyDate === applyDate);
-          if (existingIdx >= 0) {
-            nextHistory[existingIdx] = entry;
-          } else {
-            nextHistory.push(entry);
-          }
-          nextHistory = nextHistory.sort((a, b) => a.applyDate.localeCompare(b.applyDate));
+        const hasEarlier = nextHistory.some((item) => (item.applyDate || "0000-01-01") < effectiveDate);
+        if (!hasEarlier) {
+          // Chưa có mốc nào trước ngày áp dụng: thêm mốc "biểu giá cũ" (không ngày) = cấu hình đang lưu trước lần
+          // sửa này, hoặc biểu giá EVN mặc định nếu dự án chưa từng lưu — đúng với cách hệ thống đã tính trước đây.
+          nextHistory.push(
+            savedTariffBaseline ?? {
+              applyDate: "",
+              voltageLevel: DEFAULT_VOLTAGE_LEVEL,
+              prices: tariffInputs(DEFAULT_VOLTAGE_LEVEL),
+            },
+          );
         }
+        const entry: TariffHistoryEntry = {
+          applyDate: effectiveDate,
+          voltageLevel,
+          prices: { ...touPrices },
+          slots: slots.map((s) => ({ ...s })),
+        };
+        const existingIdx = nextHistory.findIndex((item) => item.applyDate === effectiveDate);
+        if (existingIdx >= 0) {
+          nextHistory[existingIdx] = entry;
+        } else {
+          nextHistory.push(entry);
+        }
+        nextHistory = nextHistory.sort((a, b) => (a.applyDate || "").localeCompare(b.applyDate || ""));
         const stored = await saveProjectSettings(projectId, {
           costConfig: {
             utility,
-            applyDate,
+            applyDate: effectiveDate,
             slots,
             tariffHistory: nextHistory,
             flatPrices,
@@ -1611,7 +1642,9 @@ function CostPanel({
                     className="flex flex-wrap items-center justify-between gap-2 rounded border border-slate-100 bg-slate-50 px-3 py-2"
                   >
                     <div>
-                      <span className="font-semibold text-slate-800">Từ ngày {h.applyDate}:</span>{" "}
+                      <span className="font-semibold text-slate-800">
+                        {h.applyDate ? `Từ ngày ${formatIsoDate(h.applyDate)}:` : "Biểu giá cũ (trước các mốc bên dưới):"}
+                      </span>{" "}
                       {h.slots && h.slots.length > 0 ? (
                         <span>
                           {h.slots.length} khung giá tùy chỉnh (
@@ -2477,15 +2510,34 @@ function Field({
   );
 }
 
+function formatIsoDate(value: string) {
+  const [y, m, d] = value.slice(0, 10).split("-");
+  return y && m && d ? `${d}/${m}/${y}` : value;
+}
+
+/**
+ * Ô chọn ngày hiển thị trực tiếp (trước đây input bị ẩn trong nhãn nên bấm không mở được lịch).
+ * Bấm vào ô là mở lịch chọn ngày (showPicker khi trình duyệt hỗ trợ).
+ */
 function DateInput({ value, onChange }: { value: string; onChange: (v: string) => void }) {
-  const [y, m, d] = value.split("-");
-  const label = y && m && d ? `${d}/${m}/${y}` : value;
   return (
-    <label className="inline-flex h-10 cursor-pointer items-center gap-2 rounded-md border border-slate-200 bg-white px-3 text-sm text-slate-700">
-      {label}
-      <CalendarIcon />
-      <input type="date" value={value} onChange={(e) => onChange(e.target.value)} className="sr-only" />
-    </label>
+    <div className="flex flex-col items-end gap-1">
+      <input
+        type="date"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        onClick={(e) => {
+          try {
+            e.currentTarget.showPicker?.();
+          } catch {
+            // Trình duyệt không hỗ trợ showPicker: vẫn nhập được bằng bàn phím.
+          }
+        }}
+        className="h-10 cursor-pointer rounded-md border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none focus:border-emerald-500"
+        aria-label="Ngày bắt đầu áp dụng"
+      />
+      {!value ? <span className="text-[11px] text-slate-400">Bỏ trống = áp dụng từ hôm nay</span> : null}
+    </div>
   );
 }
 
@@ -2783,11 +2835,3 @@ function UserPlusIcon() {
   );
 }
 
-function CalendarIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="h-4 w-4 text-slate-400" fill="none" aria-hidden>
-      <rect x="4" y="5" width="16" height="15" rx="2" stroke="currentColor" strokeWidth="1.7" />
-      <path d="M8 3.5V7M16 3.5V7M4 10h16" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
-    </svg>
-  );
-}
