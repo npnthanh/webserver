@@ -30,7 +30,7 @@ import {
 import { loadDevices, type CatalogDevice } from "@/lib/devices";
 import { vietnamNow } from "@/lib/vietnam-time";
 import { hasPermission, isAdminRole } from "@/lib/permissions";
-import { hydrateProjects, loadProjects, resolveMeterTypes } from "@/lib/projects";
+import { hydrateProjects, loadProjects, resolveMeterTypes, type Project } from "@/lib/projects";
 import {
   DEFAULT_VOLTAGE_LEVEL,
   formatTariffPrice,
@@ -2182,6 +2182,21 @@ function AccountsPanel({
     password: "",
   });
   const [submitting, setSubmitting] = useState(false);
+  /** Kỹ thuật phụ trách = tài khoản NỘI BỘ (Manage) được giao dự án; khác tài khoản khách hàng bên dưới. */
+  const [technicians, setTechnicians] = useState<NonNullable<Project["managers"]>>(
+    () => loadProjects().find((item) => item.id === projectId)?.managers ?? [],
+  );
+  useEffect(() => {
+    let active = true;
+    void hydrateProjects()
+      .then((projects) => {
+        if (active) setTechnicians(projects.find((item) => item.id === projectId)?.managers ?? []);
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, [projectId]);
 
   const displayAccounts = useMemo(() => {
     if (accounts.length > 0) return accounts;
@@ -2229,10 +2244,33 @@ function AccountsPanel({
 
   return (
     <div>
+      <div className="mb-5 rounded-lg border border-slate-200 bg-slate-50/60 p-4">
+        <h3 className="text-[14px] font-semibold text-slate-800">Kỹ thuật phụ trách</h3>
+        <p className="mt-0.5 text-[12px] text-slate-500">
+          Tài khoản nội bộ được giao quản lý dự án (khác với tài khoản khách hàng bên dưới). Giao hoặc đổi người phụ
+          trách tại trang Sửa thông tin dự án.
+        </p>
+        {technicians.length === 0 ? (
+          <p className="mt-2 text-[13px] italic text-slate-400">Chưa phân công</p>
+        ) : (
+          <ul className="mt-2 flex flex-wrap gap-2">
+            {technicians.map((item) => (
+              <li key={item.id} className="rounded-md border border-slate-200 bg-white px-3 py-2 text-[12px]">
+                <span className="block font-semibold text-slate-800">{item.fullName || item.username}</span>
+                <span className="block text-slate-500">
+                  {item.email}
+                  {item.phone ? ` · ${item.phone}` : ""}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <div>
           <h3 className="text-[15px] font-semibold text-slate-800">
-            Danh sách tài khoản truy cập ứng dụng ({displayAccounts.length})
+            Tài khoản khách hàng truy cập ứng dụng ({displayAccounts.length})
           </h3>
           <p className="mt-0.5 text-[12px] text-slate-500">
             Hệ thống khởi tạo tài khoản <strong>Admin</strong> ban đầu. Từ tài khoản Admin, khách hàng tạo các tài khoản nhánh với quyền <strong>Chỉ xem</strong> hoặc <strong>Xem và chỉnh sửa</strong> cấu hình thông số.

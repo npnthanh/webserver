@@ -42,7 +42,7 @@ export type Project = {
   meterTypes?: MeterType[];
   recipients?: AlertRecipient[];
   /** Kỹ thuật phụ trách: các tài khoản Manage được giao dự án (chỉ đọc, server trả về). */
-  managers?: { id: string; username: string; email: string }[];
+  managers?: { id: string; username: string; email: string; fullName?: string; phone?: string }[];
   /** Yêu cầu xoá đang chờ Admin khác duyệt (null nếu không có). */
   pendingDeletion?: { requestId: number; requestedByName: string } | null;
 };

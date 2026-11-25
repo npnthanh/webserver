@@ -447,8 +447,10 @@ async function getProjects(projectId?: string, allowedProjectIds?: string[]) {
   );
   // Kỹ thuật phụ trách = các tài khoản Manage được giao dự án (Admin xem mọi dự án nên không liệt kê).
   await ensureAccountProjectsSchema();
+  await ensureProjectManagerSchema();
   const managerRows = await queryRows<Row>(
-    `SELECT ap.project_id AS projectId, a.id, a.username, a.email, a.role
+    `SELECT ap.project_id AS projectId, a.id, a.username, a.email, a.role,
+            a.full_name AS fullName, a.phone
        FROM account_projects ap
        JOIN accounts a ON a.id = ap.account_id
       WHERE ap.project_id IN (${placeholders})
@@ -461,7 +463,13 @@ async function getProjects(projectId?: string, allowedProjectIds?: string[]) {
     const id = asString(row.projectId);
     managersByProject.set(id, [
       ...(managersByProject.get(id) ?? []),
-      { id: asString(row.id), username: asString(row.username), email: asString(row.email) },
+      {
+        id: asString(row.id),
+        username: asString(row.username),
+        email: asString(row.email),
+        fullName: asString(row.fullName),
+        phone: asString(row.phone),
+      },
     ]);
   }
   const pendingByProject = await pendingDeletionsByProject(ids);

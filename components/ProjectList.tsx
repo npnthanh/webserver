@@ -89,7 +89,7 @@ export function ProjectList() {
   /** Danh sách kỹ thuật phụ trách (tài khoản Manage) xuất hiện trong các dự án, dùng cho bộ lọc. */
   const technicians = useMemo(() => {
     const byId = new Map<string, string>();
-    for (const p of accessibleItems) for (const m of p.managers ?? []) byId.set(m.id, m.username);
+    for (const p of accessibleItems) for (const m of p.managers ?? []) byId.set(m.id, m.fullName || m.username);
     return [...byId.entries()].sort((a, b) => a[1].localeCompare(b[1], "vi"));
   }, [accessibleItems]);
 
@@ -106,7 +106,12 @@ export function ProjectList() {
         p.name.toLowerCase().includes(q) ||
         p.id.toLowerCase().includes(q) ||
         p.customer.toLowerCase().includes(q) ||
-        managers.some((m) => m.username.toLowerCase().includes(q) || m.email.toLowerCase().includes(q));
+        managers.some(
+          (m) =>
+            m.username.toLowerCase().includes(q) ||
+            (m.fullName ?? "").toLowerCase().includes(q) ||
+            m.email.toLowerCase().includes(q),
+        );
       return matchTechnician && matchStatus && matchSearch;
     });
   }, [technician, status, searchQuery, accessibleItems]);
@@ -290,7 +295,7 @@ export function ProjectList() {
                                 ) : (
                                   managers.map((m) => (
                                     <div key={m.id} className="min-w-0">
-                                      <span className="block text-xs font-bold text-slate-800">{m.username}</span>
+                                      <span className="block text-xs font-bold text-slate-800">{m.fullName || m.username}</span>
                                       <span className="block font-mono text-[11px] text-slate-400 truncate max-w-[220px]">
                                         {m.email}
                                       </span>
