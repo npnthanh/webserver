@@ -42,7 +42,7 @@ import {
   inferSlotMs,
 } from "@/lib/industrial-electricity";
 import { METER_PARAMETERS, registerToKwh } from "@/lib/meter-parameters";
-import { readChartParameterConfig, type ChartParameterConfig } from "@/lib/chart-parameters";
+import { isParamAllowed, readChartParameterConfig, type ChartParameterConfig } from "@/lib/chart-parameters";
 import { readChartShowMarkers, setChartDisplay } from "@/lib/chart-display";
 import { hydrateProjectSettings } from "@/lib/project-settings";
 
@@ -1291,6 +1291,7 @@ export function EnergyCharts() {
                   samples={liveSamples}
                   nodeName={livePoint ? livePoint.name : selectedPoints[0]?.name}
                   onRefresh={handleRefresh}
+                  chartParams={chartParams}
                 />
               ) : (
                 <DynamicUtilityTrend
@@ -2100,18 +2101,31 @@ function BidirectionalEnergyTrend({
   samples,
   nodeName,
   onRefresh,
+  chartParams,
 }: {
   samples?: ProjectGatewaySample[];
   /** Tên điểm đo (node) đang hiển thị — không dùng tên model đồng hồ. */
   nodeName?: string;
   onRefresh?: () => void;
+  /** Cấu hình → Tham số biểu đồ → Điện năng: chỉ số nào được vẽ. */
+  chartParams?: ChartParameterConfig;
 }) {
   const [kinds, setKinds] = useState<EnergyRegisterKind[]>(["P"]);
   const [dirs, setDirs] = useState<EnergyRegisterDir[]>(["in", "out"]);
+  const allowedRegisters = useMemo(
+    () => ENERGY_REGISTERS.filter((item) => isParamAllowed(chartParams, "energy", item.key)),
+    [chartParams],
+  );
+  const allowedKinds = (["P", "Q", "S"] as EnergyRegisterKind[]).filter((kind) =>
+    allowedRegisters.some((item) => item.kind === kind),
+  );
+  const allowedDirs = (["in", "out"] as EnergyRegisterDir[]).filter((dir) =>
+    allowedRegisters.some((item) => item.dir === dir),
+  );
 
   const series = useMemo<TrendSeriesConfig[]>(
     () =>
-      ENERGY_REGISTERS.filter((item) => kinds.includes(item.kind) && dirs.includes(item.dir)).map((item) => ({
+      allowedRegisters.filter((item) => kinds.includes(item.kind) && dirs.includes(item.dir)).map((item) => ({
         key: item.key,
         label: `${item.dir === "in" ? "Điện vào" : "Điện ra"} ${item.kind} - ${item.key} (${item.unit})`,
         tableLabel: `${item.dir === "in" ? "Vào" : "Ra"} ${item.kind} (${item.unit})`,
@@ -2121,7 +2135,7 @@ function BidirectionalEnergyTrend({
         extract: (sample) =>
           typeof sample.values[item.key] === "number" ? registerToKwh(sample.values[item.key]) : null,
       })),
-    [kinds, dirs],
+    [kinds, dirs, allowedRegisters],
   );
 
   return (
@@ -2134,7 +2148,7 @@ function BidirectionalEnergyTrend({
       headerControls={
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[12px] font-medium text-slate-700">
           <div className="inline-flex items-center gap-3 rounded-lg border border-slate-200 bg-slate-50/70 px-2.5 py-1 shadow-2xs">
-            {(["P", "Q", "S"] as EnergyRegisterKind[]).map((kind) => (
+            {allowedKinds.map((kind) => (
               <label key={kind} className="inline-flex cursor-pointer items-center gap-1.5">
                 <input
                   type="checkbox"
@@ -2147,7 +2161,7 @@ function BidirectionalEnergyTrend({
             ))}
           </div>
           <div className="inline-flex items-center gap-3 rounded-lg border border-slate-200 bg-slate-50/70 px-2.5 py-1 shadow-2xs">
-            {(["in", "out"] as EnergyRegisterDir[]).map((dir) => (
+            {allowedDirs.map((dir) => (
               <label key={dir} className="inline-flex cursor-pointer items-center gap-1.5">
                 <input
                   type="checkbox"

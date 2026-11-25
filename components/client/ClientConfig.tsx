@@ -69,6 +69,7 @@ import { readChartShowMarkers } from "@/lib/chart-display";
 import {
   CHART_PARAMETER_TABS,
   allTabKeys,
+  chartParametersForSave,
   readChartParameterConfig,
   type ChartParameterConfig,
   type ChartParamTabId,
@@ -444,7 +445,10 @@ export function ClientConfig() {
           }).catch(() => undefined);
         }
       } else if (tab === "charts") {
-        const stored = await saveProjectSettings(projectId, { chartParameters: chartConfig, chartShowMarkers });
+        const stored = await saveProjectSettings(projectId, {
+          chartParameters: chartParametersForSave(chartConfig),
+          chartShowMarkers,
+        });
         applyCostSettings(stored);
       } else if (tab === "cost") {
         // Ghi mốc lịch sử biểu giá theo ngày bắt đầu áp dụng để các ngày TRƯỚC mốc vẫn tính theo biểu giá cũ.

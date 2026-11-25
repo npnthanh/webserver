@@ -18,7 +18,7 @@ export type ChartParamSection = {
   series: ChartSeriesDef[];
 };
 
-export type ChartParamTabId = "ui" | "freq" | "power" | "pf" | "harm" | "unbalance";
+export type ChartParamTabId = "energy" | "ui" | "freq" | "power" | "pf" | "harm" | "unbalance";
 
 export type ChartParamTab = {
   id: ChartParamTabId;
@@ -31,8 +31,27 @@ const C2 = "#91cc75";
 const C3 = "#fac858";
 const C4 = "#ee6666";
 const C5 = "#73c0de";
+const C6 = "#9a60b4";
 
 export const CHART_PARAMETER_TABS: ChartParamTab[] = [
+  {
+    id: "energy",
+    label: "Điện năng",
+    sections: [
+      {
+        id: "energy_reg",
+        label: "Chỉ số điện năng 2 chiều",
+        series: [
+          { key: "EPaed", label: "EP_nhận (EPaed)", color: C1, unit: "kWh", digits: 3 },
+          { key: "EPaer", label: "EP_phát (EPaer)", color: C2, unit: "kWh", digits: 3 },
+          { key: "EQred", label: "EQ_nhận (EQred)", color: C3, unit: "kVARh", digits: 3 },
+          { key: "EQrer", label: "EQ_phát (EQrer)", color: C4, unit: "kVARh", digits: 3 },
+          { key: "ESaed", label: "ES_nhận (ESaed)", color: C5, unit: "kVAh", digits: 3 },
+          { key: "ESaer", label: "ES_phát (ESaer)", color: C6, unit: "kVAh", digits: 3 },
+        ],
+      },
+    ],
+  },
   {
     id: "ui",
     label: "Điện áp / Dòng điện",
@@ -54,6 +73,7 @@ export const CHART_PARAMETER_TABS: ChartParamTab[] = [
           { key: "Vab", label: "U_L12", color: C1, unit: "V", digits: 2 },
           { key: "Vbc", label: "U_L23", color: C2, unit: "V", digits: 2 },
           { key: "Vca", label: "U_L31", color: C3, unit: "V", digits: 2 },
+          { key: "VLLavg", label: "U_L_avg", color: C4, unit: "V", digits: 2 },
         ],
       },
       {
@@ -63,6 +83,7 @@ export const CHART_PARAMETER_TABS: ChartParamTab[] = [
           { key: "Ia", label: "I_Ph1", color: C1, unit: "A", digits: 2 },
           { key: "Ib", label: "I_Ph2", color: C2, unit: "A", digits: 2 },
           { key: "Ic", label: "I_Ph3", color: C3, unit: "A", digits: 2 },
+          { key: "Iavg", label: "I_avg", color: C4, unit: "A", digits: 2 },
           { key: "In", label: "I_N", color: C5, unit: "A", digits: 2 },
         ],
       },
@@ -148,6 +169,7 @@ export const CHART_PARAMETER_TABS: ChartParamTab[] = [
           { key: "THDVan", label: "THD_U_Ph1 (THDVan)", color: C1, unit: "%", digits: 2 },
           { key: "THDVbn", label: "THD_U_Ph2 (THDVbn)", color: C2, unit: "%", digits: 2 },
           { key: "THDVcn", label: "THD_U_Ph3 (THDVcn)", color: C3, unit: "%", digits: 2 },
+          { key: "THDVln", label: "THD_U_Ph_avg (THDVln)", color: C4, unit: "%", digits: 2 },
         ],
       },
       {
@@ -157,6 +179,7 @@ export const CHART_PARAMETER_TABS: ChartParamTab[] = [
           { key: "THDVab", label: "THD_U_L12 (THDVab)", color: C1, unit: "%", digits: 2 },
           { key: "THDVbc", label: "THD_U_L23 (THDVbc)", color: C2, unit: "%", digits: 2 },
           { key: "THDVca", label: "THD_U_L31 (THDVca)", color: C3, unit: "%", digits: 2 },
+          { key: "THDVll", label: "THD_U_L_avg (THDVll)", color: C4, unit: "%", digits: 2 },
         ],
       },
       {
@@ -166,6 +189,7 @@ export const CHART_PARAMETER_TABS: ChartParamTab[] = [
           { key: "THDCa", label: "THD_I_Ph1 (THDCa)", color: C1, unit: "%", digits: 2 },
           { key: "THDCb", label: "THD_I_Ph2 (THDCb)", color: C2, unit: "%", digits: 2 },
           { key: "THDCc", label: "THD_I_Ph3 (THDCc)", color: C3, unit: "%", digits: 2 },
+          { key: "THDCn", label: "THD_I_N (THDCn)", color: C5, unit: "%", digits: 2 },
         ],
       },
     ],
@@ -216,18 +240,42 @@ export function allTabKeys(tabId: ChartParamTabId) {
   return chartTab(tabId).sections.flatMap((section) => section.series.map((item) => item.key));
 }
 
+/** Phiên bản danh sách tham số; lưu kèm cấu hình (khóa `_v`) để biết tham số nào là mới thêm. */
+export const CHART_PARAMETERS_VERSION = 2;
+
+/**
+ * Tham số thêm ở phiên bản 2 (25/11/2026): cấu hình lưu từ trước chưa biết các tham số này nên mặc định BẬT
+ * (không thì biểu đồ mới bị ẩn ở dự án đã lưu cấu hình). Kèm IuA/IuB/IuC để hiện lại biểu đồ mất cân bằng
+ * dòng điện ở các dự án lỡ lưu thiếu.
+ */
+const ADDED_IN_V2: Partial<Record<ChartParamTabId, string[]>> = {
+  ui: ["VLLavg", "Iavg"],
+  harm: ["THDVln", "THDVll", "THDCn"],
+  unbalance: ["IuA", "IuB", "IuC"],
+};
+
 /** Đọc cấu hình từ project settings (bỏ khóa lạ / tham số không còn tồn tại). */
 export function readChartParameterConfig(settings: Record<string, unknown> | undefined | null): ChartParameterConfig {
   const raw = settings?.chartParameters;
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const version = Number((raw as Record<string, unknown>)._v) || 1;
   const config: ChartParameterConfig = {};
   for (const tab of CHART_PARAMETER_TABS) {
     const list = (raw as Record<string, unknown>)[tab.id];
     if (!Array.isArray(list)) continue;
-    const valid = new Set(allTabKeys(tab.id));
-    config[tab.id] = list.filter((key): key is string => typeof key === "string" && valid.has(key));
+    const allKeys = allTabKeys(tab.id);
+    const valid = new Set(allKeys);
+    const picked = new Set(list.filter((key): key is string => typeof key === "string" && valid.has(key)));
+    if (version < CHART_PARAMETERS_VERSION) for (const key of ADDED_IN_V2[tab.id] ?? []) picked.add(key);
+    // Giữ đúng thứ tự định nghĩa để chú giải / bảng ổn định.
+    config[tab.id] = allKeys.filter((key) => picked.has(key));
   }
   return config;
+}
+
+/** Dữ liệu lưu vào project settings (kèm phiên bản danh sách tham số). */
+export function chartParametersForSave(config: ChartParameterConfig) {
+  return { ...config, _v: CHART_PARAMETERS_VERSION };
 }
 
 /** Tham số có được vẽ không (biểu đồ chưa cấu hình = vẽ tất cả). */
