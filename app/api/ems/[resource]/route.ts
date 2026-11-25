@@ -783,6 +783,8 @@ async function getResource(resource: string, request: NextRequest) {
     );
     const mappedEvents: Record<string, unknown>[] = rows.map((row) => ({
       ...row,
+      // Điểm đo đã bị xóa / tạo lại (FK ON DELETE SET NULL) => lấy lại tên đã ghi trong nội dung cảnh báo.
+      pointName: asString(row.pointName) || pointNameFromAlertMessage(asString(row.message)) || undefined,
       value: asNumber(row.value),
       thresholdValue: row.thresholdValue == null ? undefined : asNumber(row.thresholdValue),
     }));
@@ -1608,6 +1610,14 @@ async function deleteResource(resource: string, request: NextRequest) {
   }
   await emsDb.execute(`DELETE FROM ${table} WHERE ${key} = ?`, [id]);
   return { ok: true };
+}
+
+/** Tên điểm đo trong nội dung cảnh báo: "... tại <tên>" (vượt ngưỡng) hoặc "Node <tên> (SN: ...)" (kết nối). */
+function pointNameFromAlertMessage(message: string) {
+  const node = /^Node (.+?) \(SN:/.exec(message);
+  if (node) return node[1].trim();
+  const at = /vượt ngưỡng cài đặt \([^)]*\) tại (.+)$/.exec(message);
+  return at ? at[1].trim() : "";
 }
 
 export async function GET(request: NextRequest, context: Params) {
