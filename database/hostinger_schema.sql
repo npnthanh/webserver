@@ -1049,4 +1049,14 @@ CREATE TABLE IF NOT EXISTS admin_notification_seen (
   PRIMARY KEY (account_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- Thư viện cảnh báo dùng chung theo loại điểm đo (Cấu hình → Thư viện cảnh báo).
+-- Một dòng id = 'default', payload = { categoriesByUtility, alarmsByCategory } (cùng cấu trúc alertConfig của dự án).
+-- Ứng dụng cũng tự tạo bảng này khi chạy (ensureAlertLibrarySchema).
+CREATE TABLE IF NOT EXISTS alert_library (
+  id VARCHAR(32) NOT NULL,
+  payload JSON NOT NULL,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 SET FOREIGN_KEY_CHECKS = 1;

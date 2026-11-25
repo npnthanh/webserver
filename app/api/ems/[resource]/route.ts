@@ -83,6 +83,7 @@ const RESOURCE_NAMES = new Set([
   "telegram-chats",
   "notifications",
   "project-deletions",
+  "alert-library",
   "meter-replacements",
 ]);
 
@@ -179,6 +180,37 @@ function serverError(error: unknown) {
 }
 
 let deviceColumnsReady: Promise<void> | null = null;
+let alertLibraryReady: Promise<void> | null = null;
+
+/**
+ * Thư viện cảnh báo dùng chung (không thuộc dự án nào): mẫu ngưỡng theo từng loại điểm đo, cùng cấu trúc
+ * với alertConfig của dự án ({ categoriesByUtility, alarmsByCategory }). Dự án chép từ đây khi "Áp dụng từ thư viện".
+ */
+function ensureAlertLibrarySchema() {
+  if (!alertLibraryReady) {
+    alertLibraryReady = emsDb
+      .query(
+        `CREATE TABLE IF NOT EXISTS alert_library (
+           id VARCHAR(32) NOT NULL,
+           payload JSON NOT NULL,
+           updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+           PRIMARY KEY (id)
+         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+      )
+      .then(() => undefined)
+      .catch((error) => {
+        alertLibraryReady = null;
+        throw error;
+      });
+  }
+  return alertLibraryReady;
+}
+
+async function getAlertLibrary() {
+  await ensureAlertLibrarySchema();
+  const [row] = await queryRows<Row>("SELECT payload FROM alert_library WHERE id = 'default' LIMIT 1");
+  return jsonField<Record<string, unknown>>(row?.payload, {});
+}
 let ghgColumnsReady: Promise<void> | null = null;
 let diagramDisplaysReady: Promise<void> | null = null;
 function ensureDiagramDisplaysColumn() {
@@ -557,6 +589,7 @@ async function getResource(resource: string, request: NextRequest) {
     return getProjects(projectId, allowedProjectIds);
   }
   if (resource === "project-telemetry") return getProjectsListTelemetry();
+  if (resource === "alert-library") return getAlertLibrary();
   if (resource === "project-managers") {
     if (!projectId) throw new UserFacingError("Thiếu mã dự án.");
     await ensureAccountProjectsSchema();
@@ -1574,6 +1607,10 @@ export async function GET(request: NextRequest, context: Params) {
       if (!gate.ok || !gate.session) return forbidden();
       return Response.json(await listNotifications(gate.session));
     }
+    if (resource === "alert-library") {
+      const gate = await requirePermission("viewProjects");
+      if (!gate.ok) return forbidden();
+    }
     if (resource === "notification-settings" || resource === "telegram-chats" || resource === "notification-test") {
       const gate = await requirePermission("manageUsers");
       if (!gate.ok) return forbidden("Chỉ Quản trị viên được cấu hình thông báo.");
@@ -1612,7 +1649,25 @@ export async function POST(request: NextRequest, context: Params) {
       const gate = await requirePermission("manageUsers");
       if (!gate.ok) return forbidden("Chỉ Quản trị viên được quản lý người dùng.");
     }
+    if (resource === "alert-library") {
+      const gate = await requirePermission("manageDevices");
+      if (!gate.ok) return forbidden("Không có quyền chỉnh sửa thư viện cảnh báo.");
+    }
     const body = (await request.json()) as Row;
+    if (resource === "alert-library") {
+      await ensureAlertLibrarySchema();
+      const payload = {
+        categoriesByUtility:
+          body.categoriesByUtility && typeof body.categoriesByUtility === "object" ? body.categoriesByUtility : {},
+        alarmsByCategory: body.alarmsByCategory && typeof body.alarmsByCategory === "object" ? body.alarmsByCategory : {},
+      };
+      await emsDb.execute(
+        `INSERT INTO alert_library (id, payload) VALUES ('default', ?)
+         ON DUPLICATE KEY UPDATE payload = VALUES(payload)`,
+        [JSON.stringify(payload)],
+      );
+      return Response.json(await getAlertLibrary());
+    }
     if (resource === "notification-settings" || resource === "notification-test" || resource === "telegram-chats") {
       const gate = await requirePermission("manageUsers");
       if (!gate.ok) return forbidden("Chỉ Quản trị viên được cấu hình thông báo.");

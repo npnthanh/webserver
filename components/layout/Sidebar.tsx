@@ -69,6 +69,12 @@ const navGroups: {
         permission: "manageDevices",
       },
       {
+        href: "/cau-hinh/thu-vien-canh-bao",
+        label: "Thư viện cảnh báo",
+        icon: AlertLibraryIcon,
+        permission: "manageDevices",
+      },
+      {
         href: "/cau-hinh/thong-bao",
         label: "Cấu hình thông báo",
         icon: AlertConfigIcon,
@@ -454,6 +460,16 @@ function AlertConfigIcon({ className }: { className?: string }) {
     <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
       <path d="M12 4 3.5 19h17L12 4Z" />
       <path d="M12 10v5M12 17.4v.01" />
+    </svg>
+  );
+}
+
+function AlertLibraryIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M6 8a6 6 0 0 1 12 0c0 6 2.5 8 2.5 8h-17S6 14 6 8Z" />
+      <path d="M10.3 20a1.94 1.94 0 0 0 3.4 0" />
+      <path d="M12 7v4M12 13.5v.01" />
     </svg>
   );
 }

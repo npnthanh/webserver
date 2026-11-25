@@ -2,6 +2,8 @@
 
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { CustomSelect } from "@/components/ui/CustomSelect";
+import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
+import { loadAlertLibrary, saveAlertLibrary } from "@/lib/alert-library";
 import { DEFAULT_USER_ALERT_RULES } from "@/lib/alert-config";
 import { alarmName, alarmUnitHint } from "@/lib/gateway-protocol";
 import {
@@ -249,12 +251,20 @@ function normalizeAlarm(alarm: Alarm, categoryId: string, index: number): Alarm 
 }
 
 export function AlertConfig({
-  projectId,
+  projectId = "",
   initialUtilities,
+  mode = "project",
 }: {
-  projectId: string;
+  projectId?: string;
   initialUtilities: MeterType[];
+  /**
+   * "project": thư viện cảnh báo của một dự án (lưu project_settings, đồng bộ ngưỡng xuống gateway).
+   * "library": thư viện cảnh báo dùng chung theo loại điểm đo (bảng alert_library) — chỉ là mẫu,
+   * không đẩy ngưỡng xuống gateway; dự án chép mẫu bằng nút "Áp dụng từ thư viện".
+   */
+  mode?: "project" | "library";
 }) {
+  const isLibrary = mode === "library";
   const utilities = useMemo(() => uniqueUtilities(initialUtilities), [initialUtilities]);
   const firstUtility = utilities[0] ?? "Điện";
   const [activeUtility, setActiveUtility] = useState<MeterType>(firstUtility);
@@ -268,6 +278,7 @@ export function AlertConfig({
   const [syncNotice, setSyncNotice] = useState("");
   const [settingsReady, setSettingsReady] = useState(false);
   const [showAllLiveParams, setShowAllLiveParams] = useState(false);
+  const [confirmApplyLibrary, setConfirmApplyLibrary] = useState(false);
 
   async function loadGatewayLive() {
     const from = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
@@ -296,10 +307,13 @@ export function AlertConfig({
   useEffect(() => {
     let active = true;
     setSettingsReady(false);
-    void hydrateProjectSettings(projectId)
-      .then((payload) => {
+    const loadSaved: Promise<unknown> = isLibrary
+      ? loadAlertLibrary()
+      : hydrateProjectSettings(projectId).then((payload) => payload.alertConfig);
+    void loadSaved
+      .then((rawSaved) => {
         if (!active) return;
-        const saved = payload.alertConfig as
+        const saved = rawSaved as
           | {
               categories?: Array<{ id: string; label: string }>;
               categoriesByUtility?: Record<string, Array<{ id: string; label: string }>>;
@@ -347,24 +361,32 @@ export function AlertConfig({
     return () => {
       active = false;
     };
-  }, [projectId, firstUtility, utilities]);
+  }, [projectId, firstUtility, utilities, isLibrary]);
 
   useEffect(() => {
     if (!settingsReady) return;
+    const categoriesPayload = Object.fromEntries(
+      Object.entries(categoriesByUtility).map(([utility, items]) => [
+        utility,
+        items.map(({ id, label }) => ({ id, label })),
+      ]),
+    );
+    if (isLibrary) {
+      // Thư viện chung: gom các thay đổi liên tiếp (gõ ngưỡng) rồi mới lưu.
+      const timer = window.setTimeout(() => {
+        void saveAlertLibrary({ categoriesByUtility: categoriesPayload, alarmsByCategory }).catch(() => undefined);
+      }, 600);
+      return () => window.clearTimeout(timer);
+    }
     void saveProjectSettings(projectId, {
       ...(loadProjectSettings(projectId) ?? {}),
       alertConfig: {
-        categoriesByUtility: Object.fromEntries(
-          Object.entries(categoriesByUtility).map(([utility, items]) => [
-            utility,
-            items.map(({ id, label }) => ({ id, label })),
-          ]),
-        ),
+        categoriesByUtility: categoriesPayload,
         activeUtility,
         alarmsByCategory,
       },
     });
-  }, [activeUtility, alarmsByCategory, categoriesByUtility, projectId, settingsReady]);
+  }, [activeUtility, alarmsByCategory, categoriesByUtility, projectId, settingsReady, isLibrary]);
 
   // Không chia nhóm trên giao diện: gộp mọi nhóm của loại năng lượng (kể cả nhóm đã ẩn trước đây).
   // Dữ liệu vẫn lưu theo nhóm (suy ra từ tham số) để bộ đánh giá cảnh báo phía server giữ nguyên.
@@ -452,7 +474,7 @@ export function AlertConfig({
 
   function removeAlarm(categoryId: string, alarmKey: string) {
     const target = (alarmsByCategory[categoryId] ?? []).find((item) => item.id === alarmKey);
-    if (target?.parameterKey) {
+    if (!isLibrary && target?.parameterKey) {
       const matchedThreshold = gatewayThresholds.find(
         (t) => t.parameterName === target.parameterKey,
       );
@@ -470,7 +492,9 @@ export function AlertConfig({
     }));
   }
 
-  async function syncThresholdToGateway(alarm: Alarm) {
+  async function syncThresholdToGateway(alarm: Alarm, quiet = false) {
+    // Thư viện chung chỉ là mẫu: không ghi ngưỡng xuống gateway.
+    if (isLibrary) return;
     if (!alarm.parameterKey || alarm.parameterKey.startsWith("IDAlarm:")) return;
     const minVal = alarm.minValue?.trim() ? Number(alarm.minValue.replace(",", ".")) : null;
     const maxVal = alarm.threshold.trim() ? Number(alarm.threshold.replace(",", ".")) : null;
@@ -491,7 +515,7 @@ export function AlertConfig({
           maxValue: maxVal != null && Number.isFinite(maxVal) ? maxVal : null,
         }),
       });
-      if (response.ok) {
+      if (response.ok && !quiet) {
         setSyncNotice(`Đã lưu ngưỡng ${alarm.parameterKey} xuống bộ kiểm tra tức thời của Gateway.`);
         setTimeout(() => setSyncNotice(""), 3500);
         await loadGatewayLive();
@@ -529,6 +553,40 @@ export function AlertConfig({
     }));
   }
 
+  /** Chép ngưỡng của thư viện chung (loại điểm đo đang chọn) vào thư viện cảnh báo của dự án. */
+  async function applyLibraryToProject() {
+    setConfirmApplyLibrary(false);
+    try {
+      const library = await loadAlertLibrary();
+      const libraryAlarms = (library.alarmsByCategory ?? {}) as Record<string, unknown>;
+      const categoryIds = utilityCategories.map((category) => category.id);
+      const hasRows = categoryIds.some(
+        (id) => Array.isArray(libraryAlarms[id]) && (libraryAlarms[id] as unknown[]).length > 0,
+      );
+      if (!hasRows) {
+        setSyncNotice(`Thư viện cảnh báo chưa có ngưỡng nào cho loại ${activeUtility}.`);
+        setTimeout(() => setSyncNotice(""), 4500);
+        return;
+      }
+      const nextRows: Record<string, Alarm[]> = {};
+      for (const id of categoryIds) {
+        const rows = Array.isArray(libraryAlarms[id]) ? (libraryAlarms[id] as Alarm[]) : [];
+        nextRows[id] = rows
+          .map((row, idx) => normalizeAlarm({ ...row }, id, idx))
+          .filter((row): row is Alarm => Boolean(row));
+      }
+      setAlarmsByCategory((current) => ({ ...current, ...nextRows }));
+      setSyncNotice(`Đã áp dụng thư viện cảnh báo cho loại ${activeUtility}.`);
+      setTimeout(() => setSyncNotice(""), 4500);
+      // Đồng bộ ngưỡng Min/Max mới xuống bộ kiểm tra tức thời của gateway (như khi sửa tay từng ngưỡng).
+      await Promise.all(Object.values(nextRows).flat().map((alarm) => syncThresholdToGateway(alarm, true)));
+      await loadGatewayLive();
+    } catch (error) {
+      setSyncNotice(error instanceof Error ? error.message : "Không tải được thư viện cảnh báo.");
+      setTimeout(() => setSyncNotice(""), 4500);
+    }
+  }
+
   function selectUtility(utility: MeterType) {
     setActiveUtility(utility);
     setShowAllLiveParams(false);
@@ -542,7 +600,7 @@ export function AlertConfig({
     <div className="space-y-5">
       <section className="rounded-2xl border border-slate-200 bg-slate-50/70 p-3">
         <div className="mb-2 px-1 text-[10px] font-bold uppercase tracking-[0.16em] text-slate-400">
-          Loại năng lượng của dự án
+          {isLibrary ? "Loại điểm đo" : "Loại năng lượng của dự án"}
         </div>
         <div className="flex flex-wrap gap-2" role="tablist" aria-label="Loại năng lượng">
           {utilities.map((utility) => {
@@ -580,8 +638,16 @@ export function AlertConfig({
             <div className="mb-5 flex flex-wrap items-start justify-between gap-3">
               <div>
                 <h2 className="text-lg font-semibold tracking-tight text-slate-900">
-                  Cấu hình cảnh báo tức thời đồng hồ
+                  {isLibrary ? `Thư viện cảnh báo · ${activeUtility}` : "Cấu hình cảnh báo tức thời đồng hồ"}
                 </h2>
+                {isLibrary ? (
+                  <p className="mt-1 max-w-3xl text-sm text-slate-500">
+                    Mẫu ngưỡng cảnh báo dùng chung cho loại điểm đo <strong>{activeUtility}</strong>. Thay đổi ở đây
+                    không ảnh hưởng dự án đang chạy; mỗi dự án chép mẫu này bằng nút{" "}
+                    <strong>Áp dụng từ thư viện</strong> ở trang Sửa dự án → Cảnh báo.
+                  </p>
+                ) : null}
+                {isLibrary ? null : (<>
                 <p className="mt-1 max-w-3xl text-sm text-slate-500">
                   Trang này chỉ phục vụ cấu hình những cảnh báo tức thời từ dữ liệu Gateway bắn về (tham số{" "}
                   <code className="rounded bg-slate-100 px-1 py-0.5 font-mono text-xs text-slate-700">VAL</code> và{" "}
@@ -591,12 +657,23 @@ export function AlertConfig({
                 </p>
                 <p className="mt-2 inline-flex items-center gap-2 text-sm font-semibold text-emerald-600">
                   <LiveIcon className="h-4 w-4" />
-                  Cấu hình Gateway trực tuyến (Live Gateway Configuration) ·{" "}
+                  Cấu hình gateway trực tuyến ·{" "}
                   {gateways.length > 0
                     ? `${gateways.length} gateway đang kết nối (Đồng hồ ${gateways[0]?.meterModel ?? "PM2230"} #${gateways[0]?.meterId ?? "—"})`
                     : "Đang chờ bản tin từ gateway"}
                 </p>
+                </>)}
               </div>
+              {isLibrary ? null : (
+                <button
+                  type="button"
+                  onClick={() => setConfirmApplyLibrary(true)}
+                  className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-emerald-200 bg-emerald-50 px-3 text-xs font-semibold text-emerald-700 hover:bg-emerald-100"
+                  title="Chép ngưỡng từ Thư viện cảnh báo dùng chung cho loại điểm đo đang chọn"
+                >
+                  Áp dụng từ thư viện
+                </button>
+              )}
             </div>
 
             {utilityParameters.length > 0 ? (
@@ -837,13 +914,15 @@ export function AlertConfig({
                           </span>
                         ) : null}
                       </div>
-                      <button
-                        type="button"
-                        onClick={() => void syncThresholdToGateway(alarm)}
-                        className="rounded-lg bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-700 transition-colors hover:bg-emerald-100"
-                      >
-                        Lưu ngưỡng xuống Gateway
-                      </button>
+                      {isLibrary ? null : (
+                        <button
+                          type="button"
+                          onClick={() => void syncThresholdToGateway(alarm)}
+                          className="rounded-lg bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-700 transition-colors hover:bg-emerald-100"
+                        >
+                          Lưu ngưỡng xuống Gateway
+                        </button>
+                      )}
                     </div>
                   </article>
                 );
@@ -866,6 +945,7 @@ export function AlertConfig({
             </button>
           </section>
 
+          {isLibrary ? null : (
           <section className="rounded-xl border border-slate-200 bg-white p-5 shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
             <h2 className="text-[12px] font-semibold uppercase tracking-wide text-slate-500">
               Ngưỡng Min / Max đang kích hoạt trên Gateway Server ({gatewayThresholds.length})
@@ -913,8 +993,18 @@ export function AlertConfig({
               </div>
             )}
           </section>
+          )}
       </>
 
+      <ConfirmDialog
+        open={confirmApplyLibrary}
+        title="Áp dụng thư viện cảnh báo"
+        description={`Thay toàn bộ ngưỡng cảnh báo loại ${activeUtility} của dự án bằng mẫu trong Thư viện cảnh báo? Các ngưỡng đang có của loại này sẽ bị thay thế.`}
+        confirmText="Áp dụng"
+        danger={false}
+        onConfirm={() => void applyLibraryToProject()}
+        onCancel={() => setConfirmApplyLibrary(false)}
+      />
     </div>
   );
 }
