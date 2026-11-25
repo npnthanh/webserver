@@ -124,11 +124,6 @@ export function ClientShell({
             </Link>
           ) : null}
 
-          <div className="hidden sm:inline-flex items-center gap-2 rounded-full border border-emerald-200/80 bg-emerald-50/70 px-2.5 py-0.5 text-[11px] font-medium text-emerald-700">
-            <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
-            <span>Đang trực tuyến</span>
-          </div>
-
           <div className="h-4 w-px bg-slate-200 hidden sm:block" />
 
           <div className="flex items-center gap-2 sm:gap-2.5">
