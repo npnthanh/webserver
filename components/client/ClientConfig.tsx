@@ -1131,7 +1131,7 @@ function MetersPanel({
                                 ),
                               );
                             }}
-                            className="h-7 max-w-[180px] rounded border border-slate-200 bg-white px-2 text-[11px] font-medium text-slate-700 outline-none focus:border-emerald-500"
+                            className="h-7 max-w-[280px] rounded border border-slate-200 bg-white px-2 text-[11px] font-medium text-slate-700 outline-none focus:border-emerald-500"
                           >
                             <option value="">-- Đổi / Gán đồng hồ --</option>
                             {devices.map((dev) => {
@@ -1143,20 +1143,8 @@ function MetersPanel({
                               );
                             })}
                           </CustomSelect>
-                          <input
-                            value={item.serialNumber ?? assigned?.sn ?? ""}
-                            onChange={(e) => {
-                              const sn = e.target.value;
-                              onMetersChange(
-                                meters.map((m) =>
-                                  m.id === item.id ? { ...m, serialNumber: sn } : m,
-                                ),
-                              );
-                            }}
-                            placeholder="Nhập SN công tơ mới..."
-                            title="Thay đổi Serial đồng hồ tại điểm đo này (dữ liệu đồng hồ cũ vẫn được bảo toàn theo lịch sử)"
-                            className="h-7 w-36 rounded border border-slate-200 bg-white px-2 font-mono text-[11px] text-slate-700 outline-none focus:border-emerald-500"
-                          />
+                          {/* Serial lấy theo đồng hồ đã chọn (khai báo ở Thư viện loại đồng hồ); không cho gõ tay
+                              để serial trên điểm đo không lệch với đồng hồ được gắn. */}
                         </div>
                         {duplicateOf(item).length ? (
                           <p className="rounded border border-rose-200 bg-rose-50 px-2 py-1 text-[11px] font-medium text-rose-700">
