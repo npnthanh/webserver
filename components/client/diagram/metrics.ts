@@ -6,12 +6,15 @@ import {
 import { formatAppNumber } from "@/lib/number-format";
 import type { MeterMetric, MeterStatus } from "./types";
 
-/** Thông số mặc định trên thẻ sơ đồ (điện áp / dòng / công suất / tần số). */
-export const DEFAULT_DIAGRAM_METRIC_KEYS = ["Van", "Ia", "Papt", "F"] as const;
+/** Thông số mặc định trên thẻ sơ đồ (điện áp / dòng / công suất). */
+export const DEFAULT_DIAGRAM_METRIC_KEYS = ["Van", "Ia", "Papt"] as const;
 
-/** Bỏ qua sóng hài bậc cao (quá dài cho picker sơ đồ). */
+/** Thông số không hiển thị trên sơ đồ (tần số F đã bỏ khỏi sơ đồ). */
+const HIDDEN_DIAGRAM_KEYS = new Set(["F"]);
+
+/** Bỏ qua sóng hài bậc cao (quá dài cho picker sơ đồ) và các thông số ẩn. */
 export const DIAGRAM_PICKER_PARAMETERS: MeterParameter[] = METER_PARAMETERS.filter(
-  (item) => item.id <= 61,
+  (item) => item.id <= 61 && !HIDDEN_DIAGRAM_KEYS.has(item.key),
 );
 
 const SHORT_LABELS: Record<string, string> = {
@@ -44,7 +47,9 @@ const ENERGY_KEYS = new Set(["EPaed", "EPaer", "EQred", "EQrer", "ESaed", "ESaer
 export const DIAGRAM_ONLINE_MS = 15 * 60 * 1000;
 
 export function normalizeMetricKeys(keys: string[] | null | undefined): string[] {
-  const cleaned = (keys ?? []).filter((key) => typeof key === "string" && key.trim());
+  const cleaned = (keys ?? []).filter(
+    (key) => typeof key === "string" && key.trim() && !HIDDEN_DIAGRAM_KEYS.has(key),
+  );
   return cleaned.length ? [...new Set(cleaned)] : [...DEFAULT_DIAGRAM_METRIC_KEYS];
 }
 

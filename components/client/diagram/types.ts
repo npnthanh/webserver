@@ -48,7 +48,6 @@ export type SourceNodeData = {
   energy: EnergyKind;
   totalPowerText: string;
   voltageText: string;
-  freqText: string;
   normalCount: number;
   warningCount: number;
   offlineCount: number;

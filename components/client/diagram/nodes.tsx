@@ -106,8 +106,6 @@ export function SourceNode({ data }: NodeProps<SourceFlowNode>) {
             </svg>
             <div className="pb-0.5 font-mono text-[10.5px] leading-[1.35]">
               <EditableGridLabel value={data.gridLabel} />
-              <p className={VALUE_TEXT}>f: {data.freqText}</p>
-              <p className={isOnline ? VALUE_TEXT : "text-slate-400"}>{isOnline ? "Đóng điện" : "Standby"}</p>
             </div>
           </div>
           {/* Đường dây từ nguồn xuống thanh cái: chỉ một nét liền (giữ nguyên chiều cao bố cục cũ). */}

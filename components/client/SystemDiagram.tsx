@@ -262,7 +262,6 @@ function buildSourceNodeData(
       ? formatMetricReading("VLLavg", sampleValues)
       : formatMetricReading("Van", sampleValues)
     : "380 V";
-  const freqText = sampleValues ? formatMetricReading("F", sampleValues) : "50,0 Hz";
 
   return {
     title: `Trạm biến áp & Tủ tổng ${projectName}`,
@@ -274,7 +273,6 @@ function buildSourceNodeData(
     energy,
     totalPowerText,
     voltageText,
-    freqText,
     normalCount,
     warningCount,
     offlineCount,
