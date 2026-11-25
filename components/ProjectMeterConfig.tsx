@@ -26,9 +26,9 @@ type DeviceKind = "meter" | "inverter" | "thermo" | "water" | "wind" | "steam" |
 type Status = "connected" | "disconnected" | "disabled";
 
 const STATUS_STYLE: Record<Status, { label: string; dot: string; text: string }> = {
-  connected: { label: "Connected", dot: "bg-emerald-500", text: "text-slate-700" },
-  disconnected: { label: "Disconnected", dot: "bg-red-500", text: "text-red-500" },
-  disabled: { label: "Disabled", dot: "bg-slate-300", text: "text-slate-400" },
+  connected: { label: "Đang kết nối", dot: "bg-emerald-500", text: "text-slate-700" },
+  disconnected: { label: "Mất kết nối", dot: "bg-red-500", text: "text-red-500" },
+  disabled: { label: "Chưa gắn đồng hồ", dot: "bg-slate-300", text: "text-slate-400" },
 };
 
 /** Điểm đo đang kết nối = có mẫu gateway trong cửa sổ online (cùng quy tắc với Sơ đồ hệ thống). */

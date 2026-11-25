@@ -261,7 +261,7 @@ export function NotificationConfig() {
               onChange={(e) => update("zalo", { accessToken: e.target.value })}
             />
           </Field>
-          <Field label="Refresh Token">
+          <Field label="Mã làm mới (Refresh Token)">
             <input
               className="input"
               type="password"

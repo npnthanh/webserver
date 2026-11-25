@@ -837,14 +837,14 @@ function ProjectForm({
         onChange={(e) => onClassify(e.target.value)}
         className="h-10 w-full rounded-md border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none focus:border-emerald-500"
       >
-        <option>Thông tin chung (Info)</option>
+        <option value="Thông tin chung (Info)">Thông tin chung</option>
         <option>Thông tin kỹ thuật</option>
       </CustomSelect>
       <div className="mt-2 divide-y divide-slate-100">
-        <Field n={1} title="Start Time" hint="Thời gian bắt đầu chu kỳ dữ liệu hệ thống">
+        <Field n={1} title="Thời gian bắt đầu" hint="Thời gian bắt đầu chu kỳ dữ liệu hệ thống">
           <DateInput value={startTime} onChange={onStartTime} />
         </Field>
-        <Field n={2} title="Warning Number" hint="Số lượng cảnh báo tối đa cho phép trong hàng đợi">
+        <Field n={2} title="Số lượng cảnh báo" hint="Số lượng cảnh báo tối đa cho phép trong hàng đợi">
           <input
             value={warnCount}
             onChange={(e) => onWarnCount(e.target.value)}
@@ -852,10 +852,10 @@ function ProjectForm({
             className="h-10 w-full max-w-xs rounded-md border border-slate-200 px-3 text-sm outline-none focus:border-emerald-500"
           />
         </Field>
-        <Field n={3} title="Warning Timeout" hint="Thời gian chờ phản hồi cảnh báo (tối thiểu 1 phút)">
+        <Field n={3} title="Thời gian chờ cảnh báo" hint="Thời gian chờ phản hồi cảnh báo (tối thiểu 1 phút)">
           <Stepper value={warnTimeout} min={1} onChange={onWarnTimeout} />
         </Field>
-        <Field n={4} title="Online Timeout" hint="Thời gian xác định trạng thái ngoại tuyến (tối thiểu 2 phút)">
+        <Field n={4} title="Thời gian xác định ngoại tuyến" hint="Thời gian xác định trạng thái ngoại tuyến (tối thiểu 2 phút)">
           <Stepper value={onlineTimeout} min={2} onChange={onOnlineTimeout} />
         </Field>
         <Field n={7} title="Gmail đăng nhập" hint="Email hệ thống dùng để gửi thông báo và báo cáo tự động">
@@ -1814,7 +1814,7 @@ function AlertsPanel({
             className="h-10 w-full rounded-md border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none focus:border-emerald-500"
           >
             <option value="Cấu hình ngưỡng theo thông số đo">Cấu hình ngưỡng theo thông số đo</option>
-            <option value="Thông tin chung (Info)">Thông tin chung & Ngưỡng tiêu thụ (Info)</option>
+            <option value="Thông tin chung (Info)">Thông tin chung & Ngưỡng tiêu thụ</option>
             <option value="Mức độ phân loại lỗi">Mức độ phân loại cảnh báo theo danh mục</option>
           </CustomSelect>
         </div>
@@ -2022,8 +2022,8 @@ function AlertsPanel({
                             <tr className="border-b border-slate-100 bg-slate-50 text-[10px] font-bold tracking-wider text-slate-400 uppercase">
                               <th className="px-3 py-2">Điểm đo</th>
                               <th className="px-3 py-2">Giá trị hiện tại</th>
-                              <th className="px-3 py-2">Ngưỡng thấp (Min)</th>
-                              <th className="px-3 py-2">Ngưỡng cao (Max)</th>
+                              <th className="px-3 py-2">Ngưỡng thấp</th>
+                              <th className="px-3 py-2">Ngưỡng cao</th>
                             </tr>
                           </thead>
                           <tbody className="divide-y divide-slate-100">
@@ -2108,7 +2108,7 @@ function AlertsPanel({
             Cảnh báo khi sản lượng tiêu thụ điện vượt định mức cho phép theo chu kỳ hoặc giờ cao điểm.
           </p>
           <div className="divide-y divide-slate-100">
-            <Field title="Over-consumption threshold" hint="Ngưỡng tiêu thụ vượt mức cho phép (kWh)">
+            <Field title="Ngưỡng tiêu thụ vượt mức" hint="Ngưỡng tiêu thụ vượt mức cho phép (kWh)">
               <div className="relative">
                 <input
                   value={threshold}
@@ -2121,10 +2121,10 @@ function AlertsPanel({
                 </span>
               </div>
             </Field>
-            <Field title="Daily limit" hint="Giới hạn tiêu thụ hàng ngày tối đa (kWh/ngày)">
+            <Field title="Giới hạn tiêu thụ hằng ngày" hint="Giới hạn tiêu thụ hàng ngày tối đa (kWh/ngày)">
               <Stepper value={dailyLimit} min={0} onChange={onDailyLimit} />
             </Field>
-            <Field title="Peak Hour Warning" hint="Cảnh báo khi tiêu thụ cao trong giờ cao điểm (17:30 – 22:30)">
+            <Field title="Cảnh báo giờ cao điểm" hint="Cảnh báo khi tiêu thụ cao trong giờ cao điểm (17:30 – 22:30)">
               <label className="inline-flex items-center gap-2 text-sm text-slate-600">
                 <button
                   type="button"

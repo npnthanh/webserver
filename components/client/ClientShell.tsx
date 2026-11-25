@@ -126,7 +126,7 @@ export function ClientShell({
 
           <div className="hidden sm:inline-flex items-center gap-2 rounded-full border border-emerald-200/80 bg-emerald-50/70 px-2.5 py-0.5 text-[11px] font-medium text-emerald-700">
             <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
-            <span>SCADA Online</span>
+            <span>Đang trực tuyến</span>
           </div>
 
           <div className="h-4 w-px bg-slate-200 hidden sm:block" />
@@ -277,7 +277,7 @@ export function ClientShell({
 
       <footer className="hidden sm:flex h-9 shrink-0 items-center justify-between gap-4 border-t border-slate-200/80 bg-white px-4 text-[11px] text-slate-400 sm:px-6">
         <p className="truncate">
-          © 2026 {resolved.customer} • EMS Telemetry Gateway
+          © 2026 {resolved.customer} • DTS – Giám sát năng lượng
         </p>
         <p className="hidden shrink-0 items-center gap-1.5 sm:flex">
           <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />

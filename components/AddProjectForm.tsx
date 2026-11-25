@@ -583,7 +583,7 @@ export function AddProjectForm({ initialProject }: { initialProject?: Project })
                       </Field>
                     ) : null}
                     {(item.channels ?? []).includes("Zalo") ? (
-                      <Field label="ZALO USER ID">
+                      <Field label="MÃ NGƯỜI DÙNG ZALO (USER ID)">
                         <input
                           value={item.zaloUserId ?? ""}
                           onChange={(e) => updateRecipient(item.id, { zaloUserId: e.target.value })}

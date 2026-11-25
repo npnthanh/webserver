@@ -72,7 +72,7 @@ export function LoginForm({
         <div className="absolute inset-0 z-0">
           <Image
             src="/images/login-hero.jpg"
-            alt="EMS Smart Green Industrial Facility"
+            alt="Nhà máy công nghiệp xanh thông minh"
             fill
             priority
             className="object-cover object-center scale-105 transform transition-transform duration-10000 ease-out"
@@ -95,10 +95,10 @@ export function LoginForm({
               <div className="flex items-center gap-2">
                 <span className="text-base font-bold tracking-tight text-white">DTS</span>
                 <span className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-400 uppercase tracking-wider">
-                  Enterprise
+                  Doanh nghiệp
                 </span>
               </div>
-              <p className="text-[11px] text-slate-400">Energy Management & Carbon Intelligence</p>
+              <p className="text-[11px] text-slate-400">Quản lý năng lượng & phát thải carbon</p>
             </div>
           </div>
 
@@ -158,10 +158,10 @@ export function LoginForm({
             <span className="h-3 w-px bg-slate-700" />
             <span className="flex items-center gap-1.5">
               <LeafIcon className="h-4 w-4 text-cyan-400" />
-              GHG Protocol Verified
+              Theo chuẩn GHG Protocol
             </span>
           </div>
-          <span className="text-[11px]">© 2026 EMS Ecosystem.</span>
+          <span className="text-[11px]">© 2026 DTS.</span>
         </div>
       </div>
 
@@ -181,7 +181,7 @@ export function LoginForm({
             </div>
             <div>
               <span className="text-lg font-bold tracking-tight text-white">DTS</span>
-              <p className="text-xs text-slate-400">Energy & Carbon Intelligence</p>
+              <p className="text-xs text-slate-400">Quản lý năng lượng & phát thải carbon</p>
             </div>
           </div>
 

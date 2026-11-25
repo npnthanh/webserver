@@ -90,15 +90,15 @@ export const METER_PARAMETERS: MeterParameter[] = [
 
 function harmonicParameters(): MeterParameter[] {
   const channels: Array<{ label: string; suffix: string }> = [
-    { label: "Voltage A-B", suffix: "Vab" },
-    { label: "Voltage A-C", suffix: "Vca" },
-    { label: "Voltage B-C", suffix: "Vbc" },
-    { label: "Voltage A-N", suffix: "Van" },
-    { label: "Voltage B-N", suffix: "Vbn" },
-    { label: "Voltage C-N", suffix: "Vcn" },
-    { label: "Current A", suffix: "Ca" },
-    { label: "Current B", suffix: "Cb" },
-    { label: "Current C", suffix: "Cc" },
+    { label: "Điện áp dây A-B", suffix: "Vab" },
+    { label: "Điện áp dây C-A", suffix: "Vca" },
+    { label: "Điện áp dây B-C", suffix: "Vbc" },
+    { label: "Điện áp pha A", suffix: "Van" },
+    { label: "Điện áp pha B", suffix: "Vbn" },
+    { label: "Điện áp pha C", suffix: "Vcn" },
+    { label: "Dòng điện pha A", suffix: "Ca" },
+    { label: "Dòng điện pha B", suffix: "Cb" },
+    { label: "Dòng điện pha C", suffix: "Cc" },
   ];
   const orders = [3, 5, 7, 9];
   const rows: MeterParameter[] = [];
@@ -109,7 +109,7 @@ function harmonicParameters(): MeterParameter[] {
         id,
         group: "Độ thị bậc sóng hài",
         chart: "harm",
-        name: `${channel.label}, H${order} Magnitude`,
+        name: `${channel.label}, sóng hài bậc ${order}`,
         unit: "%",
         key: `H${order}${channel.suffix}`,
       });

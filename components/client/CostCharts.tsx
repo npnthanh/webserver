@@ -661,7 +661,7 @@ export function CostCharts() {
             className="flex h-10 w-full items-center justify-center gap-2 rounded-xl bg-emerald-50 text-[13px] font-semibold text-emerald-800 hover:bg-emerald-100 transition-colors shadow-xs"
           >
             <RefreshIcon className="h-4 w-4" />
-            Refresh Data
+            Làm mới dữ liệu
           </button>
         </div>
       </aside>

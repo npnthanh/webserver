@@ -476,10 +476,10 @@ export function SampleTrendChart({
   const exportTableExcel = () => {
     exportToExcel({
       filename: `${title.toLowerCase().replace(/\s+/g, "-")}-table-data`,
-      sheetName: "Table Data",
-      title: `${title} - Table Data`,
+      sheetName: "Bảng dữ liệu",
+      title: `${title} - Bảng dữ liệu`,
       columns: [
-        { header: "Time", width: 24 },
+        { header: "Thời gian", width: 24 },
         ...series.map((s) => ({
           header: s.unit ? `${s.label} (${s.unit})` : s.label,
           width: 18,
@@ -538,7 +538,7 @@ export function SampleTrendChart({
         <div className="mt-3">
           <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
             <div className="flex flex-wrap items-center gap-2.5">
-              <h4 className="text-[18px] font-bold text-slate-800">Table Data</h4>
+              <h4 className="text-[18px] font-bold text-slate-800">Bảng dữ liệu</h4>
               {isZoomed ? (
                 <div className="inline-flex rounded-md border border-slate-200 bg-slate-50 p-0.5 text-xs">
                   <button
@@ -567,7 +567,7 @@ export function SampleTrendChart({
                         : "text-slate-500 hover:text-slate-700"
                     }`}
                   >
-                    Vùng đang Zoom ({visibleSamples.length})
+                    Vùng đang phóng to ({visibleSamples.length})
                   </button>
                 </div>
               ) : null}
@@ -586,7 +586,7 @@ export function SampleTrendChart({
                 onClick={() => setTableMode(false)}
                 className="inline-flex h-8 items-center rounded bg-[#b91c1c] px-3.5 text-xs font-semibold text-white hover:bg-[#991b1b]"
               >
-                Close
+                Đóng
               </button>
             </div>
           </div>
@@ -598,7 +598,7 @@ export function SampleTrendChart({
             <table className="w-full min-w-[540px] border-collapse text-center text-[13px]">
               <thead className="sticky top-0 z-10 bg-slate-50 text-slate-700 shadow-2xs">
                 <tr className="border-b border-slate-300">
-                  <th className="px-3.5 py-2.5 font-semibold whitespace-nowrap">Time</th>
+                  <th className="px-3.5 py-2.5 font-semibold whitespace-nowrap">Thời gian</th>
                   {series.map((s) => (
                     <th
                       key={s.key}
@@ -670,7 +670,7 @@ export function SampleTrendChart({
               onClick={() => setTableMode(false)}
               className="inline-flex h-8 items-center rounded bg-[#b91c1c] px-4 text-xs font-semibold text-white shadow-xs hover:bg-[#991b1b]"
             >
-              Close
+              Đóng
             </button>
           </div>
         </div>
@@ -713,7 +713,7 @@ export function SampleTrendChart({
             <div className="flex items-center gap-1.5">
               <button
                 type="button"
-                title="Table Data (Xem bảng dữ liệu chi tiết)"
+                title="Xem bảng dữ liệu chi tiết"
                 onClick={() => {
                   setTableScrollTop(0);
                   setTableMode(true);
@@ -1181,7 +1181,7 @@ export function SampleTrendChart({
               </span>
 
               <div className="flex flex-wrap items-center gap-1">
-                <span className="mr-1 text-[10.5px] text-slate-400">Zoom nhanh:</span>
+                <span className="mr-1 text-[10.5px] text-slate-400">Thu phóng nhanh:</span>
                 {totalSpanMs <= 48 * 3600 * 1000 ? (
                   <>
                     <button

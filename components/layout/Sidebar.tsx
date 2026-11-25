@@ -30,7 +30,7 @@ const navGroups: {
       },
       {
         href: "/gateway",
-        label: "Gateway Server",
+        label: "Máy chủ Gateway",
         icon: GatewayIcon,
         permission: "manageGateway",
       },
@@ -223,7 +223,7 @@ function SidebarBody({
                   ? "QUẢN LÝ DỰ ÁN"
                   : config
                     ? "CẤU HÌNH DỰ ÁN"
-                    : "Energy & Carbon Platform"}
+                    : "Nền tảng năng lượng & carbon"}
               </p>
             </div>
           )}
