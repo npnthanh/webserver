@@ -15,6 +15,12 @@ import {
 } from "@/lib/server-meter-replacement";
 import { emsDb, jsonField, queryRows } from "@/lib/server-db";
 import {
+  deleteReportTemplate,
+  listReportTemplates,
+  ReportTemplateError,
+  saveReportTemplate,
+} from "@/lib/server-report-templates";
+import {
   ensureNotifierSchema,
   getMaskedSettings,
   listDeliveries,
@@ -85,6 +91,7 @@ const RESOURCE_NAMES = new Set([
   "project-deletions",
   "alert-library",
   "meter-replacements",
+  "report-templates",
 ]);
 
 /** Lỗi nghiệp vụ: thông điệp được trả nguyên văn cho người dùng với HTTP 400. */
@@ -144,7 +151,12 @@ function forbidden(message = "Không có quyền thực hiện thao tác này.")
 }
 
 function serverError(error: unknown) {
-  if (error instanceof UserFacingError || error instanceof ProjectEventError || error instanceof CatalogUserError) {
+  if (
+    error instanceof UserFacingError ||
+    error instanceof ProjectEventError ||
+    error instanceof CatalogUserError ||
+    error instanceof ReportTemplateError
+  ) {
     return Response.json({ error: error.message }, { status: 400 });
   }
   const sqlMessage =
@@ -1611,6 +1623,11 @@ export async function GET(request: NextRequest, context: Params) {
       const gate = await requirePermission("viewProjects");
       if (!gate.ok) return forbidden();
     }
+    if (resource === "report-templates") {
+      // Trang Báo cáo của cả tài khoản quản trị lẫn khách hàng đều chọn mẫu: chỉ cần đã đăng nhập.
+      if (!(await getServerSession())) return forbidden();
+      return Response.json(await listReportTemplates());
+    }
     if (resource === "notification-settings" || resource === "telegram-chats" || resource === "notification-test") {
       const gate = await requirePermission("manageUsers");
       if (!gate.ok) return forbidden("Chỉ Quản trị viên được cấu hình thông báo.");
@@ -1652,6 +1669,11 @@ export async function POST(request: NextRequest, context: Params) {
     if (resource === "alert-library") {
       const gate = await requirePermission("manageDevices");
       if (!gate.ok) return forbidden("Không có quyền chỉnh sửa thư viện cảnh báo.");
+    }
+    if (resource === "report-templates") {
+      const gate = await requirePermission("manageDevices");
+      if (!gate.ok) return forbidden("Không có quyền chỉnh sửa thư viện báo cáo.");
+      return Response.json(await saveReportTemplate(await request.json()));
     }
     const body = (await request.json()) as Row;
     if (resource === "alert-library") {
@@ -1766,6 +1788,11 @@ export async function DELETE(request: NextRequest, context: Params) {
       if (target && !canManageAccountRole(gate.session, { id, role: asString(target.role) })) {
         return forbidden("Chỉ người có cấp cao hơn mới được xoá tài khoản này.");
       }
+    }
+    if (resource === "report-templates") {
+      const gate = await requirePermission("manageDevices");
+      if (!gate.ok) return forbidden("Không có quyền chỉnh sửa thư viện báo cáo.");
+      return Response.json(await deleteReportTemplate(request.nextUrl.searchParams.get("id") ?? ""));
     }
     if (resource === "projects") {
       const gate = await requirePermission("manageProjects");

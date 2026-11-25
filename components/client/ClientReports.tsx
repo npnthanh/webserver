@@ -27,8 +27,10 @@ import {
   type ReportConfig,
   type ReportFieldDef,
   type ReportHeaderFooterConfig,
+  type ReportTemplate,
   type ReportTypeId,
 } from "@/lib/report-config";
+import { loadReportTemplates } from "@/lib/report-templates";
 import {
   loadProjectGatewayEnergySlots,
   loadProjectGatewayLatest,
@@ -64,12 +66,39 @@ type Format = ".pdf" | ".xlsx";
 
 type ComparisonBaseline = "prev_period" | "prev_month" | "prev_year" | "between_meters";
 
-const TEMPLATES = [
-  "Mẫu báo cáo chuẩn EMS",
-  "Mẫu báo cáo ISO 50001",
-  "Mẫu báo cáo kiểm kê GHG (ISO 14064)",
-  "Mẫu tùy chỉnh doanh nghiệp",
-];
+/** Lựa chọn "không dùng mẫu thư viện": theo cấu hình báo cáo riêng của dự án. */
+const PROJECT_TEMPLATE_LABEL = "Theo cấu hình dự án";
+
+/**
+ * Cấu hình hiển thị khi áp một mẫu thư viện lên cấu hình báo cáo của dự án (tpl = null: theo dự án).
+ * Giới hạn của quản trị viên vẫn giữ: chỉ loại báo cáo được bật và trường dữ liệu được phép của dự án.
+ */
+function buildTemplateState(base: ReportConfig, tpl: ReportTemplate | null, currentReportId: ReportTypeId) {
+  let config: ReportConfig;
+  if (!tpl) {
+    config = { ...base, templateId: undefined };
+  } else {
+    const enabled = tpl.enabledReports.filter((rid) => base.enabledReports.includes(rid));
+    const fields = { ...base.fieldsByReport };
+    for (const rid of REPORTS.map((item) => item.id)) {
+      const allowed = base.allowedFields[rid];
+      const picked = (tpl.fieldsByReport[rid] ?? []).filter((key) => allowed.includes(key));
+      fields[rid] = picked.length ? picked : allowed;
+    }
+    config = {
+      ...base,
+      enabledReports: enabled.length ? enabled : base.enabledReports,
+      fieldsByReport: fields,
+      titles: { ...tpl.titles },
+      layout: { ...tpl.layout },
+      templateId: tpl.id,
+    };
+  }
+  const openId = config.enabledReports.includes(currentReportId) ? currentReportId : config.enabledReports[0];
+  const openReport = REPORTS.find((item) => item.id === openId) ?? REPORTS[0];
+  const headerFooter = { ...(tpl ? tpl.headerFooter : base.headerFooter), formCode: openReport.formCode };
+  return { config, openReport, headerFooter };
+}
 
 
 /**
@@ -113,7 +142,12 @@ export function ClientReports({
   const projectId = params?.id ?? "default";
 
   const [projectName, setProjectName] = useState<string>("Dự án EMS");
-  const [template, setTemplate] = useState(TEMPLATES[0]);
+  // Mẫu trong Thư viện báo cáo (Cấu hình → Thư viện báo cáo); "" = theo cấu hình riêng của dự án.
+  const [libraryTemplates, setLibraryTemplates] = useState<ReportTemplate[]>([]);
+  const [templateId, setTemplateId] = useState("");
+  /** Cấu hình báo cáo của dự án như đã lưu (trước khi áp mẫu) — để quay lại và để lưu không ghi đè phần quản trị. */
+  const [baseConfig, setBaseConfig] = useState<ReportConfig | null>(null);
+  const [projectMeterTypes, setProjectMeterTypes] = useState<string[]>([]);
   const [reportId, setReportId] = useState<ReportTypeId>(
     REPORTS.some((r) => r.id === initialId) ? initialId : "overview",
   );
@@ -175,12 +209,18 @@ export function ClientReports({
       hydrateAlertEvents(projectId).catch(() => []),
       hydrateProjectSettings(projectId, { force: true }).catch(() => ({})),
       loadProjectGatewayLatest(projectId).catch(() => []),
-    ]).then(([projects, meterRows, ghgList, alertsList, settings, latestList]) => {
+      loadReportTemplates().catch(() => [] as ReportTemplate[]),
+    ]).then(([projects, meterRows, ghgList, alertsList, settings, latestList, templateList]) => {
       if (!active) return;
       const proj = projects.find((p) => p.id === projectId);
       if (proj) setProjectName(proj.name);
 
       setMeters(meterRows);
+      setProjectMeterTypes(
+        Array.from(
+          new Set([...(proj?.meterTypes ?? []), ...meterRows.map((m) => m.utility)].filter(Boolean) as string[]),
+        ),
+      );
       setSelectedMeterIds((current) => {
         const valid = current.filter((id) => meterRows.some((m) => m.id === id));
         if (valid.length > 0) return valid;
@@ -214,20 +254,25 @@ export function ClientReports({
       const customUnknown = parseTariffPrice(String(savedCost?.electricity?.prices?.none ?? ""));
       setUnknownPrice(customUnknown > 0 ? customUnknown : null);
 
-      const config = readReportConfig(settingsObj);
+      const base = readReportConfig(settingsObj);
+      setBaseConfig(base);
+      setLibraryTemplates(templateList);
+      // Dự án đã lưu mẫu thư viện → mở lại trang tự áp mẫu đó. Loại báo cáo mở ban đầu không được bật
+      // cho dự án thì chuyển sang loại đầu tiên được bật.
+      const savedTemplate = templateList.find((item) => item.id === base.templateId) ?? null;
+      const startId = REPORTS.some((r) => r.id === initialId) ? initialId : "overview";
+      const state = buildTemplateState(base, savedTemplate, startId);
+      const config = state.config;
+      setTemplateId(savedTemplate?.id ?? "");
       setReportConfig(config);
       setFieldsByReport(config.fieldsByReport);
       setChart(config.layout.chart ? "Có" : "Không");
       setSummary(config.layout.summary ? "Có" : "Không");
       setDetail(config.layout.detail ? "Có" : "Không");
       setFormat(config.layout.format);
-      // Loại báo cáo mở ban đầu không được bật cho dự án → chuyển sang loại đầu tiên được bật.
-      const startId = REPORTS.some((r) => r.id === initialId) ? initialId : "overview";
-      const openId = config.enabledReports.includes(startId) ? startId : config.enabledReports[0];
-      const openReport = REPORTS.find((item) => item.id === openId) ?? REPORTS[0];
-      setReportId(openReport.id);
-      setTitle(reportTitle(config, openReport.id));
-      setHeaderFooter({ ...config.headerFooter, formCode: openReport.formCode });
+      setReportId(state.openReport.id);
+      setTitle(reportTitle(config, state.openReport.id));
+      setHeaderFooter(state.headerFooter);
     });
 
     return () => {
@@ -279,6 +324,49 @@ export function ClientReports({
       active = false;
     };
   }, [projectId, timeFilter]);
+
+  /** Mẫu thư viện dùng được cho dự án: đúng loại điểm đo của dự án (chưa biết loại thì hiện tất cả). */
+  const availableTemplates = useMemo(
+    () =>
+      projectMeterTypes.length
+        ? libraryTemplates.filter((item) => projectMeterTypes.includes(item.meterType))
+        : libraryTemplates,
+    [libraryTemplates, projectMeterTypes],
+  );
+  const selectedTemplate = availableTemplates.find((item) => item.id === templateId) ?? null;
+  const templateLabel = selectedTemplate?.name ?? PROJECT_TEMPLATE_LABEL;
+
+  /**
+   * Áp mẫu thư viện lên trang báo cáo. Giới hạn của quản trị viên vẫn giữ: chỉ loại báo cáo được bật và
+   * trường dữ liệu được phép xem của dự án. Chọn "" = quay về cấu hình riêng của dự án.
+   */
+  const applyTemplate = (id: string) => {
+    if (!baseConfig) return;
+    const tpl = libraryTemplates.find((item) => item.id === id) ?? null;
+    const state = buildTemplateState(baseConfig, tpl, reportId);
+    setTemplateId(tpl?.id ?? "");
+    setReportConfig(state.config);
+    setFieldsByReport(state.config.fieldsByReport);
+    setChart(state.config.layout.chart ? "Có" : "Không");
+    setSummary(state.config.layout.summary ? "Có" : "Không");
+    setDetail(state.config.layout.detail ? "Có" : "Không");
+    setFormat(state.config.layout.format);
+    setReportId(state.openReport.id);
+    setTitle(reportTitle(state.config, state.openReport.id));
+    setHeaderFooter(state.headerFooter);
+    // Lưu lựa chọn mẫu cho dự án (chỉ thêm templateId, giữ nguyên phần quản trị viên đã cấu hình).
+    const savedBase: ReportConfig = { ...baseConfig, templateId: tpl?.id || undefined };
+    setBaseConfig(savedBase);
+    void saveProjectSettings(projectId, { reportConfig: savedBase })
+      .then(() => {
+        setSaveNotice(tpl ? `Đã áp dụng mẫu "${tpl.name}" cho dự án` : "Đã chuyển về cấu hình báo cáo của dự án");
+        window.setTimeout(() => setSaveNotice(""), 2500);
+      })
+      .catch(() => {
+        setSaveNotice("Đã áp dụng mẫu cho lần xem này (không lưu được lựa chọn cho dự án)");
+        window.setTimeout(() => setSaveNotice(""), 3500);
+      });
+  };
 
   const pickReport = (id: ReportTypeId) => {
     const next = REPORTS.find((item) => item.id === id) ?? REPORTS[0];
@@ -344,10 +432,18 @@ export function ClientReports({
     setSavingTemplate(true);
     setSaveNotice("");
     try {
-      // Giữ phần quản trị viên cấu hình (loại báo cáo, tiêu đề, bố cục), chỉ cập nhật Header/Footer + trường dữ liệu.
-      const nextConfig = { ...reportConfig, headerFooter, fieldsByReport };
-      await saveProjectSettings(projectId, { reportConfig: nextConfig });
-      setReportConfig(nextConfig);
+      // Giữ phần quản trị viên cấu hình (loại báo cáo, tiêu đề, bố cục), chỉ cập nhật Header/Footer, trường
+      // dữ liệu và mẫu thư viện đang chọn (mở lại trang sẽ tự áp mẫu này).
+      const base = baseConfig ?? reportConfig;
+      const savedConfig: ReportConfig = {
+        ...base,
+        headerFooter,
+        fieldsByReport,
+        templateId: templateId || undefined,
+      };
+      await saveProjectSettings(projectId, { reportConfig: savedConfig });
+      setBaseConfig(savedConfig);
+      setReportConfig((current) => ({ ...current, headerFooter, fieldsByReport, templateId: templateId || undefined }));
       setSaveNotice("Đã lưu mẫu Header / Footer và trường dữ liệu báo cáo");
       window.setTimeout(() => setSaveNotice(""), 2500);
     } catch {
@@ -1116,7 +1212,7 @@ export function ClientReports({
     </div>
     <div style="text-align:right;font-size:11px;color:#475569">
       <div><strong>Mã biểu mẫu:</strong> ${headerFooter.formCode}</div>
-      <div style="margin-top:2px"><strong>Mẫu áp dụng:</strong> ${template}</div>
+      <div style="margin-top:2px"><strong>Mẫu áp dụng:</strong> ${templateLabel}</div>
       <div style="margin-top:2px"><strong>Ngày trích xuất:</strong> ${exportedAt}</div>
     </div>
   </div>
@@ -1187,13 +1283,14 @@ export function ClientReports({
         <div className="flex items-center justify-between gap-2">
           <span className="text-xs font-bold text-slate-800">Danh Sách Báo Cáo</span>
           <CustomSelect
-            value={template}
-            onChange={(e) => setTemplate(e.target.value)}
+            value={templateId}
+            onChange={(e) => applyTemplate(e.target.value)}
             className="h-8 max-w-[210px] rounded-md border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 outline-none focus:border-emerald-500"
           >
-            {TEMPLATES.map((item) => (
-              <option key={item} value={item}>
-                {item}
+            <option value="">{PROJECT_TEMPLATE_LABEL}</option>
+            {availableTemplates.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.name}
               </option>
             ))}
           </CustomSelect>
@@ -1234,16 +1331,20 @@ export function ClientReports({
             Mẫu báo cáo áp dụng
           </p>
           <CustomSelect
-            value={template}
-            onChange={(e) => setTemplate(e.target.value)}
+            value={templateId}
+            onChange={(e) => applyTemplate(e.target.value)}
             className="h-10 w-full rounded-md border border-slate-200 bg-white px-3 text-xs font-medium text-slate-700 outline-none focus:border-emerald-500"
           >
-            {TEMPLATES.map((item) => (
-              <option key={item} value={item}>
-                {item}
+            <option value="">{PROJECT_TEMPLATE_LABEL}</option>
+            {availableTemplates.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.name} · {item.meterType}
               </option>
             ))}
           </CustomSelect>
+          <p className="mt-1.5 text-[10.5px] leading-snug text-slate-400">
+            Mẫu lấy từ Thư viện báo cáo theo loại điểm đo của dự án.
+          </p>
         </div>
         <nav className="min-h-0 flex-1 overflow-y-auto px-3 pb-4">
           <p className="mb-1.5 px-2 text-[10px] font-bold tracking-wider text-slate-400 uppercase">
@@ -1632,7 +1733,7 @@ export function ClientReports({
             <div className="mb-4 flex flex-wrap items-center justify-between gap-2 border-b border-dashed border-slate-200 pb-3">
               <span className="inline-flex items-center gap-2 text-[11px] sm:text-xs font-bold tracking-wider text-slate-500 uppercase">
                 <span className="h-2 w-2 shrink-0 rounded-full bg-emerald-500" />
-                Xem trước mẫu báo cáo ({template})
+                Xem trước mẫu báo cáo ({templateLabel})
               </span>
               <div className="flex items-center gap-2">
                 <button
@@ -1673,7 +1774,7 @@ export function ClientReports({
                   </span>
                 </p>
                 <p className="mt-0.5">
-                  <span className="font-semibold text-slate-800">Mẫu báo cáo:</span> {template}
+                  <span className="font-semibold text-slate-800">Mẫu báo cáo:</span> {templateLabel}
                 </p>
                 <p className="mt-0.5">
                   <span className="font-semibold text-slate-800">Kỳ báo cáo:</span> {periodLabel}

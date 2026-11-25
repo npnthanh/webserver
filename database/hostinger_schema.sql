@@ -1059,4 +1059,18 @@ CREATE TABLE IF NOT EXISTS alert_library (
   PRIMARY KEY (id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- Thư viện mẫu báo cáo dùng chung theo loại điểm đo (Cấu hình → Thư viện báo cáo).
+-- payload = { headerFooter, enabledReports, fieldsByReport, titles, layout }.
+-- Ứng dụng tự tạo bảng này khi chạy và thêm sẵn 4 mẫu cho loại Điện nếu bảng trống (ensureReportTemplatesSchema).
+CREATE TABLE IF NOT EXISTS report_templates (
+  id VARCHAR(64) NOT NULL,
+  meter_type VARCHAR(100) NOT NULL,
+  name VARCHAR(200) NOT NULL,
+  payload JSON NOT NULL,
+  sort_order INT NOT NULL DEFAULT 0,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_report_templates_type (meter_type, sort_order)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 SET FOREIGN_KEY_CHECKS = 1;

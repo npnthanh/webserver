@@ -75,6 +75,12 @@ const navGroups: {
         permission: "manageDevices",
       },
       {
+        href: "/cau-hinh/thu-vien-bao-cao",
+        label: "Thư viện báo cáo",
+        icon: ReportConfigIcon,
+        permission: "manageDevices",
+      },
+      {
         href: "/cau-hinh/thong-bao",
         label: "Cấu hình thông báo",
         icon: AlertConfigIcon,

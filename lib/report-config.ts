@@ -194,6 +194,24 @@ export type ReportConfig = {
   /** Tiêu đề in trên báo cáo theo từng loại (bỏ trống = tiêu đề chuẩn). */
   titles: Partial<Record<ReportTypeId, string>>;
   layout: ReportLayoutDefaults;
+  /** Mẫu trong Thư viện báo cáo mà dự án đang dùng (rỗng = theo cấu hình riêng của dự án). */
+  templateId?: string;
+};
+
+/**
+ * Mẫu báo cáo trong Thư viện báo cáo (Cấu hình → Thư viện báo cáo), chia theo loại điểm đo.
+ * Trang Báo cáo của dự án chọn mẫu để áp header/footer, loại báo cáo, tiêu đề, trường dữ liệu và bố cục.
+ */
+export type ReportTemplate = {
+  id: string;
+  name: string;
+  /** Loại điểm đo (Điện, Áp suất, ...) */
+  meterType: string;
+  headerFooter: ReportHeaderFooterConfig;
+  enabledReports: ReportTypeId[];
+  fieldsByReport: Record<ReportTypeId, string[]>;
+  titles: Partial<Record<ReportTypeId, string>>;
+  layout: ReportLayoutDefaults;
 };
 
 export const DEFAULT_REPORT_LAYOUT: ReportLayoutDefaults = { chart: true, summary: true, detail: true, format: ".pdf" };
@@ -203,6 +221,23 @@ export const REPORT_TYPE_IDS = REPORTS.map((item) => item.id);
 export function reportTitle(config: Pick<ReportConfig, "titles">, id: ReportTypeId) {
   const custom = config.titles[id]?.trim();
   return custom || (REPORTS.find((item) => item.id === id)?.title ?? "");
+}
+
+/** Chuẩn hoá một mẫu báo cáo (dữ liệu thiếu / sai thì dùng mặc định). */
+export function normalizeReportTemplate(raw: unknown): ReportTemplate {
+  const source = raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+  // Dùng lại bộ đọc reportConfig cho header/footer, loại báo cáo, tiêu đề, trường dữ liệu và bố cục.
+  const config = readReportConfig({ reportConfig: source });
+  return {
+    id: typeof source.id === "string" ? source.id : "",
+    name: typeof source.name === "string" ? source.name : "",
+    meterType: typeof source.meterType === "string" ? source.meterType : "",
+    headerFooter: config.headerFooter,
+    enabledReports: config.enabledReports,
+    fieldsByReport: config.fieldsByReport,
+    titles: config.titles,
+    layout: config.layout,
+  };
 }
 
 /** Đọc cấu hình báo cáo từ project settings (thiếu / sai thì dùng mặc định). */
@@ -272,5 +307,6 @@ export function readReportConfig(settings: Record<string, unknown> | undefined |
     enabledReports: enabled.length ? enabled : ["overview"],
     titles,
     layout,
+    ...(typeof raw.templateId === "string" && raw.templateId ? { templateId: raw.templateId } : {}),
   };
 }
