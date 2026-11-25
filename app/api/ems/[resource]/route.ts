@@ -1127,6 +1127,16 @@ async function saveResource(resource: string, body: Row) {
     const [previousDevice] = await queryRows<Row>("SELECT serial_number AS sn FROM devices WHERE id = ?", [
       asString(body.id),
     ]);
+    if (previousDevice) {
+      // Đồng hồ đang gắn vào điểm đo của dự án: khoá chỉnh sửa (đổi serial / model sẽ làm lệch dữ liệu đã đo).
+      const linked = (await deviceProjectLinks()).get(asString(body.id)) ?? [];
+      if (linked.length > 0) {
+        const where = linked.map((item) => `${item.projectName} (${item.meterName})`).join(", ");
+        throw new UserFacingError(
+          `Đồng hồ đang được gắn tại: ${where}. Không thể chỉnh sửa khi đồng hồ đang gắn vào dự án — hãy gỡ đồng hồ khỏi điểm đo trước.`,
+        );
+      }
+    }
     await emsDb.execute(
       `INSERT INTO devices
         (id, name, serial_number, brand_model, brand, device_type, category, kind, status,

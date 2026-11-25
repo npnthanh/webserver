@@ -15,6 +15,7 @@ import {
   todaySyncLabel,
   upsertDevice,
   type DeviceExtraField,
+  type DeviceProjectLink,
   type DeviceRegister,
 } from "@/lib/devices";
 
@@ -66,6 +67,9 @@ export function AddCustomDeviceForm() {
   const [fieldToDelete, setFieldToDelete] = useState<ExtraField | null>(null);
   const [rowToDelete, setRowToDelete] = useState<RegisterRow | null>(null);
   const [rows, setRows] = useState<RegisterRow[]>(emptyRegisterRows());
+  /** Điểm đo đang gắn đồng hồ này: khác rỗng thì khoá chỉnh sửa (server cũng chặn). */
+  const [linkedPoints, setLinkedPoints] = useState<DeviceProjectLink[]>([]);
+  const locked = isEdit && linkedPoints.length > 0;
 
   const lastEdited = useMemo(() => "Vừa xong", []);
 
@@ -86,6 +90,7 @@ export function AddCustomDeviceForm() {
         return;
       }
       setIsEdit(true);
+      setLinkedPoints(existing.projects ?? []);
       const linkedModel =
         models.find((item) => item.id === existing.modelId) ??
         models.find(
@@ -156,6 +161,7 @@ export function AddCustomDeviceForm() {
   }
 
   async function handleSubmit() {
+    if (locked) return;
     const serialNumber = serial.trim();
     if (!selectedModel || !serialNumber) {
       setError("Vui lòng chọn loại đồng hồ, thương hiệu, tên model và nhập Serial.");
@@ -214,11 +220,34 @@ export function AddCustomDeviceForm() {
         </Link>
         <div>
           <h1 className="text-2xl font-bold tracking-tight text-slate-900">
-            {isEdit ? "Cập nhật loại đồng hồ" : "Thêm loại đồng hồ"}
+            {isEdit ? (locked ? "Thông tin đồng hồ" : "Cập nhật loại đồng hồ") : "Thêm loại đồng hồ"}
           </h1>
         </div>
       </div>
 
+      {locked ? (
+        <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+          <p className="font-semibold">Đồng hồ đang được gắn vào dự án nên không thể chỉnh sửa.</p>
+          <ul className="mt-1.5 space-y-0.5 text-xs">
+            {linkedPoints.map((item) => (
+              <li key={`${item.projectId}-${item.meterId}`}>
+                •{" "}
+                <Link href={`/du-an/${encodeURIComponent(item.projectId)}`} className="font-semibold underline-offset-2 hover:underline">
+                  {item.projectName}
+                </Link>{" "}
+                — điểm đo {item.meterName}
+              </li>
+            ))}
+          </ul>
+          <p className="mt-1.5 text-xs text-amber-800">
+            Muốn sửa thông tin, hãy gỡ đồng hồ khỏi điểm đo (Cấu hình dự án → Cụm điểm đo) trước. Thay đồng hồ khác
+            cho điểm đo thì dùng chức năng thay đồng hồ của dự án.
+          </p>
+        </div>
+      ) : null}
+
+      {/* Khoá toàn bộ ô nhập / nút bên trong khi đồng hồ đang gắn vào dự án. */}
+      <fieldset disabled={locked} className="m-0 flex min-w-0 flex-col gap-5 border-0 p-0 disabled:opacity-70">
       <section className="rounded-xl border border-slate-200 bg-white p-5 shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
         <div className="mb-5 flex items-center justify-between gap-3">
           <h2 className="flex items-center gap-2 text-sm font-bold tracking-wide text-slate-700 uppercase">
@@ -461,6 +490,7 @@ export function AddCustomDeviceForm() {
           </table>
         </div>
       </section>
+      </fieldset>
 
       <div className="sticky bottom-0 -mx-6 mt-1 flex items-center justify-between gap-3 border-t border-slate-200 bg-[#f3f5f8]/95 px-6 py-4 backdrop-blur lg:-mx-8 lg:px-8">
         <p className="flex items-center gap-2 text-xs text-slate-500">
@@ -475,12 +505,14 @@ export function AddCustomDeviceForm() {
           >
             Hủy bỏ
           </Link>
-          <button
-            type="submit"
-            className="h-10 rounded-xl bg-emerald-600 px-5 text-sm font-semibold text-white shadow-xs hover:bg-emerald-700 transition-colors"
-          >
-            {isEdit ? "Cập nhật loại đồng hồ" : "Lưu loại đồng hồ"}
-          </button>
+          {locked ? null : (
+            <button
+              type="submit"
+              className="h-10 rounded-xl bg-emerald-600 px-5 text-sm font-semibold text-white shadow-xs hover:bg-emerald-700 transition-colors"
+            >
+              {isEdit ? "Cập nhật loại đồng hồ" : "Lưu loại đồng hồ"}
+            </button>
+          )}
         </div>
       </div>
 
