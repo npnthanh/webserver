@@ -1228,6 +1228,26 @@ async function saveResource(resource: string, body: Row) {
       const [conflict] = await findSerialConflicts(projectId, serials);
       if (conflict) throw new UserFacingError(serialConflictMessage(conflict));
 
+      // Gỡ đồng hồ khỏi dự án (điểm đo đang có đồng hồ mà lần lưu này bỏ trống, hoặc bị xoá hẳn) chỉ Admin được làm.
+      const nextById = new Map(meters.map((meter) => [asString(meter.id), meter]));
+      const removedFrom = currentRows.filter((row) => {
+        if (!currentSerial.get(asString(row.id))) return false;
+        const next = nextById.get(asString(row.id));
+        return !next || !effectiveSerial(next.serialNumber, next.deviceId);
+      });
+      if (removedFrom.length > 0) {
+        const session = await getServerSession();
+        if (!isAdminRole(session)) {
+          const names = await queryRows<Row>(
+            `SELECT name FROM meter_points WHERE project_id = ? AND id IN (${removedFrom.map(() => "?").join(",")})`,
+            [projectId, ...removedFrom.map((row) => asString(row.id))],
+          ).catch(() => [] as Row[]);
+          throw new UserFacingError(
+            `Chỉ Admin mới được gỡ đồng hồ khỏi dự án (điểm đo: ${names.map((row) => asString(row.name)).join(", ") || removedFrom.length}).`,
+          );
+        }
+      }
+
       // Trong cùng dự án: một đồng hồ chỉ được gắn cho MỘT điểm đo (gắn 2 điểm đo thì dữ liệu bị tính 2 lần).
       // Chỉ chặn khi có điểm đo vừa gắn / vừa đổi sang đồng hồ đó, để dữ liệu cũ đã trùng không chặn lần lưu khác.
       const pointsBySerial = new Map<string, { name: string; changed: boolean }[]>();

@@ -28,7 +28,7 @@ import {
   type CustomerBranchRole,
 } from "@/lib/customer-accounts";
 import { loadDevices, type CatalogDevice } from "@/lib/devices";
-import { hasPermission } from "@/lib/permissions";
+import { hasPermission, isAdminRole } from "@/lib/permissions";
 import { hydrateProjects, loadProjects, resolveMeterTypes } from "@/lib/projects";
 import {
   DEFAULT_VOLTAGE_LEVEL,
@@ -615,6 +615,7 @@ export function ClientConfig() {
                 projectId={projectId}
                 devices={devices}
                 addMeterHref={addMeterHref}
+                canRemoveDevice={canEditConfig && isAdminRole(session)}
                 onMetersChange={(nextVisible) => {
                   if (!canEditConfig) return;
                   setMeters((current) => {
@@ -883,6 +884,7 @@ function MetersPanel({
   projectId,
   devices,
   addMeterHref,
+  canRemoveDevice,
   onMetersChange,
 }: {
   utility: Utility;
@@ -894,9 +896,23 @@ function MetersPanel({
   projectId: string;
   devices: CatalogDevice[];
   addMeterHref?: string;
+  /** Chỉ Admin: được gỡ đồng hồ khỏi điểm đo (server cũng chặn tài khoản khác). */
+  canRemoveDevice: boolean;
   onMetersChange: (rows: Meter[]) => void;
 }) {
   const [dragId, setDragId] = useState<string | null>(null);
+  /** Điểm đo đang chờ xác nhận gỡ đồng hồ. */
+  const [confirmRemoveId, setConfirmRemoveId] = useState<string | null>(null);
+  /** Điểm đo vừa gỡ đồng hồ trong phiên sửa này (chưa lưu). */
+  const [removedIds, setRemovedIds] = useState<string[]>([]);
+
+  function removeDevice(pointId: string) {
+    onMetersChange(
+      meters.map((m) => (m.id === pointId ? { ...m, deviceId: "", serialNumber: "" } : m)),
+    );
+    setRemovedIds((current) => (current.includes(pointId) ? current : [...current, pointId]));
+    setConfirmRemoveId(null);
+  }
   const [dropHint, setDropHint] = useState<{ id: string; position: DropPosition } | null>(null);
 
   const depthMap = useMemo(() => buildMeterDepthMap(meters), [meters]);
@@ -1118,6 +1134,8 @@ function MetersPanel({
                             value={item.deviceId ?? ""}
                             onChange={(e) => {
                               const nextDevId = e.target.value;
+                              // Dòng "-- Đổi / Gán đồng hồ --" chỉ là nhãn; gỡ đồng hồ dùng nút "Gỡ đồng hồ" (chỉ Admin).
+                              if (!nextDevId) return;
                               const dev = devices.find((d) => d.id === nextDevId);
                               onMetersChange(
                                 meters.map((m) =>
@@ -1145,7 +1163,47 @@ function MetersPanel({
                           </CustomSelect>
                           {/* Serial lấy theo đồng hồ đã chọn (khai báo ở Thư viện loại đồng hồ); không cho gõ tay
                               để serial trên điểm đo không lệch với đồng hồ được gắn. */}
+                          {canRemoveDevice && (item.deviceId || item.serialNumber) && confirmRemoveId !== item.id ? (
+                            <button
+                              type="button"
+                              onClick={() => setConfirmRemoveId(item.id)}
+                              className="h-7 rounded border border-rose-200 bg-white px-2 text-[11px] font-semibold text-rose-600 hover:bg-rose-50"
+                              title="Gỡ đồng hồ khỏi điểm đo này (chỉ Admin)"
+                            >
+                              Gỡ đồng hồ
+                            </button>
+                          ) : null}
                         </div>
+                        {confirmRemoveId === item.id ? (
+                          <div className="rounded border border-rose-200 bg-rose-50 px-2 py-1.5 text-[11px] text-rose-800">
+                            <p>
+                              Gỡ đồng hồ <span className="font-mono font-semibold">{assigned?.sn ?? item.serialNumber}</span> khỏi
+                              điểm đo {item.name}? Dữ liệu đã đo được giữ lại; từ lúc lưu, dữ liệu của đồng hồ này không còn
+                              tính cho điểm đo nữa.
+                            </p>
+                            <div className="mt-1.5 flex gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => removeDevice(item.id)}
+                                className="rounded bg-rose-600 px-2 py-0.5 text-[11px] font-semibold text-white hover:bg-rose-700"
+                              >
+                                Gỡ đồng hồ
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setConfirmRemoveId(null)}
+                                className="rounded border border-slate-200 bg-white px-2 py-0.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50"
+                              >
+                                Huỷ
+                              </button>
+                            </div>
+                          </div>
+                        ) : null}
+                        {removedIds.includes(item.id) && !item.deviceId && !item.serialNumber ? (
+                          <p className="text-[11px] font-medium text-amber-700">
+                            Đã gỡ đồng hồ — bấm &quot;Lưu cấu hình&quot; để áp dụng.
+                          </p>
+                        ) : null}
                         {duplicateOf(item).length ? (
                           <p className="rounded border border-rose-200 bg-rose-50 px-2 py-1 text-[11px] font-medium text-rose-700">
                             Trùng đồng hồ với điểm đo {duplicateOf(item).map((other) => other.name).join(", ")}. Mỗi đồng hồ chỉ
