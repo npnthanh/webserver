@@ -46,6 +46,9 @@ export function MeterCatalogConfig({ section }: { section: "types" | "models" })
 
   const [pendingDelete, setPendingDelete] = useState<PendingDelete | null>(null);
   const [deleteError, setDeleteError] = useState("");
+  /** Sắp xếp theo mã nhận dạng: none = thứ tự gốc, asc = tăng dần, desc = giảm dần. */
+  const [typeSort, setTypeSort] = useState<SortDir>("none");
+  const [modelSort, setModelSort] = useState<SortDir>("none");
 
   useEffect(() => {
     let active = true;
@@ -73,6 +76,15 @@ export function MeterCatalogConfig({ section }: { section: "types" | "models" })
     () => new Map(types.map((item) => [item.name, item.gatewayCode ?? null])),
     [types],
   );
+  const sortedTypes = useMemo(
+    () => sortByCodes(types, typeSort, (item) => [item.gatewayCode]),
+    [types, typeSort],
+  );
+  const sortedModels = useMemo(
+    () => sortByCodes(models, modelSort, (item) => [typeCodeByName.get(item.meterType) ?? null, item.modelCode]),
+    [models, modelSort, typeCodeByName],
+  );
+
   const brandOptions = useMemo(
     () => Array.from(new Set(models.map((item) => item.brand))).sort((a, b) => a.localeCompare(b, "vi")),
     [models],
@@ -201,8 +213,15 @@ export function MeterCatalogConfig({ section }: { section: "types" | "models" })
         </div>
         {typeError ? <ErrorText text={typeError} /> : null}
 
-        <Table headers={["Loại điểm đo", "Mã nhận dạng (MT)", "Mô tả", ""]}>
-          {types.map((item) => (
+        <Table
+          headers={[
+            "Loại điểm đo",
+            <SortHeader key="mt" label="Mã nhận dạng (MT)" dir={typeSort} onChange={setTypeSort} />,
+            "Mô tả",
+            "",
+          ]}
+        >
+          {sortedTypes.map((item) => (
             <tr key={item.name} className={editingType === item.name ? "bg-emerald-50/50" : "hover:bg-slate-50/80"}>
               <td className="px-4 py-3 font-semibold text-slate-900">{item.name}</td>
               <td className="px-4 py-3">
@@ -304,7 +323,16 @@ export function MeterCatalogConfig({ section }: { section: "types" | "models" })
         </div>
         {modelError ? <ErrorText text={modelError} /> : null}
 
-        <Table headers={["Loại điểm đo", "Thương hiệu / Nhà sản xuất", "Tên model", "Mã nhận dạng (MT · MM)", "Protocol Version", ""]}>
+        <Table
+          headers={[
+            "Loại điểm đo",
+            "Thương hiệu / Nhà sản xuất",
+            "Tên model",
+            <SortHeader key="mtmm" label="Mã nhận dạng (MT · MM)" dir={modelSort} onChange={setModelSort} />,
+            "Protocol Version",
+            "",
+          ]}
+        >
           {models.length === 0 ? (
             <tr>
               <td colSpan={6} className="px-4 py-10 text-center text-slate-400">
@@ -312,7 +340,7 @@ export function MeterCatalogConfig({ section }: { section: "types" | "models" })
               </td>
             </tr>
           ) : (
-            models.map((item) => (
+            sortedModels.map((item) => (
               <tr key={item.id} className={editingModel === item.id ? "bg-emerald-50/50" : "hover:bg-slate-50/80"}>
                 <td className="px-4 py-3 font-semibold text-slate-900">{item.meterType}</td>
                 <td className="px-4 py-3 text-slate-700">{item.brand}</td>
@@ -424,14 +452,14 @@ function FormButtons({
   );
 }
 
-function Table({ headers, children }: { headers: string[]; children: ReactNode }) {
+function Table({ headers, children }: { headers: ReactNode[]; children: ReactNode }) {
   return (
     <div className="overflow-x-auto rounded-xl border border-slate-100">
       <table className="w-full min-w-[720px] text-left text-xs">
         <thead>
           <tr className="border-b border-slate-100 bg-slate-50/60 text-[11px] font-semibold uppercase tracking-wider text-slate-400">
             {headers.map((header, index) => (
-              <th key={`${header}-${index}`} className={`px-4 py-3 ${index === headers.length - 1 ? "text-right" : ""}`}>
+              <th key={index} className={`px-4 py-3 ${index === headers.length - 1 ? "text-right" : ""}`}>
                 {header}
               </th>
             ))}
@@ -440,6 +468,61 @@ function Table({ headers, children }: { headers: string[]; children: ReactNode }
         <tbody className="divide-y divide-slate-100">{children}</tbody>
       </table>
     </div>
+  );
+}
+
+type SortDir = "none" | "asc" | "desc";
+
+/**
+ * Sắp xếp theo một hoặc nhiều mã (so lần lượt từng mã). Dòng chưa đặt mã luôn nằm cuối
+ * dù tăng hay giảm; "none" giữ nguyên thứ tự gốc.
+ */
+function sortByCodes<T>(items: T[], dir: SortDir, codesOf: (item: T) => (number | null | undefined)[]) {
+  if (dir === "none") return items;
+  const sign = dir === "asc" ? 1 : -1;
+  return items
+    .map((item, index) => ({ item, index, codes: codesOf(item) }))
+    .sort((a, b) => {
+      for (let i = 0; i < Math.max(a.codes.length, b.codes.length); i += 1) {
+        const x = a.codes[i];
+        const y = b.codes[i];
+        const xMissing = x == null;
+        const yMissing = y == null;
+        if (xMissing !== yMissing) return xMissing ? 1 : -1;
+        if (!xMissing && !yMissing && x !== y) return (x - y) * sign;
+      }
+      return a.index - b.index;
+    })
+    .map((entry) => entry.item);
+}
+
+/** Tiêu đề cột bấm được: lần lượt tăng dần → giảm dần → thứ tự gốc. */
+function SortHeader({ label, dir, onChange }: { label: string; dir: SortDir; onChange: (dir: SortDir) => void }) {
+  const next: SortDir = dir === "none" ? "asc" : dir === "asc" ? "desc" : "none";
+  const title =
+    dir === "asc" ? "Đang tăng dần · bấm để giảm dần" : dir === "desc" ? "Đang giảm dần · bấm để bỏ sắp xếp" : "Bấm để sắp xếp tăng dần";
+  return (
+    <button
+      type="button"
+      onClick={() => onChange(next)}
+      title={title}
+      aria-label={`${label}: ${title}`}
+      className={`inline-flex items-center gap-1 uppercase tracking-wider transition-colors ${
+        dir === "none" ? "hover:text-slate-700" : "text-emerald-700"
+      }`}
+    >
+      {label}
+      <SortIcon dir={dir} />
+    </button>
+  );
+}
+
+function SortIcon({ dir }: { dir: SortDir }) {
+  return (
+    <svg viewBox="0 0 12 16" className="h-3.5 w-2.5" aria-hidden>
+      <path d="M6 1.5 10 6H2z" fill="currentColor" opacity={dir === "asc" ? 1 : 0.3} />
+      <path d="M6 14.5 2 10h8z" fill="currentColor" opacity={dir === "desc" ? 1 : 0.3} />
+    </svg>
   );
 }
 
