@@ -1,5 +1,11 @@
 import net from "node:net";
 
+/**
+ * Cầu nối TCP thô → HTTP(S) cho gateway (module SIM / WiFi chỉ gửi chuỗi JSON qua TCP, không header).
+ * Nhận JSON, chuyển lên GATEWAY_INGEST_URL (VD https://webserver.kivon.tech/api/gateway), trả nguyên ACK JSON
+ * qua TCP rồi đóng kết nối. Gửi kiểu HTTP (có header) cũng được: ACK trả về kèm header HTTP.
+ * Hướng dẫn cài: deploy/gateway-bridge/HUONG-DAN.md
+ */
 const PORT = Number(process.env.GATEWAY_TCP_PORT || 3010);
 const HOST = process.env.GATEWAY_TCP_HOST || "0.0.0.0";
 const INGEST =
@@ -7,6 +13,8 @@ const INGEST =
 /** Firmware thường gửi JSON rồi đứng đợi ACK, không FIN. Không được chờ `end`. */
 const IDLE_MS = Number(process.env.GATEWAY_TCP_IDLE_MS || 400);
 const HARD_MS = Number(process.env.GATEWAY_TCP_TIMEOUT_MS || 8000);
+/** Chờ server web trả ACK tối đa (ms). Quá hạn thì không trả gì, gateway tự gửi lại theo cơ chế của firmware. */
+const INGEST_TIMEOUT_MS = Number(process.env.GATEWAY_INGEST_TIMEOUT_MS || 15000);
 
 function findJsonObject(text) {
   const start = text.indexOf("{");
@@ -92,11 +100,13 @@ function wrapHttpAck(jsonText) {
   );
 }
 
-async function ingest(raw) {
+async function ingest(raw, peerIp) {
+  // Giữ kết nối HTTPS tới server web giữa các gói (nhanh hơn, không phải bắt tay TLS mỗi lần).
   const res = await fetch(INGEST, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Connection: "close" },
+    headers: { "Content-Type": "application/json", "X-Forwarded-For": peerIp },
     body: raw,
+    signal: AbortSignal.timeout(INGEST_TIMEOUT_MS),
   });
   const text = await res.text();
   return { status: res.status, text };
@@ -132,7 +142,7 @@ const server = net.createServer((socket) => {
       `[gateway-tcp] ${new Date().toISOString()} ${peer} ${reason} ${Buffer.byteLength(raw)} bytes ${json.slice(0, 180)}`,
     );
     try {
-      const result = await ingest(json);
+      const result = await ingest(json, peer.split(":")[0] || "");
       console.log(`[gateway-tcp] ingest ${result.status} ${result.text.slice(0, 200)}`);
       const ack = result.text.endsWith("\n") ? result.text : `${result.text}\n`;
       reply(isHttp(raw) ? wrapHttpAck(ack) : ack);
@@ -171,6 +181,20 @@ const server = net.createServer((socket) => {
   });
 });
 
+server.on("error", (err) => {
+  // VD EADDRINUSE: cổng đã có chương trình khác dùng.
+  console.error(`[gateway-tcp] không mở được cổng ${HOST}:${PORT}: ${err.message}`);
+  process.exit(1);
+});
+
 server.listen(PORT, HOST, () => {
   console.log(`gateway tcp listening on ${HOST}:${PORT} -> ${INGEST}`);
 });
+
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => {
+    console.log(`[gateway-tcp] nhận ${signal}, dừng nhận kết nối mới`);
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 3000).unref();
+  });
+}

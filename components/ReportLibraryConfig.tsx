@@ -1,15 +1,19 @@
 "use client";
 
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { CustomSelect } from "@/components/ui/CustomSelect";
 import { hydrateMeterTypeDefs } from "@/lib/meter-types";
+import { declaredParamsForType, hydrateDevices, loadDevices, type CatalogDevice } from "@/lib/devices";
 import {
   DEFAULT_HEADER_FOOTER,
   DEFAULT_REPORT_LAYOUT,
   REPORTS,
-  REPORT_FIELDS,
-  defaultSelectedFieldsByReport,
+  defaultFieldsForMeterType,
+  isElectricMeterType,
+  reportFieldsFor,
+  reportsForMeterType,
+  type DeclaredReportParam,
   type ReportHeaderFooterConfig,
   type ReportTemplate,
   type ReportTypeId,
@@ -25,14 +29,14 @@ const HEADER_FIELDS: { key: Exclude<keyof ReportHeaderFooterConfig, "formCode">;
   { key: "footerNote", label: "Ghi chú chân trang", multiline: true },
 ];
 
-function blankTemplate(meterType: string): ReportTemplate {
+function blankTemplate(meterType: string, params: DeclaredReportParam[]): ReportTemplate {
   return {
     id: "",
     name: "",
     meterType,
     headerFooter: { ...DEFAULT_HEADER_FOOTER },
-    enabledReports: REPORTS.map((item) => item.id),
-    fieldsByReport: defaultSelectedFieldsByReport(),
+    enabledReports: reportsForMeterType(meterType),
+    fieldsByReport: defaultFieldsForMeterType(meterType, params),
     titles: {},
     layout: { ...DEFAULT_REPORT_LAYOUT },
   };
@@ -44,10 +48,19 @@ export function ReportLibraryConfig() {
   const [activeType, setActiveType] = useState("");
   const [templates, setTemplates] = useState<ReportTemplate[]>([]);
   const [draft, setDraft] = useState<ReportTemplate | null>(null);
+  const editorRef = useRef<HTMLElement>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [devices, setDevices] = useState<CatalogDevice[]>(loadDevices);
+
+  useEffect(() => {
+    const reloadDevices = () => void hydrateDevices().then(setDevices);
+    reloadDevices();
+    window.addEventListener("ems-devices-changed", reloadDevices);
+    return () => window.removeEventListener("ems-devices-changed", reloadDevices);
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -77,6 +90,13 @@ export function ReportLibraryConfig() {
     [templates, activeType],
   );
 
+  // Báo cáo / trường dữ liệu theo loại điểm đo của mẫu đang sửa (loại không phải điện: bỏ trường riêng của điện,
+  // thêm trường theo thông số khai báo ở Hàm nhận dữ liệu của đồng hồ cùng loại).
+  const draftType = draft?.meterType ?? activeType;
+  const declaredParams = useMemo(() => declaredParamsForType(devices, draftType), [devices, draftType]);
+  const availableReports = useMemo(() => reportsForMeterType(draftType), [draftType]);
+  const fieldsFor = (id: ReportTypeId) => reportFieldsFor(id, draftType, declaredParams);
+
   function flash(kind: "ok" | "error", text: string) {
     setMessage({ kind, text });
     window.setTimeout(() => setMessage(null), 3500);
@@ -93,29 +113,39 @@ export function ReportLibraryConfig() {
 
   function toggleReport(id: ReportTypeId) {
     if (!draft) return;
-    const enabled = draft.enabledReports.includes(id)
-      ? draft.enabledReports.filter((item) => item !== id)
-      : REPORTS.map((item) => item.id).filter((item) => item === id || draft.enabledReports.includes(item));
+    const current = draft.enabledReports.filter((item) => availableReports.includes(item));
+    const enabled = current.includes(id)
+      ? current.filter((item) => item !== id)
+      : availableReports.filter((item) => item === id || current.includes(item));
     if (enabled.length === 0) return flash("error", "Mẫu phải có ít nhất một loại báo cáo.");
     patch({ enabledReports: enabled });
   }
 
   function toggleField(id: ReportTypeId, key: string) {
     if (!draft) return;
-    const current = draft.fieldsByReport[id] ?? [];
+    const keys = fieldsFor(id).map((f) => f.key);
+    const current = (draft.fieldsByReport[id] ?? []).filter((item) => keys.includes(item));
     if (current.includes(key) && current.length <= 1) return flash("error", "Mỗi báo cáo phải giữ ít nhất một trường dữ liệu.");
     const next = current.includes(key)
       ? current.filter((item) => item !== key)
-      : REPORT_FIELDS[id].map((f) => f.key).filter((item) => item === key || current.includes(item));
+      : keys.filter((item) => item === key || current.includes(item));
     patch({ fieldsByReport: { ...draft.fieldsByReport, [id]: next } });
   }
 
   async function save() {
     if (!draft) return;
     if (!draft.name.trim()) return flash("error", "Vui lòng nhập tên mẫu báo cáo.");
+    const enabledReports = draft.enabledReports.filter((id) => availableReports.includes(id));
+    if (enabledReports.length === 0) return flash("error", "Mẫu phải có ít nhất một loại báo cáo.");
+    const fieldsByReport = { ...draft.fieldsByReport };
+    for (const id of availableReports) {
+      const keys = fieldsFor(id).map((f) => f.key);
+      const kept = (draft.fieldsByReport[id] ?? []).filter((key) => keys.includes(key));
+      fieldsByReport[id] = kept.length ? kept : defaultFieldsForMeterType(draftType, declaredParams)[id];
+    }
     setSaving(true);
     try {
-      const list = await saveReportTemplate(draft);
+      const list = await saveReportTemplate({ ...draft, enabledReports, fieldsByReport });
       setTemplates(list);
       const saved =
         list.find((item) => (draft.id ? item.id === draft.id : item.meterType === draft.meterType && item.name === draft.name.trim())) ??
@@ -142,15 +172,16 @@ export function ReportLibraryConfig() {
     }
   }
 
+  /** Mở mẫu để sửa; dưới lg khung sửa nằm dưới danh sách mẫu nên cuộn xuống cho thấy ngay. */
+  function openTemplate(template: Parameters<typeof setDraft>[0]) {
+    setDraft(template);
+    if (window.matchMedia("(min-width: 1024px)").matches) return;
+    window.setTimeout(() => editorRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 0);
+  }
+
   return (
-    <div className="mx-auto max-w-[1400px] space-y-5 p-6 lg:p-8">
-      <div>
-        <h1 className="text-2xl font-bold tracking-tight text-slate-900">Thư viện báo cáo</h1>
-        <p className="mt-1 text-sm text-slate-500">
-          Biểu mẫu báo cáo dùng chung theo từng loại điểm đo. Ở trang Báo cáo của dự án, chọn mẫu tại ô{" "}
-          <strong>Mẫu báo cáo áp dụng</strong>.
-        </p>
-      </div>
+    <div className="mx-auto max-w-[1400px] space-y-5 p-4 sm:p-6 lg:p-8">
+      <h1 className="text-xl font-bold tracking-tight text-slate-900 sm:text-2xl">Thư viện báo cáo</h1>
 
       {message ? (
         <p
@@ -205,7 +236,7 @@ export function ReportLibraryConfig() {
                   <button
                     key={item.id}
                     type="button"
-                    onClick={() => setDraft(item)}
+                    onClick={() => openTemplate(item)}
                     className={`block w-full rounded-lg border px-3 py-2 text-left text-sm transition-colors ${
                       draft?.id === item.id
                         ? "border-emerald-500 bg-emerald-50 font-semibold text-emerald-800"
@@ -221,7 +252,7 @@ export function ReportLibraryConfig() {
               )}
               <button
                 type="button"
-                onClick={() => setDraft(blankTemplate(activeType))}
+                onClick={() => openTemplate(blankTemplate(activeType, declaredParamsForType(devices, activeType)))}
                 disabled={!activeType}
                 className="mt-1 flex w-full items-center justify-center gap-1.5 rounded-lg border border-dashed border-slate-300 py-2.5 text-sm font-semibold text-slate-600 hover:border-emerald-500 hover:text-emerald-700 disabled:opacity-50"
               >
@@ -230,9 +261,9 @@ export function ReportLibraryConfig() {
             </aside>
 
             {draft ? (
-              <section className="space-y-5 rounded-2xl border border-slate-200 bg-white p-5">
+              <section ref={editorRef} className="scroll-mt-20 space-y-5 rounded-2xl border border-slate-200 bg-white p-4 sm:p-5">
                 <div className="flex flex-wrap items-end justify-between gap-3">
-                  <label className="block min-w-[260px] flex-1">
+                  <label className="block w-full min-w-0 flex-1 sm:w-auto sm:min-w-[260px]">
                     <span className="mb-1.5 block text-[11px] font-semibold tracking-wide text-slate-500">TÊN MẪU BÁO CÁO</span>
                     <input
                       className="input"
@@ -241,7 +272,7 @@ export function ReportLibraryConfig() {
                       placeholder="VD: Báo cáo vận hành tháng"
                     />
                   </label>
-                  <div className="flex flex-wrap gap-2">
+                  <div className="flex w-full gap-2 sm:w-auto [&>*]:flex-1 sm:[&>*]:flex-none">
                     {draft.id ? (
                       <>
                         <button
@@ -278,7 +309,8 @@ export function ReportLibraryConfig() {
                         <span className="mb-1.5 block text-[11px] font-semibold tracking-wide text-slate-500">{field.label}</span>
                         {field.multiline ? (
                           <textarea
-                            className="input h-20 py-2"
+                            rows={3}
+                            className="block min-h-[96px] w-full resize-y rounded-lg border border-slate-200 bg-white px-3 py-2 text-base leading-relaxed text-slate-800 outline-none placeholder:text-slate-400 focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/15 sm:text-sm"
                             value={draft.headerFooter[field.key]}
                             onChange={(e) => patch({ headerFooter: { ...draft.headerFooter, [field.key]: e.target.value } })}
                           />
@@ -296,12 +328,21 @@ export function ReportLibraryConfig() {
 
                 <Block title="Loại báo cáo, tiêu đề và trường dữ liệu">
                   <div className="space-y-3">
-                    {REPORTS.map((report) => {
+                    {isElectricMeterType(draftType) ? null : (
+                      <p className="rounded-lg border border-amber-200 bg-amber-50/70 px-3 py-2 text-xs leading-relaxed text-amber-900">
+                        Loại {draftType}: chỉ có các báo cáo và trường dữ liệu dùng được cho loại này (không có khung giờ
+                        giá điện, chi phí 3 giá, khí nhà kính, điện áp, dòng điện).
+                        {declaredParams.length === 0
+                          ? ` Chưa có thông số đo nào: khai báo ở Thư viện loại đồng hồ → đồng hồ loại ${draftType} → Hàm nhận dữ liệu từ gateway.`
+                          : ""}
+                      </p>
+                    )}
+                    {REPORTS.filter((report) => availableReports.includes(report.id)).map((report) => {
                       const enabled = draft.enabledReports.includes(report.id);
                       const selected = draft.fieldsByReport[report.id] ?? [];
                       return (
                         <div key={report.id} className={`rounded-xl border p-3 ${enabled ? "border-emerald-200 bg-emerald-50/30" : "border-slate-200"}`}>
-                          <label className="flex cursor-pointer items-center gap-2 text-sm font-semibold text-slate-800">
+                          <label className="flex cursor-pointer flex-wrap items-center gap-x-2 gap-y-0.5 text-sm font-semibold text-slate-800">
                             <input
                               type="checkbox"
                               checked={enabled}
@@ -312,7 +353,7 @@ export function ReportLibraryConfig() {
                             <span className="font-mono text-[11px] font-normal text-slate-400">{report.formCode}</span>
                           </label>
                           {enabled ? (
-                            <div className="mt-2 space-y-2 pl-6">
+                            <div className="mt-2 space-y-2 sm:pl-6">
                               <input
                                 className="input"
                                 value={draft.titles[report.id] ?? ""}
@@ -320,7 +361,7 @@ export function ReportLibraryConfig() {
                                 placeholder={`Tiêu đề in trên báo cáo (bỏ trống = ${report.title})`}
                               />
                               <div className="flex flex-wrap gap-1.5">
-                                {REPORT_FIELDS[report.id].map((field) => {
+                                {fieldsFor(report.id).map((field) => {
                                   const on = selected.includes(field.key);
                                   return (
                                     <button

@@ -117,8 +117,9 @@ export function NotificationBell() {
         ) : null}
       </button>
 
+      {/* Điện thoại: trải ngang màn hình ngay dưới header (nút chuông không nằm sát mép phải nên canh theo nút sẽ tràn ra ngoài). Từ sm trở lên: thả xuống dưới nút chuông như cũ. */}
       {open ? (
-        <div className="absolute right-0 top-full z-50 mt-2 w-[min(380px,calc(100vw-24px))] overflow-hidden rounded-xl border border-slate-200 bg-white shadow-xl">
+        <div className="fixed inset-x-3 top-[68px] z-50 overflow-hidden rounded-xl border border-slate-200 bg-white shadow-xl sm:absolute sm:inset-x-auto sm:top-full sm:right-0 sm:mt-2 sm:w-[380px]">
           <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3">
             <p className="text-sm font-semibold text-slate-800">Thông báo dự án</p>
             <span className="text-[11px] text-slate-400">{items.length ? `${items.length} gần nhất` : ""}</span>
@@ -126,7 +127,7 @@ export function NotificationBell() {
           {error ? (
             <p className="border-b border-rose-100 bg-rose-50 px-4 py-2 text-xs font-medium text-rose-700">{error}</p>
           ) : null}
-          <ul className="max-h-[420px] divide-y divide-slate-100 overflow-y-auto">
+          <ul className="max-h-[min(420px,calc(100dvh-160px))] divide-y divide-slate-100 overflow-y-auto">
             {items.length === 0 ? (
               <li className="px-4 py-10 text-center text-xs text-slate-400">Chưa có thông báo nào.</li>
             ) : (

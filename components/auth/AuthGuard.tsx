@@ -53,7 +53,7 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
 
 function Forbidden({ role }: { role: string }) {
   return (
-    <div className="flex h-full min-h-screen w-full items-center justify-center bg-slate-50 px-6">
+    <div className="flex h-dvh w-full items-center justify-center bg-slate-50 px-6">
       <div className="max-w-md rounded-2xl border border-slate-200 bg-white p-8 text-center shadow-sm">
         <p className="text-xs font-semibold tracking-[0.14em] text-amber-600 uppercase">Phân quyền</p>
         <h1 className="mt-2 text-xl font-bold text-slate-900">Không có quyền truy cập</h1>
@@ -74,7 +74,7 @@ function Forbidden({ role }: { role: string }) {
 
 function AuthSplash({ message }: { message: string }) {
   return (
-    <div className="flex h-full min-h-screen w-full items-center justify-center bg-[#0b1120]">
+    <div className="flex h-dvh w-full items-center justify-center bg-[#0b1120]">
       <div className="text-center">
         <div className="mx-auto h-10 w-10 animate-spin rounded-full border-2 border-slate-800 border-t-emerald-400 shadow-[0_0_15px_rgba(16,185,129,0.3)]" />
         <p className="mt-4 text-xs font-medium tracking-wide text-slate-400">{message}</p>

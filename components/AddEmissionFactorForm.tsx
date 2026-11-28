@@ -195,7 +195,7 @@ export function AddEmissionFactorForm() {
           </div>
 
           <div className="overflow-hidden rounded-xl border border-slate-200 bg-white">
-            <div className="grid grid-cols-[1.3fr_1fr_1fr_44px] sm:grid-cols-[1.3fr_1fr_1fr_48px] items-center border-b border-slate-200 bg-[#f8fafc] px-4 py-2.5 text-[11px] font-semibold tracking-wide text-slate-500 uppercase">
+            <div className="hidden grid-cols-[1.3fr_1fr_1fr_48px] items-center gap-3 border-b border-slate-200 bg-[#f8fafc] px-4 py-2.5 text-[11px] font-semibold tracking-wide text-slate-500 uppercase sm:grid">
               <span>THÀNH PHẦN (KHÍ)</span>
               <span>GIÁ TRỊ</span>
               <span>ĐƠN VỊ</span>
@@ -217,11 +217,15 @@ export function AddEmissionFactorForm() {
               </div>
             ) : (
               rows.map((row) => (
+                // Điện thoại: thẻ 2 hàng (tên khí + nút xoá / giá trị + đơn vị). Từ sm: một hàng 4 cột như bảng.
                 <div
                   key={row.id}
-                  className="grid grid-cols-[1.3fr_1fr_1fr_44px] sm:grid-cols-[1.3fr_1fr_1fr_48px] items-center gap-2 sm:gap-3 border-b border-slate-100 px-4 py-3 last:border-0 hover:bg-slate-50/50 transition-colors"
+                  className="grid grid-cols-[1fr_auto] items-center gap-2 border-b border-slate-100 px-3 py-3 last:border-0 transition-colors hover:bg-slate-50/50 sm:grid-cols-[1.3fr_1fr_1fr_48px] sm:gap-3 sm:px-4"
                 >
                   <div>
+                    <span className="mb-1 block text-[10px] font-semibold tracking-wide text-slate-400 uppercase sm:hidden">
+                      Thành phần (khí)
+                    </span>
                     <input
                       value={row.label}
                       onChange={(e) => updateRow(row.id, { label: e.target.value })}
@@ -231,33 +235,43 @@ export function AddEmissionFactorForm() {
                       required
                     />
                   </div>
-                  <div>
-                    <input
-                      value={row.value}
-                      onChange={(e) => updateRow(row.id, { value: formatLiveNumberInput(e.target.value) })}
-                      onBlur={(e) => updateRow(row.id, { value: formatAppNumberInput(e.target.value) })}
-                      inputMode="decimal"
-                      placeholder="0"
-                      className="input"
-                    />
-                  </div>
-                  <div>
-                    <input
-                      value={row.unit}
-                      onChange={(e) => updateRow(row.id, { unit: e.target.value })}
-                      placeholder="kg/TJ"
-                      className="input"
-                    />
-                  </div>
-                  <div className="flex justify-center">
+                  <div className="flex justify-center self-end sm:order-last sm:self-auto">
                     <button
                       type="button"
                       onClick={() => setRowToDelete(row)}
-                      className="flex h-9 w-9 items-center justify-center rounded-lg text-slate-400 hover:text-red-600 hover:bg-red-50 transition-colors"
+                      className="flex h-10 w-10 items-center justify-center rounded-lg text-slate-400 hover:text-red-600 hover:bg-red-50 transition-colors sm:h-9 sm:w-9"
                       title="Xóa thành phần này"
+                      aria-label="Xóa thành phần này"
                     >
                       <TrashIcon className="h-4 w-4" />
                     </button>
+                  </div>
+                  {/* sm:contents: từ sm hai ô này nằm thẳng trong lưới 4 cột của hàng */}
+                  <div className="col-span-2 grid grid-cols-2 gap-2 sm:contents">
+                    <div>
+                      <span className="mb-1 block text-[10px] font-semibold tracking-wide text-slate-400 uppercase sm:hidden">
+                        Giá trị
+                      </span>
+                      <input
+                        value={row.value}
+                        onChange={(e) => updateRow(row.id, { value: formatLiveNumberInput(e.target.value) })}
+                        onBlur={(e) => updateRow(row.id, { value: formatAppNumberInput(e.target.value) })}
+                        inputMode="decimal"
+                        placeholder="0"
+                        className="input"
+                      />
+                    </div>
+                    <div>
+                      <span className="mb-1 block text-[10px] font-semibold tracking-wide text-slate-400 uppercase sm:hidden">
+                        Đơn vị
+                      </span>
+                      <input
+                        value={row.unit}
+                        onChange={(e) => updateRow(row.id, { unit: e.target.value })}
+                        placeholder="kg/TJ"
+                        className="input"
+                      />
+                    </div>
                   </div>
                 </div>
               ))
@@ -266,10 +280,10 @@ export function AddEmissionFactorForm() {
 
         </div>
 
-        <div className="mt-8 flex flex-wrap justify-end gap-3">
+        <div className="mt-8 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
           <Link
             href="/he-so-phat-thai"
-            className="inline-flex h-10 items-center rounded-xl border border-slate-200 bg-white px-4 text-sm font-semibold text-slate-600 hover:bg-slate-50 transition-colors shadow-xs"
+            className="inline-flex h-10 items-center justify-center rounded-xl border border-slate-200 bg-white px-4 text-sm font-semibold text-slate-600 hover:bg-slate-50 transition-colors shadow-xs"
           >
             Quay lại thư viện
           </Link>

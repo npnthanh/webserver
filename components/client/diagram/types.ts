@@ -18,10 +18,15 @@ export type MeterMetric = {
   value: string;
 };
 
+/** Thông số khai báo ở "Hàm nhận dữ liệu từ gateway" của đồng hồ (key = TÊN, label = MÔ TẢ). */
+export type DiagramParamOption = { key: string; label: string; unit?: string };
+
 export type DiagramNodeDisplay = {
   title?: string;
   icon?: MeterIcon;
   metricKeys?: string[];
+  /** Chỉ dùng lúc chạy (không lưu): đồng hồ không phải điện chỉ hiện / cho chọn các thông số này. */
+  paramOptions?: DiagramParamOption[];
 };
 
 export type MeterNodeData = {
@@ -33,6 +38,7 @@ export type MeterNodeData = {
   iconImage?: string;
   metrics: MeterMetric[];
   metricKeys: string[];
+  paramOptions?: DiagramParamOption[];
   sampleAt?: string;
   /** Dây nhánh tô vàng khi có bản tin gần đây (cùng điều kiện với đường nối từ thanh cái). */
   lineLive?: boolean;

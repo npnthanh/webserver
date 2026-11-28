@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { CustomSelect } from "@/components/ui/CustomSelect";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
-import { loadAlertLibrary, saveAlertLibrary } from "@/lib/alert-library";
+import { loadAlertTemplates, type AlertTemplate } from "@/lib/alert-library";
 import { DEFAULT_USER_ALERT_RULES } from "@/lib/alert-config";
 import { alarmName, alarmUnitHint } from "@/lib/gateway-protocol";
 import {
@@ -14,6 +14,7 @@ import {
   type MeterParameter,
 } from "@/lib/meter-parameters";
 import { hydrateProjectSettings, loadProjectSettings, saveProjectSettings } from "@/lib/project-settings";
+import { hydrateDevices, loadDevices, type CatalogDevice } from "@/lib/devices";
 import type { MeterType } from "@/lib/projects";
 
 type CategoryId =
@@ -133,6 +134,35 @@ function parametersForCategory(categoryId: string): MeterParameter[] {
   return parametersForChart(chartId);
 }
 
+function isElectricUtility(utility: string) {
+  const value = utility.toLowerCase();
+  return value.includes("điện") || value.includes("dien");
+}
+
+/**
+ * Tham số của loại điểm đo không phải điện = các dòng "Hàm nhận dữ liệu từ gateway" đã khai báo cho đồng hồ
+ * cùng loại (Thư viện loại đồng hồ). Không dùng bộ 97 tham số của đồng hồ điện.
+ */
+function declaredParametersForUtility(utility: string, devices: CatalogDevice[]): MeterParameter[] {
+  const list: MeterParameter[] = [];
+  for (const device of devices) {
+    if (device.type !== utility) continue;
+    for (const row of device.registers ?? []) {
+      const key = row.address?.trim();
+      if (!key || list.some((item) => item.key === key)) continue;
+      list.push({
+        id: 10_000 + list.length,
+        group: "Hàm nhận dữ liệu",
+        chart: "energy",
+        name: row.name?.trim() || key,
+        unit: row.unit?.trim() || "",
+        key,
+      });
+    }
+  }
+  return list;
+}
+
 function uniqueUtilities(values: string[]): MeterType[] {
   return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)));
 }
@@ -163,6 +193,15 @@ function categoriesForUtility(utility: string): Category[] {
   return categories.length > 0
     ? categories
     : [{ id: `utility-${utility.toLowerCase().replace(/\s+/g, "-")}`, label: utility, icon: utilityIcon(utility) }];
+}
+
+/** Id các nhóm cảnh báo của một loại điểm đo (nhóm mặc định + nhóm đã lưu thêm). */
+function utilityCategoryIds(utility: string, categoriesByUtility: Record<string, Category[]>) {
+  const ids = categoriesForUtility(utility).map((category) => category.id as string);
+  for (const category of categoriesByUtility[utility] ?? []) {
+    if (!ids.includes(category.id)) ids.push(category.id);
+  }
+  return ids;
 }
 
 function buildCategoryMap(utilities: string[]) {
@@ -207,10 +246,9 @@ function normalizeAlarm(alarm: Alarm, categoryId: string, index: number): Alarm 
     return null;
   }
   const catParams = parametersForCategory(categoryId);
-  const matchedParam =
-    (alarm.parameterKey ? METER_PARAMETERS.find((p) => p.key === alarm.parameterKey) : undefined) ??
-    catParams[index] ??
-    catParams[0];
+  const matchedParam = alarm.parameterKey
+    ? METER_PARAMETERS.find((p) => p.key === alarm.parameterKey)
+    : catParams[index] ?? catParams[0];
 
   const parameterKey = alarm.parameterKey || matchedParam?.key || "";
   const isLegacyZeroVolt = alarm.unit === "V" && alarm.threshold === "0" && categoryId !== "ui";
@@ -254,9 +292,14 @@ export function AlertConfig({
   projectId = "",
   initialUtilities,
   mode = "project",
+  libraryAlarms,
+  onLibraryAlarmsChange,
 }: {
   projectId?: string;
   initialUtilities: MeterType[];
+  /** Chế độ thư viện: ngưỡng của mẫu đang sửa (trang Thư viện cảnh báo giữ danh sách mẫu). */
+  libraryAlarms?: Record<string, unknown[]>;
+  onLibraryAlarmsChange?: (alarmsByCategory: Record<string, unknown[]>) => void;
   /**
    * "project": thư viện cảnh báo của một dự án (lưu project_settings, đồng bộ ngưỡng xuống gateway).
    * "library": thư viện cảnh báo dùng chung theo loại điểm đo (bảng alert_library) — chỉ là mẫu,
@@ -278,7 +321,32 @@ export function AlertConfig({
   const [syncNotice, setSyncNotice] = useState("");
   const [settingsReady, setSettingsReady] = useState(false);
   const [showAllLiveParams, setShowAllLiveParams] = useState(false);
-  const [confirmApplyLibrary, setConfirmApplyLibrary] = useState(false);
+  /** Mẫu thư viện chờ xác nhận áp dụng (trang cảnh báo của dự án). */
+  const [pendingTemplate, setPendingTemplate] = useState<AlertTemplate | null>(null);
+  const [templates, setTemplates] = useState<AlertTemplate[]>([]);
+  /** Mẫu đang áp dụng cho từng loại điểm đo của dự án. */
+  const [templateByUtility, setTemplateByUtility] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    if (isLibrary) return;
+    let active = true;
+    void loadAlertTemplates()
+      .then((list) => {
+        if (active) setTemplates(list);
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, [isLibrary]);
+  const [devices, setDevices] = useState<CatalogDevice[]>(loadDevices);
+
+  useEffect(() => {
+    const reloadDevices = () => void hydrateDevices().then(setDevices);
+    reloadDevices();
+    window.addEventListener("ems-devices-changed", reloadDevices);
+    return () => window.removeEventListener("ems-devices-changed", reloadDevices);
+  }, []);
 
   async function loadGatewayLive() {
     const from = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
@@ -308,7 +376,7 @@ export function AlertConfig({
     let active = true;
     setSettingsReady(false);
     const loadSaved: Promise<unknown> = isLibrary
-      ? loadAlertLibrary()
+      ? Promise.resolve({ alarmsByCategory: libraryAlarms ?? {} })
       : hydrateProjectSettings(projectId).then((payload) => payload.alertConfig);
     void loadSaved
       .then((rawSaved) => {
@@ -320,6 +388,7 @@ export function AlertConfig({
               activeUtility?: string;
               activeId?: string;
               alarmsByCategory?: Record<string, Alarm[]>;
+              templateByUtility?: Record<string, string>;
             }
           | undefined;
         const restoreCategory = (item: { id: string; label: string }) => {
@@ -342,6 +411,7 @@ export function AlertConfig({
             : firstUtility;
         setCategoriesByUtility(defaults);
         setActiveUtility(restoredUtility);
+        setTemplateByUtility(saved?.templateByUtility && typeof saved.templateByUtility === "object" ? saved.templateByUtility : {});
         if (saved?.alarmsByCategory) {
           const next: Record<string, Alarm[]> = buildDefaultAlarmsByCategory();
           for (const [categoryId, rows] of Object.entries(saved.alarmsByCategory)) {
@@ -361,6 +431,8 @@ export function AlertConfig({
     return () => {
       active = false;
     };
+    // libraryAlarms chỉ đọc khi mở mẫu: trang Thư viện tạo lại component (key) khi đổi mẫu.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId, firstUtility, utilities, isLibrary]);
 
   useEffect(() => {
@@ -372,10 +444,10 @@ export function AlertConfig({
       ]),
     );
     if (isLibrary) {
-      // Thư viện chung: gom các thay đổi liên tiếp (gõ ngưỡng) rồi mới lưu.
-      const timer = window.setTimeout(() => {
-        void saveAlertLibrary({ categoriesByUtility: categoriesPayload, alarmsByCategory }).catch(() => undefined);
-      }, 600);
+      // Thư viện: báo ngưỡng của các nhóm thuộc loại điểm đo cho trang Thư viện (trang đó lưu mẫu).
+      const ids = new Set(utilityCategoryIds(activeUtility, categoriesByUtility));
+      const picked = Object.fromEntries(Object.entries(alarmsByCategory).filter(([id]) => ids.has(id)));
+      const timer = window.setTimeout(() => onLibraryAlarmsChange?.(picked), 300);
       return () => window.clearTimeout(timer);
     }
     void saveProjectSettings(projectId, {
@@ -384,9 +456,12 @@ export function AlertConfig({
         categoriesByUtility: categoriesPayload,
         activeUtility,
         alarmsByCategory,
+        templateByUtility,
       },
     });
-  }, [activeUtility, alarmsByCategory, categoriesByUtility, projectId, settingsReady, isLibrary]);
+    // onLibraryAlarmsChange: hàm của trang cha, không cần chạy lại khi đổi tham chiếu.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeUtility, alarmsByCategory, categoriesByUtility, projectId, settingsReady, isLibrary, templateByUtility]);
 
   // Không chia nhóm trên giao diện: gộp mọi nhóm của loại năng lượng (kể cả nhóm đã ẩn trước đây).
   // Dữ liệu vẫn lưu theo nhóm (suy ra từ tham số) để bộ đánh giá cảnh báo phía server giữ nguyên.
@@ -397,7 +472,9 @@ export function AlertConfig({
     }
     return list;
   }, [activeUtility, categoriesByUtility]);
+  const electric = isElectricUtility(activeUtility);
   const utilityParameters = useMemo(() => {
+    if (!electric) return declaredParametersForUtility(activeUtility, devices);
     const seen = new Set<string>();
     const list: MeterParameter[] = [];
     for (const category of utilityCategories) {
@@ -408,7 +485,10 @@ export function AlertConfig({
       }
     }
     return list;
-  }, [utilityCategories]);
+  }, [utilityCategories, electric, activeUtility, devices]);
+  /** Tra tham số: ưu tiên tham số của loại điểm đo đang chọn, sau đó bộ tham số điện chuẩn. */
+  const findParameter = (key: string | undefined) =>
+    key ? utilityParameters.find((p) => p.key === key) ?? METER_PARAMETERS.find((p) => p.key === key) : undefined;
   const alarmEntries = useMemo(
     () =>
       utilityCategories.flatMap((category) =>
@@ -554,17 +634,16 @@ export function AlertConfig({
   }
 
   /** Chép ngưỡng của thư viện chung (loại điểm đo đang chọn) vào thư viện cảnh báo của dự án. */
-  async function applyLibraryToProject() {
-    setConfirmApplyLibrary(false);
+  async function applyLibraryToProject(template: AlertTemplate) {
+    setPendingTemplate(null);
     try {
-      const library = await loadAlertLibrary();
-      const libraryAlarms = (library.alarmsByCategory ?? {}) as Record<string, unknown>;
+      const libraryAlarms = (template.alarmsByCategory ?? {}) as Record<string, unknown>;
       const categoryIds = utilityCategories.map((category) => category.id);
       const hasRows = categoryIds.some(
         (id) => Array.isArray(libraryAlarms[id]) && (libraryAlarms[id] as unknown[]).length > 0,
       );
       if (!hasRows) {
-        setSyncNotice(`Thư viện cảnh báo chưa có ngưỡng nào cho loại ${activeUtility}.`);
+        setSyncNotice(`Mẫu "${template.name}" chưa có ngưỡng nào.`);
         setTimeout(() => setSyncNotice(""), 4500);
         return;
       }
@@ -576,7 +655,8 @@ export function AlertConfig({
           .filter((row): row is Alarm => Boolean(row));
       }
       setAlarmsByCategory((current) => ({ ...current, ...nextRows }));
-      setSyncNotice(`Đã áp dụng thư viện cảnh báo cho loại ${activeUtility}.`);
+      setTemplateByUtility((current) => ({ ...current, [activeUtility]: template.id }));
+      setSyncNotice(`Đã áp dụng mẫu "${template.name}" cho loại ${activeUtility}.`);
       setTimeout(() => setSyncNotice(""), 4500);
       // Đồng bộ ngưỡng Min/Max mới xuống bộ kiểm tra tức thời của gateway (như khi sửa tay từng ngưỡng).
       await Promise.all(Object.values(nextRows).flat().map((alarm) => syncThresholdToGateway(alarm, true)));
@@ -598,9 +678,10 @@ export function AlertConfig({
 
   return (
     <div className="space-y-5">
+      {isLibrary ? null : (
       <section className="rounded-2xl border border-slate-200 bg-slate-50/70 p-3">
         <div className="mb-2 px-1 text-[10px] font-bold uppercase tracking-[0.16em] text-slate-400">
-          {isLibrary ? "Loại điểm đo" : "Loại năng lượng của dự án"}
+          Loại năng lượng của dự án
         </div>
         <div className="flex flex-wrap gap-2" role="tablist" aria-label="Loại năng lượng">
           {utilities.map((utility) => {
@@ -632,21 +713,15 @@ export function AlertConfig({
           })}
         </div>
       </section>
+      )}
 
       <>
-          <section className="rounded-xl border border-slate-200 bg-white p-6 shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
-            <div className="mb-5 flex flex-wrap items-start justify-between gap-3">
+          <section className="rounded-xl border border-slate-200 bg-white p-3 shadow-[0_1px_2px_rgba(16,24,40,0.04)] sm:p-6">
+            <div className="mb-5 flex flex-wrap items-start justify-between gap-3 px-1 sm:px-0">
               <div>
                 <h2 className="text-lg font-semibold tracking-tight text-slate-900">
                   {isLibrary ? `Thư viện cảnh báo · ${activeUtility}` : "Cấu hình cảnh báo tức thời đồng hồ"}
                 </h2>
-                {isLibrary ? (
-                  <p className="mt-1 max-w-3xl text-sm text-slate-500">
-                    Mẫu ngưỡng cảnh báo dùng chung cho loại điểm đo <strong>{activeUtility}</strong>. Thay đổi ở đây
-                    không ảnh hưởng dự án đang chạy; mỗi dự án chép mẫu này bằng nút{" "}
-                    <strong>Áp dụng từ thư viện</strong> ở trang Sửa dự án → Cảnh báo.
-                  </p>
-                ) : null}
                 {isLibrary ? null : (<>
                 <p className="mt-1 max-w-3xl text-sm text-slate-500">
                   Trang này chỉ phục vụ cấu hình những cảnh báo tức thời từ dữ liệu Gateway bắn về (tham số{" "}
@@ -665,27 +740,42 @@ export function AlertConfig({
                 </>)}
               </div>
               {isLibrary ? null : (
-                <button
-                  type="button"
-                  onClick={() => setConfirmApplyLibrary(true)}
-                  className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-emerald-200 bg-emerald-50 px-3 text-xs font-semibold text-emerald-700 hover:bg-emerald-100"
-                  title="Chép ngưỡng từ Thư viện cảnh báo dùng chung cho loại điểm đo đang chọn"
-                >
-                  Áp dụng từ thư viện
-                </button>
+                <div className="w-full sm:w-72">
+                  <span className="mb-1 block text-[10px] font-semibold uppercase tracking-wide text-slate-400">
+                    Mẫu cảnh báo áp dụng ({activeUtility})
+                  </span>
+                  <CustomSelect
+                    value={templateByUtility[activeUtility] ?? ""}
+                    onChange={(e) => {
+                      const picked = templates.find((item) => item.id === e.target.value);
+                      if (picked) setPendingTemplate(picked);
+                    }}
+                    className="h-9 w-full rounded-lg border border-emerald-200 bg-emerald-50 px-3 text-xs font-semibold text-emerald-800 outline-none focus:border-emerald-500"
+                  >
+                    <option value="">
+                      {templates.some((item) => item.meterType === activeUtility)
+                        ? "-- Chọn mẫu từ thư viện --"
+                        : "Thư viện chưa có mẫu cho loại này"}
+                    </option>
+                    {templates
+                      .filter((item) => item.meterType === activeUtility)
+                      .map((item) => (
+                        <option key={item.id} value={item.id}>
+                          {item.name}
+                        </option>
+                      ))}
+                  </CustomSelect>
+                </div>
               )}
             </div>
 
             {utilityParameters.length > 0 ? (
-              <div className="mb-5 rounded-xl border border-slate-200 bg-slate-50/70 p-4">
+              <div className="mb-5 rounded-xl border border-slate-200 bg-slate-50/70 p-3 sm:p-4">
                 <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2">
                   <div>
                     <h3 className="text-xs font-bold uppercase tracking-wider text-slate-700">
                       Giá trị tức thời Gateway bắn về ({activeUtility})
                     </h3>
-                    <p className="mt-0.5 text-xs text-slate-500">
-                      Xem giá trị thực tế từ gói tin <code className="font-mono">VAL</code> của Gateway để chọn và cài đặt ngưỡng Min / Max chính xác. Bấm vào tham số để thêm nhanh cấu hình ngưỡng.
-                    </p>
                   </div>
                   {utilityParameters.length > 12 ? (
                     <button
@@ -744,6 +834,11 @@ export function AlertConfig({
                   })}
                 </div>
               </div>
+            ) : !electric ? (
+              <div className="mb-5 rounded-xl border border-dashed border-amber-200 bg-amber-50/60 p-4 text-sm text-amber-900">
+                Chưa có tham số nào cho loại {activeUtility}. Khai báo ở <strong>Thư viện loại đồng hồ</strong> → sửa
+                đồng hồ loại {activeUtility} → <strong>Hàm nhận dữ liệu từ gateway</strong> (tên, mô tả, đơn vị).
+              </div>
             ) : null}
 
             {syncNotice ? (
@@ -754,7 +849,7 @@ export function AlertConfig({
 
             <div className="space-y-3">
               {alarmEntries.map(({ alarm, categoryId }) => {
-                const paramMeta = METER_PARAMETERS.find((p) => p.key === alarm.parameterKey);
+                const paramMeta = findParameter(alarm.parameterKey);
                 const liveParam = alarm.parameterKey
                   ? latestValuesMap.get(alarm.parameterKey)
                   : undefined;
@@ -775,10 +870,11 @@ export function AlertConfig({
                 return (
                   <article
                     key={alarm.id}
-                    className="rounded-xl border border-slate-200 bg-white px-5 py-4 shadow-[0_1px_2px_rgba(16,24,40,0.03)]"
+                    className="rounded-xl border border-slate-200 bg-white px-3 py-3 shadow-[0_1px_2px_rgba(16,24,40,0.03)] sm:px-5 sm:py-4"
                   >
-                    <div className="grid gap-3 lg:grid-cols-[minmax(220px,1.2fr)_minmax(200px,1.2fr)_120px_120px_84px_40px] lg:items-start">
-                      <div>
+                    {/* [&>*]:min-w-0: chữ dài trong ô chọn tham số không được đẩy lưới rộng quá màn hình */}
+                    <div className="grid grid-cols-6 gap-x-2 gap-y-3 sm:gap-3 lg:grid-cols-[minmax(220px,1.2fr)_minmax(200px,1.2fr)_120px_120px_84px_40px] lg:items-start [&>*]:min-w-0">
+                      <div className="col-span-6 lg:col-span-1">
                         <span className="mb-1.5 block text-[10px] font-semibold uppercase tracking-wide text-slate-400">
                           THAM SỐ GATEWAY BẮN VỀ
                         </span>
@@ -799,7 +895,7 @@ export function AlertConfig({
                               });
                               return;
                             }
-                            const picked = METER_PARAMETERS.find((p) => p.key === nextKey);
+                            const picked = findParameter(nextKey);
                             const live = latestValuesMap.get(nextKey);
                             updateAlarm(categoryId, alarm.id, {
                               parameterKey: nextKey,
@@ -824,13 +920,13 @@ export function AlertConfig({
                               </option>
                             );
                           })}
-                          <option value="IDAlarm:1">IDAlarm #1 — Quá áp (V)</option>
-                          <option value="IDAlarm:2">IDAlarm #2 — Quá dòng (A)</option>
-                          <option value="IDAlarm:3">IDAlarm #3 — Quá áp (V)</option>
+                          {electric ? <option value="IDAlarm:1">IDAlarm #1 — Quá áp (V)</option> : null}
+                          {electric ? <option value="IDAlarm:2">IDAlarm #2 — Quá dòng (A)</option> : null}
+                          {electric ? <option value="IDAlarm:3">IDAlarm #3 — Quá áp (V)</option> : null}
                         </CustomSelect>
                       </div>
 
-                      <label className="block">
+                      <label className="col-span-6 block lg:col-span-1">
                         <span className="mb-1.5 block text-[10px] font-semibold uppercase tracking-wide text-slate-400">
                           TÊN CẢNH BÁO
                         </span>
@@ -845,7 +941,7 @@ export function AlertConfig({
                         </span>
                       </label>
 
-                      <label className="block">
+                      <label className="col-span-2 block lg:col-span-1">
                         <span className="mb-1.5 block text-[10px] font-semibold uppercase tracking-wide text-slate-400">
                           NGƯỠNG MIN
                         </span>
@@ -854,12 +950,12 @@ export function AlertConfig({
                           onChange={(e) => updateAlarm(categoryId, alarm.id, { minValue: e.target.value })}
                           onBlur={() => void syncThresholdToGateway(alarm)}
                           inputMode="decimal"
-                          placeholder="Để trống = bỏ qua"
+                          placeholder="Bỏ trống"
                           className="h-10 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-800 outline-none placeholder:text-xs placeholder:font-normal placeholder:text-slate-400 focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/15"
                         />
                       </label>
 
-                      <label className="block">
+                      <label className="col-span-2 block lg:col-span-1">
                         <span className="mb-1.5 block text-[10px] font-semibold uppercase tracking-wide text-slate-400">
                           NGƯỠNG MAX
                         </span>
@@ -875,7 +971,7 @@ export function AlertConfig({
                         />
                       </label>
 
-                      <label className="block">
+                      <label className="col-span-2 block lg:col-span-1">
                         <span className="mb-1.5 block text-[10px] font-semibold uppercase tracking-wide text-slate-400">
                           ĐƠN VỊ
                         </span>
@@ -887,7 +983,7 @@ export function AlertConfig({
                         />
                       </label>
 
-                      <div className="pt-5">
+                      <div className="hidden pt-5 lg:block">
                         <button
                           type="button"
                           onClick={() => removeAlarm(categoryId, alarm.id)}
@@ -900,12 +996,13 @@ export function AlertConfig({
                     </div>
 
                     <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 pt-2.5 text-xs">
-                      <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
-                        <span className="inline-flex items-center gap-1.5 font-medium text-emerald-700">
-                          <CurrentIcon className="h-3.5 w-3.5" />
-                          Giá trị gateway bắn về hiện tại
+                      <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-4 gap-y-1">
+                        <span className="inline-flex min-w-0 flex-wrap items-center gap-x-1.5 font-medium text-emerald-700">
+                          <CurrentIcon className="h-3.5 w-3.5 shrink-0" />
+                          <span className="hidden sm:inline">Giá trị gateway bắn về hiện tại</span>
+                          <span className="sm:hidden">Hiện tại</span>
                           {alarm.parameterKey ? ` (${alarm.parameterKey})` : ""}:{" "}
-                          <strong className="font-mono text-sm">{currentDisplay}</strong>
+                          <strong className="whitespace-nowrap font-mono text-sm">{currentDisplay}</strong>
                         </span>
                         {liveParam ? (
                           <span className="text-slate-400">
@@ -914,15 +1011,26 @@ export function AlertConfig({
                           </span>
                         ) : null}
                       </div>
-                      {isLibrary ? null : (
+                      <div className="flex items-center gap-2">
+                        {isLibrary ? null : (
+                          <button
+                            type="button"
+                            onClick={() => void syncThresholdToGateway(alarm)}
+                            className="rounded-lg bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-700 transition-colors hover:bg-emerald-100"
+                          >
+                            Lưu ngưỡng xuống Gateway
+                          </button>
+                        )}
                         <button
                           type="button"
-                          onClick={() => void syncThresholdToGateway(alarm)}
-                          className="rounded-lg bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-700 transition-colors hover:bg-emerald-100"
+                          onClick={() => removeAlarm(categoryId, alarm.id)}
+                          title="Xóa cảnh báo này"
+                          aria-label="Xóa cảnh báo này"
+                          className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200 text-slate-400 transition-colors hover:border-rose-200 hover:bg-rose-50 hover:text-rose-600 lg:hidden"
                         >
-                          Lưu ngưỡng xuống Gateway
+                          <TrashIcon className="h-4 w-4" />
                         </button>
-                      )}
+                      </div>
                     </div>
                   </article>
                 );
@@ -941,7 +1049,8 @@ export function AlertConfig({
               className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl border border-dashed border-slate-300 bg-[#f8fafc] py-3.5 text-sm font-semibold text-slate-600 transition-colors hover:border-emerald-500 hover:bg-emerald-50/30 hover:text-emerald-700"
             >
               <span className="text-base leading-none text-emerald-600">+</span>
-              Thêm cảnh báo tức thời từ tham số Gateway
+              <span className="sm:hidden">Thêm cảnh báo</span>
+              <span className="hidden sm:inline">Thêm cảnh báo tức thời từ tham số Gateway</span>
             </button>
           </section>
 
@@ -997,13 +1106,15 @@ export function AlertConfig({
       </>
 
       <ConfirmDialog
-        open={confirmApplyLibrary}
-        title="Áp dụng thư viện cảnh báo"
-        description={`Thay toàn bộ ngưỡng cảnh báo loại ${activeUtility} của dự án bằng mẫu trong Thư viện cảnh báo? Các ngưỡng đang có của loại này sẽ bị thay thế.`}
+        open={Boolean(pendingTemplate)}
+        title="Áp dụng mẫu cảnh báo"
+        description={`Thay toàn bộ ngưỡng cảnh báo loại ${activeUtility} của dự án bằng mẫu "${pendingTemplate?.name ?? ""}"? Các ngưỡng đang có của loại này sẽ bị thay thế.`}
         confirmText="Áp dụng"
         danger={false}
-        onConfirm={() => void applyLibraryToProject()}
-        onCancel={() => setConfirmApplyLibrary(false)}
+        onConfirm={() => {
+          if (pendingTemplate) void applyLibraryToProject(pendingTemplate);
+        }}
+        onCancel={() => setPendingTemplate(null)}
       />
     </div>
   );

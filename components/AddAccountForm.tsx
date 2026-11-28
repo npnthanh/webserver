@@ -47,11 +47,9 @@ export function AddAccountForm() {
   // Khoá ô vai trò: không tự đổi vai trò của mình, người cùng cấp không đổi vai trò của nhau.
   const isSelf = isEdit && existing !== null && existing.id === session?.userId;
   const roleLocked = isEdit && existing !== null && !canManageAccountRole(session, existing);
-  const roleLockReason = !roleLocked
-    ? ""
-    : isSelf
-      ? "Không thể tự thay đổi vai trò của chính mình."
-      : "Chỉ người có cấp cao hơn mới được thay đổi vai trò của tài khoản này.";
+  // Tự sửa tài khoản của mình: ô vai trò vẫn khoá nhưng không hiện dòng giải thích.
+  const roleLockReason =
+    !roleLocked || isSelf ? "" : "Chỉ người có cấp cao hơn mới được thay đổi vai trò của tài khoản này.";
 
   useEffect(() => {
     setProjects(loadProjects());
@@ -286,7 +284,7 @@ export function AddAccountForm() {
               </CustomSelect>
               <ChevronIcon className="pointer-events-none absolute top-1/2 right-3 h-4 w-4 -translate-y-1/2 text-slate-400" />
             </div>
-            {roleLocked ? <p className="mt-1.5 text-[11px] font-medium text-amber-700">{roleLockReason}</p> : null}
+            {roleLockReason ? <p className="mt-1.5 text-[11px] font-medium text-amber-700">{roleLockReason}</p> : null}
           </Field>
           {!isEdit ? (
             <Field label="MẬT KHẨU">
@@ -310,11 +308,6 @@ export function AddAccountForm() {
                 <h3 className="text-[14px] font-semibold text-slate-800">
                   {resetMode ? "Đặt lại mật khẩu" : "Đổi mật khẩu"}
                 </h3>
-                <p className="mt-0.5 text-xs text-slate-500">
-                  {resetMode
-                    ? "Đặt mật khẩu mới mà không cần mật khẩu cũ. Tài khoản sẽ bị đăng xuất khỏi các thiết bị đang đăng nhập."
-                    : "Để trống các ô nếu giữ nguyên mật khẩu hiện tại."}
-                </p>
               </div>
               <button
                 type="button"
@@ -377,11 +370,6 @@ export function AddAccountForm() {
               <h3 className="text-[14px] font-semibold text-slate-800">
                 Các dự án / khách hàng được quản trị
               </h3>
-              {role === "Admin" ? (
-                <p className="mt-0.5 text-xs text-slate-500">
-                  Tài khoản Admin có toàn quyền truy cập và cấu hình tất cả các dự án trên hệ thống.
-                </p>
-              ) : null}
             </div>
             {role === "Admin" ? (
               <span className="inline-flex items-center gap-1.5 rounded-full bg-slate-900 px-3 py-1 text-xs font-semibold text-white">

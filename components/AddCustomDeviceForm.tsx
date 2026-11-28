@@ -13,6 +13,7 @@ import {
   hydrateDevices,
   kindFromDeviceType,
   todaySyncLabel,
+  updateDeviceRegisters,
   upsertDevice,
   type DeviceExtraField,
   type DeviceProjectLink,
@@ -29,9 +30,10 @@ function defaultPm2230Registers(): RegisterRow[] {
   return METER_PARAMETERS.filter((param) => coreKeys.includes(param.key)).map((param, idx) => ({
     id: `r-${idx + 1}`,
     address: param.key,
-    name: `${param.name}${param.unit ? ` (${param.unit})` : ""}`,
+    name: param.name,
     dataType: "FLOAT32",
     multiplier: "1.0",
+    unit: param.unit || "",
   }));
 }
 
@@ -41,7 +43,7 @@ function nextId(prefix: string) {
 
 function emptyRegisterRows(): RegisterRow[] {
   return [
-    { id: "r1", address: "", name: "", dataType: "FLOAT32", multiplier: "1.0" },
+    { id: "r1", address: "", name: "", dataType: "FLOAT32", multiplier: "1.0", unit: "" },
   ];
 }
 
@@ -150,18 +152,40 @@ export function AddCustomDeviceForm() {
         name: "",
         dataType: "FLOAT32",
         multiplier: "1.0",
+        unit: "",
       },
     ]);
   }
 
-  function updateRow(id: string, key: keyof RegisterRow, value: string) {
+  /** Chỉ một chỉ số cộng dồn cho mỗi đồng hồ (dùng tính sản lượng tiêu thụ trong báo cáo). */
+  function setCumulative(id: string, checked: boolean) {
+    setRows((current) => current.map((row) => ({ ...row, cumulative: row.id === id ? checked : checked ? false : row.cumulative })));
+  }
+
+  function updateRow(id: string, key: Exclude<keyof RegisterRow, "cumulative">, value: string) {
     setRows((current) =>
       current.map((row) => (row.id === id ? { ...row, [key]: value } : row)),
     );
   }
 
+  const cleanRows = () =>
+    rows
+      .filter((row) => row.address.trim() || row.name.trim())
+      .map((row) => ({ ...row, unit: row.unit?.trim() ?? "" }));
+
   async function handleSubmit() {
-    if (locked) return;
+    if (locked) {
+      if (!editingId) return;
+      setError("");
+      try {
+        await updateDeviceRegisters(editingId, cleanRows());
+      } catch {
+        setError("Không lưu được hàm nhận dữ liệu. Hãy thử lại.");
+        return;
+      }
+      router.push("/thiet-bi");
+      return;
+    }
     const serialNumber = serial.trim();
     if (!selectedModel || !serialNumber) {
       setError("Vui lòng chọn loại đồng hồ, thương hiệu, tên model và nhập Serial.");
@@ -187,7 +211,7 @@ export function AddCustomDeviceForm() {
         notes: notes.trim(),
         image: preview ?? undefined,
         extraFields,
-        registers: rows.filter((row) => row.address.trim() || row.name.trim()),
+        registers: cleanRows(),
       });
     } catch (submitError) {
       const message = submitError instanceof Error ? submitError.message : "";
@@ -227,7 +251,10 @@ export function AddCustomDeviceForm() {
 
       {locked ? (
         <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
-          <p className="font-semibold">Đồng hồ đang được gắn vào dự án nên không thể chỉnh sửa.</p>
+          <p className="font-semibold">
+            Đồng hồ đang được gắn vào dự án nên không thể sửa loại, model, serial. Vẫn sửa được phần Hàm nhận dữ
+            liệu (mô tả, đơn vị…).
+          </p>
           <ul className="mt-1.5 space-y-0.5 text-xs">
             {linkedPoints.map((item) => (
               <li key={`${item.projectId}-${item.meterId}`}>
@@ -406,6 +433,9 @@ export function AddCustomDeviceForm() {
         </div>
       </section>
 
+      </fieldset>
+
+      {/* Không khoá khi đồng hồ đang gắn dự án: chỉ là mô tả / đơn vị hiển thị, không ảnh hưởng dữ liệu đã đo. */}
       <section className="rounded-xl border border-slate-200 bg-white p-5 shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
         <div className="mb-5 flex items-center justify-between gap-3">
           <h2 className="flex items-center gap-2 text-sm font-bold tracking-wide text-slate-700 uppercase">
@@ -422,12 +452,16 @@ export function AddCustomDeviceForm() {
         </div>
 
         <div className="overflow-x-auto">
-          <table className="w-full min-w-[700px] text-left text-sm">
+          <table className="w-full min-w-[900px] text-left text-sm">
             <thead>
               <tr className="border-b border-slate-100 text-[11px] font-semibold tracking-wide text-slate-400">
                 {/* Dữ liệu lưu giữ nguyên: cột "Tên" ở trường address (VD: EPaed), "Mô tả" ở trường name. */}
                 <th className="px-2 py-2">TÊN</th>
                 <th className="px-2 py-2">MÔ TẢ</th>
+                <th className="w-32 px-2 py-2">ĐƠN VỊ</th>
+                <th className="w-24 px-2 py-2 text-center" title="Chỉ số tích lũy (VD tổng m³): báo cáo dùng để tính sản lượng tiêu thụ theo kỳ">
+                  CỘNG DỒN
+                </th>
                 <th className="px-2 py-2">KIỂU DỮ LIỆU</th>
                 <th className="px-2 py-2">HỆ SỐ NHÂN</th>
                 <th className="w-12 px-2 py-2 text-right">THAO TÁC</th>
@@ -449,9 +483,28 @@ export function AddCustomDeviceForm() {
                     <input
                       value={row.name}
                       onChange={(e) => updateRow(row.id, "name", e.target.value)}
-                      placeholder="VD: Điện năng tác dụng nhận (kWh)"
+                      placeholder="VD: Lưu lượng nước"
                       aria-label="Mô tả"
                       className="input h-9"
+                    />
+                  </td>
+                  <td className="px-2 py-2">
+                    <input
+                      value={row.unit ?? ""}
+                      onChange={(e) => updateRow(row.id, "unit", e.target.value)}
+                      placeholder="VD: m³/s"
+                      aria-label="Đơn vị"
+                      className="input h-9"
+                    />
+                  </td>
+                  <td className="px-2 py-2 text-center">
+                    <input
+                      type="checkbox"
+                      checked={Boolean(row.cumulative)}
+                      onChange={(e) => setCumulative(row.id, e.target.checked)}
+                      aria-label="Chỉ số cộng dồn"
+                      title="Chỉ số tích lũy (VD tổng m³): báo cáo dùng để tính sản lượng tiêu thụ theo kỳ"
+                      className="h-4 w-4 accent-emerald-600"
                     />
                   </td>
                   <td className="px-2 py-2">
@@ -490,7 +543,6 @@ export function AddCustomDeviceForm() {
           </table>
         </div>
       </section>
-      </fieldset>
 
       <div className="sticky bottom-0 -mx-6 mt-1 flex items-center justify-between gap-3 border-t border-slate-200 bg-[#f3f5f8]/95 px-6 py-4 backdrop-blur lg:-mx-8 lg:px-8">
         <p className="flex items-center gap-2 text-xs text-slate-500">
@@ -505,14 +557,12 @@ export function AddCustomDeviceForm() {
           >
             Hủy bỏ
           </Link>
-          {locked ? null : (
-            <button
-              type="submit"
-              className="h-10 rounded-xl bg-emerald-600 px-5 text-sm font-semibold text-white shadow-xs hover:bg-emerald-700 transition-colors"
-            >
-              {isEdit ? "Cập nhật loại đồng hồ" : "Lưu loại đồng hồ"}
-            </button>
-          )}
+          <button
+            type="submit"
+            className="h-10 rounded-xl bg-emerald-600 px-5 text-sm font-semibold text-white shadow-xs hover:bg-emerald-700 transition-colors"
+          >
+            {locked ? "Lưu hàm nhận dữ liệu" : isEdit ? "Cập nhật loại đồng hồ" : "Lưu loại đồng hồ"}
+          </button>
         </div>
       </div>
 

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { CustomSelect } from "@/components/ui/CustomSelect";
 import {
@@ -43,6 +43,10 @@ export function MeterCatalogConfig({ section }: { section: "types" | "models" })
   const [editingModel, setEditingModel] = useState<string | null>(null);
   const [modelError, setModelError] = useState("");
   const [savingModel, setSavingModel] = useState(false);
+
+  // Khung sửa nằm phía trên bảng: bấm "Sửa" ở một dòng thì cuộn lên khung sửa cho người dùng thấy ngay.
+  const typeFormRef = useRef<HTMLDivElement>(null);
+  const modelFormRef = useRef<HTMLDivElement>(null);
 
   const [pendingDelete, setPendingDelete] = useState<PendingDelete | null>(null);
   const [deleteError, setDeleteError] = useState("");
@@ -173,6 +177,16 @@ export function MeterCatalogConfig({ section }: { section: "types" | "models" })
     }
   }
 
+  /** Cuộn lên khung sửa và đặt con trỏ vào ô nhập đầu tiên còn sửa được. */
+  function revealForm(form: HTMLDivElement | null) {
+    if (!form) return;
+    form.scrollIntoView({ behavior: "smooth", block: "start" });
+    // Chỉ tự đặt con trỏ trên máy tính: trên điện thoại sẽ bật bàn phím che mất khung sửa.
+    if (!window.matchMedia("(pointer: fine)").matches) return;
+    const input = form.querySelector<HTMLInputElement>("input:not([disabled])");
+    input?.focus({ preventScroll: true });
+  }
+
   return (
     <div className="mx-auto max-w-[1400px] space-y-6 p-4 font-sans sm:p-6 lg:p-8">
       <h1 className="text-xl font-bold tracking-tight text-slate-900 sm:text-2xl">
@@ -182,7 +196,7 @@ export function MeterCatalogConfig({ section }: { section: "types" | "models" })
       {/* ---------------- Loại điểm đo (dùng chung cho dự án và đồng hồ) ---------------- */}
       {section === "types" ? (
       <Section title="Danh sách loại điểm đo">
-        <div className="grid gap-3 sm:grid-cols-[1.2fr_0.7fr_2fr_auto] sm:items-end">
+        <div ref={typeFormRef} className="grid scroll-mt-20 gap-3 sm:grid-cols-[1.2fr_0.7fr_2fr_auto] sm:items-end">
           <Field label="Tên loại điểm đo">
             <input
               className="input"
@@ -238,6 +252,7 @@ export function MeterCatalogConfig({ section }: { section: "types" | "models" })
                       code: item.gatewayCode == null ? "" : String(item.gatewayCode),
                       description: item.description,
                     });
+                    revealForm(typeFormRef.current);
                   }}
                   onDelete={() => {
                     setDeleteError("");
@@ -256,7 +271,7 @@ export function MeterCatalogConfig({ section }: { section: "types" | "models" })
       {/* ---------------- Model đồng hồ ---------------- */}
       {section === "models" ? (
       <Section title="Model đồng hồ">
-        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-[1fr_1.2fr_1.2fr_0.7fr_1fr_auto] lg:items-end">
+        <div ref={modelFormRef} className="grid scroll-mt-20 gap-3 sm:grid-cols-2 lg:grid-cols-[1fr_1.2fr_1.2fr_0.7fr_1fr_auto] lg:items-end">
           <Field label="Loại điểm đo">
             <CustomSelect
               className="input"
@@ -364,6 +379,7 @@ export function MeterCatalogConfig({ section }: { section: "types" | "models" })
                         code: item.modelCode == null ? "" : String(item.modelCode),
                         protocol: item.protocol || protocolVersions[0] || "",
                       });
+                      revealForm(modelFormRef.current);
                     }}
                     onDelete={() => {
                       setDeleteError("");

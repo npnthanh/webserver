@@ -2,12 +2,20 @@
 
 import { useEffect, useState } from "react";
 import { CustomSelect } from "@/components/ui/CustomSelect";
+import { hydrateClientMeters } from "@/lib/client-meters";
+import { declaredParamsForType, hydrateDevices, loadDevices, type CatalogDevice } from "@/lib/devices";
 import { hydrateProjectSettings, saveProjectSettings } from "@/lib/project-settings";
+import { hydrateProjects } from "@/lib/projects";
 import {
+  PARAM_FIELD_PREFIX,
   REPORTS,
   REPORT_FIELDS,
   defaultSelectedFieldsByReport,
+  isElectricMeterType,
+  isReportFieldAllowed,
   readReportConfig,
+  reportFieldsFor,
+  reportsForMeterType,
   type ReportConfig,
   type ReportHeaderFooterConfig,
   type ReportTypeId,
@@ -30,6 +38,33 @@ export function ReportConfigEditor({ projectId }: { projectId: string }) {
   const [fieldTab, setFieldTab] = useState<ReportTypeId>("overview");
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState<{ ok: boolean; text: string } | null>(null);
+  // Loại điểm đo đang xem ở mục "Trường dữ liệu" (Điện / Nước / …) — trường hiển thị theo loại.
+  const [meterTypes, setMeterTypes] = useState<string[]>([]);
+  const [fieldUtility, setFieldUtility] = useState("Điện");
+  const [devices, setDevices] = useState<CatalogDevice[]>(loadDevices);
+
+  useEffect(() => {
+    let active = true;
+    void Promise.all([
+      hydrateProjects().catch(() => []),
+      hydrateClientMeters(projectId).catch(() => []),
+      hydrateDevices().catch(() => loadDevices()),
+    ]).then(([projects, meters, deviceList]) => {
+      if (!active) return;
+      const project = projects.find((item) => item.id === projectId);
+      const types = Array.from(
+        new Set([...(project?.meterTypes ?? []), ...meters.map((m) => m.utility)].filter(Boolean) as string[]),
+      );
+      setMeterTypes(types);
+      setDevices(deviceList);
+      setFieldUtility((current) =>
+        types.includes(current) ? current : types.find((type) => isElectricMeterType(type)) ?? types[0] ?? "Điện",
+      );
+    });
+    return () => {
+      active = false;
+    };
+  }, [projectId]);
 
   useEffect(() => {
     let active = true;
@@ -74,6 +109,14 @@ export function ReportConfigEditor({ projectId }: { projectId: string }) {
     });
   }
 
+  /** Trường theo thông số đo (param:…): mặc định được xem, bỏ tích thì ghi vào danh sách ẩn. */
+  function toggleParamField(id: ReportTypeId, key: string) {
+    if (!config) return;
+    const hidden = config.hiddenParamFields?.[id] ?? [];
+    const next = hidden.includes(key) ? hidden.filter((item) => item !== key) : [...hidden, key];
+    update({ hiddenParamFields: { ...config.hiddenParamFields, [id]: next } });
+  }
+
   async function save() {
     if (!config) return;
     setSaving(true);
@@ -91,7 +134,13 @@ export function ReportConfigEditor({ projectId }: { projectId: string }) {
   const cardClass = "rounded-xl border border-slate-200 bg-white p-5 shadow-[0_1px_2px_rgba(16,24,40,0.04)]";
   const inputClass =
     "h-9 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-800 outline-none focus:border-emerald-500";
-  const fieldSelected = config.allowedFields[fieldTab] ?? [];
+  const electricFields = isElectricMeterType(fieldUtility);
+  const declaredParams = electricFields ? [] : declaredParamsForType(devices, fieldUtility);
+  const fieldReports = REPORTS.filter((item) => reportsForMeterType(fieldUtility).includes(item.id));
+  const activeFieldTab = fieldReports.some((item) => item.id === fieldTab) ? fieldTab : fieldReports[0]?.id ?? "overview";
+  const fieldsOf = (id: ReportTypeId) => reportFieldsFor(id, fieldUtility, declaredParams);
+  const allowedCount = (id: ReportTypeId) =>
+    fieldsOf(id).filter((field) => isReportFieldAllowed(config, id, field.key)).length;
 
   return (
     <div className="space-y-5">
@@ -214,10 +263,14 @@ export function ReportConfigEditor({ projectId }: { projectId: string }) {
           <button
             type="button"
             onClick={() => {
-              const all = REPORT_FIELDS[fieldTab].map((field) => field.key);
+              const all = REPORT_FIELDS[activeFieldTab].map((field) => field.key);
               update({
-                allowedFields: { ...config.allowedFields, [fieldTab]: all },
-                fieldsByReport: { ...config.fieldsByReport, [fieldTab]: defaultSelectedFieldsByReport()[fieldTab] },
+                allowedFields: { ...config.allowedFields, [activeFieldTab]: all },
+                fieldsByReport: {
+                  ...config.fieldsByReport,
+                  [activeFieldTab]: defaultSelectedFieldsByReport()[activeFieldTab],
+                },
+                hiddenParamFields: { ...config.hiddenParamFields, [activeFieldTab]: [] },
               });
             }}
             className="text-xs font-semibold text-slate-500 hover:underline"
@@ -225,28 +278,55 @@ export function ReportConfigEditor({ projectId }: { projectId: string }) {
             Cho xem tất cả
           </button>
         </div>
+        {meterTypes.length > 1 ? (
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <span className="text-xs font-semibold text-slate-500">Loại điểm đo:</span>
+            {meterTypes.map((type) => (
+              <button
+                key={type}
+                type="button"
+                onClick={() => setFieldUtility(type)}
+                className={`h-8 rounded-lg border px-3 text-xs font-semibold transition-colors ${
+                  type === fieldUtility
+                    ? "border-emerald-500 bg-emerald-50 text-emerald-800"
+                    : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+                }`}
+              >
+                {type}
+              </button>
+            ))}
+          </div>
+        ) : null}
+        {electricFields ? null : (
+          <p className="mt-2 rounded-lg border border-amber-200 bg-amber-50/70 px-3 py-2 text-xs leading-relaxed text-amber-900">
+            Loại {fieldUtility} không có báo cáo chi phí 3 giá / khí nhà kính và các trường riêng của điện. Trường cùng tên
+            (điểm đo, tổng tiêu thụ, chỉ số đầu / cuối kỳ…) dùng chung quyền xem với Điện; trường thông số đo (VD Qm3s) chỉ
+            áp cho loại này.
+          </p>
+        )}
         <div className="mt-3 flex flex-wrap gap-1.5">
-          {REPORTS.map((item) => (
+          {fieldReports.map((item) => (
             <button
               key={item.id}
               type="button"
               onClick={() => setFieldTab(item.id)}
               className={`inline-flex h-8 items-center gap-1.5 rounded-full px-3 text-xs font-semibold transition-colors ${
-                fieldTab === item.id
+                activeFieldTab === item.id
                   ? "bg-emerald-600 text-white shadow-xs"
                   : "bg-white text-slate-600 ring-1 ring-slate-200 hover:bg-emerald-50"
               }`}
             >
               {item.name}
-              <span className={fieldTab === item.id ? "text-white/80" : "text-slate-400"}>
-                {(config.allowedFields[item.id] ?? []).length}/{REPORT_FIELDS[item.id].length}
+              <span className={activeFieldTab === item.id ? "text-white/80" : "text-slate-400"}>
+                {allowedCount(item.id)}/{fieldsOf(item.id).length}
               </span>
             </button>
           ))}
         </div>
         <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-          {REPORT_FIELDS[fieldTab].map((field) => {
-            const checked = fieldSelected.includes(field.key);
+          {fieldsOf(activeFieldTab).map((field) => {
+            const isParam = field.key.startsWith(PARAM_FIELD_PREFIX);
+            const checked = isReportFieldAllowed(config, activeFieldTab, field.key);
             return (
               <label
                 key={field.key}
@@ -259,7 +339,9 @@ export function ReportConfigEditor({ projectId }: { projectId: string }) {
                 <input
                   type="checkbox"
                   checked={checked}
-                  onChange={() => toggleField(fieldTab, field.key)}
+                  onChange={() =>
+                    isParam ? toggleParamField(activeFieldTab, field.key) : toggleField(activeFieldTab, field.key)
+                  }
                   className="h-3.5 w-3.5 accent-emerald-600"
                 />
                 <span className="truncate">{field.label}</span>

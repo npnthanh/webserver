@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   INTERNET_LABEL,
+  METER_TYPE_BY_CODE,
   METER_TYPE_LABEL,
   gatewayErrorText,
 } from "@/lib/gateway-protocol";
@@ -20,6 +21,15 @@ type GatewayDeviceView = {
   meterTypeName?: string | null;
   meterModelName?: string | null;
   meterId: string | null;
+  /** Các đồng hồ gateway đang đọc (VD điện + nước xen kẽ). */
+  meters?: Array<{
+    meterType: string;
+    meterModel: string;
+    meterId: string;
+    meterTypeName: string | null;
+    meterModelName: string | null;
+    lastAt: string;
+  }>;
   lastReadingTime: string | null;
   lastIsReplay: boolean | null;
   lastError: number | null;
@@ -244,16 +254,46 @@ export function GatewayConsole() {
                           </div>
                         </div>
 
+                        {device.meters && device.meters.length > 0 ? (
+                          <div className="mt-4 border-t border-slate-100 pt-3 text-xs">
+                            <p className="mb-1.5 text-[10px] font-semibold tracking-wide text-slate-400 uppercase">
+                              Đồng hồ đang đọc ({device.meters.length})
+                            </p>
+                            <ul className="space-y-1.5">
+                              {device.meters.map((meter) => (
+                                <li
+                                  key={`${meter.meterModel}-${meter.meterId}`}
+                                  className="flex flex-wrap items-center justify-between gap-x-3 gap-y-0.5 rounded-lg bg-slate-50 px-2.5 py-1.5"
+                                >
+                                  <span className="min-w-0 font-medium text-slate-800">
+                                    {meter.meterModelName || meter.meterModel} (SN: {meter.meterId})
+                                  </span>
+                                  <span className="flex items-center gap-2 text-[11px] text-slate-500">
+                                    <span className="rounded bg-white px-1.5 py-0.5 font-semibold text-slate-600 ring-1 ring-slate-200">
+                                      {meter.meterTypeName || meterTypeText(meter.meterType)}
+                                    </span>
+                                    {formatStamp(meter.lastAt) ?? ""}
+                                  </span>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        ) : null}
+
                         <dl className="mt-4 grid grid-cols-2 gap-x-4 gap-y-2.5 border-t border-slate-100 pt-3 text-xs sm:grid-cols-3">
-                          <Field
-                            label="Đồng hồ đang đọc"
-                            value={
-                              device.meterModelName || device.meterModel
-                                ? `${device.meterModelName || device.meterModel}${device.meterId ? ` (SN: ${device.meterId})` : ""}`
-                                : null
-                            }
-                          />
-                          <Field label="Loại năng lượng" value={device.meterTypeName || meterTypeText(device.meterType)} />
+                          {device.meters && device.meters.length > 0 ? null : (
+                            <>
+                              <Field
+                                label="Đồng hồ đang đọc"
+                                value={
+                                  device.meterModelName || device.meterModel
+                                    ? `${device.meterModelName || device.meterModel}${device.meterId ? ` (SN: ${device.meterId})` : ""}`
+                                    : null
+                                }
+                              />
+                              <Field label="Loại năng lượng" value={device.meterTypeName || meterTypeText(device.meterType)} />
+                            </>
+                          )}
                           <Field label="Chu kỳ gửi dữ liệu" value={`${device.timeUpdate} giây`} />
                           <Field
                             label="Nhiệt độ / Độ ẩm tủ"
@@ -461,7 +501,9 @@ function Empty({ text }: { text: string }) {
 
 function meterTypeText(value: string | null) {
   if (!value) return null;
-  return METER_TYPE_LABEL[value] ?? value;
+  // Mã số MT (1 điện, 2 nước, …) hoặc chữ cái cũ (E/W/P/F).
+  const letter = /^\d+$/.test(value) ? METER_TYPE_BY_CODE[Number(value)] : value;
+  return (letter && METER_TYPE_LABEL[letter]) ?? value;
 }
 
 function formatStamp(value: string | null) {

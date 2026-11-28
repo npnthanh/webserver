@@ -21,6 +21,7 @@ import {
   type ClientMeter,
 } from "@/lib/client-meters";
 import { hydrateProjects, resolveMeterTypes, type MeterType } from "@/lib/projects";
+import { hydrateDevices, loadDevices, type CatalogDevice } from "@/lib/devices";
 import {
   clearDiagramState,
   hydrateDiagramState,
@@ -40,12 +41,14 @@ import {
   formatMetricReading,
   normalizeMetricKeys,
   parameterGroups,
+  resolveMetricKeys,
 } from "./diagram/metrics";
 import { MeterNode, NodeGlyph, SourceNode } from "./diagram/nodes";
 import type {
   DiagramEdge,
   DiagramNode,
   DiagramNodeDisplay,
+  DiagramParamOption,
   EnergyKind,
   MeterFlowNode,
   MeterIcon,
@@ -164,6 +167,29 @@ function saveDiagramDisplays(
   });
 }
 
+/**
+ * Đồng hồ không phải điện (Nước, Khí nén, Nhiệt, Hơi…): thông số là các dòng đã khai báo ở "Hàm nhận dữ liệu từ
+ * gateway" của đồng hồ; chưa khai báo thì lấy các thông số có trong bản tin gần nhất. Đồng hồ điện: null (dùng danh
+ * sách thông số điện chuẩn).
+ */
+function paramOptionsForMeter(
+  meter: ClientMeter,
+  devices: CatalogDevice[],
+  sample: ProjectGatewaySample | undefined,
+): DiagramParamOption[] | null {
+  if (meter.utility === "Điện") return null;
+  const device = meter.deviceId ? devices.find((item) => item.id === meter.deviceId) : undefined;
+  const fromRegisters: DiagramParamOption[] = [];
+  for (const row of device?.registers ?? []) {
+    const key = row.address?.trim();
+    if (!key || fromRegisters.some((item) => item.key === key)) continue;
+    fromRegisters.push({ key, label: row.name?.trim() || key, unit: row.unit?.trim() || undefined });
+  }
+  if (fromRegisters.length) return fromRegisters;
+  const fromSample = Object.keys(sample?.values ?? {}).map((key) => ({ key, label: key }));
+  return fromSample.length ? fromSample : null;
+}
+
 function iconForUtility(utility: string): MeterIcon {
   if (utility === "Nước") return "pump";
   if (utility === "Hơi") return "boiler";
@@ -183,11 +209,12 @@ function nodeDataForMeter(
   display: DiagramNodeDisplay | undefined,
   sample: ProjectGatewaySample | undefined,
 ): MeterNodeData {
-  const metricKeys = normalizeMetricKeys(display?.metricKeys);
+  const metricKeys = resolveMetricKeys(display);
   const live = buildLiveMetrics(metricKeys, sample?.values, {
     hasDevice: Boolean(meter.deviceId),
     online: isSampleOnline(sample?.at),
     code: meter.code,
+    paramOptions: display?.paramOptions,
   });
   return {
     title: display?.title ?? meter.name,
@@ -200,6 +227,7 @@ function nodeDataForMeter(
     energy: meter.utility,
     listed: true,
     metricKeys,
+    paramOptions: display?.paramOptions,
     metrics: live.metrics,
     sampleAt: sample?.at ? formatStoredVietnam(sample.at) ?? sample.at : undefined,
     lineLive: isSampleOnline(sample?.at),
@@ -230,7 +258,7 @@ function buildSourceNodeData(
 
   for (const meter of meters) {
     const sample = liveById[meter.id];
-    const live = buildLiveMetrics(normalizeMetricKeys(displays[meter.id]?.metricKeys), sample?.values, {
+    const live = buildLiveMetrics(resolveMetricKeys(displays[meter.id]), sample?.values, {
       hasDevice: Boolean(meter.deviceId),
       online: isSampleOnline(sample?.at),
       code: meter.code,
@@ -420,14 +448,24 @@ function SystemDiagramInner() {
   const [mobileListOpen, setMobileListOpen] = useState(false);
   const [savedNotice, setSavedNotice] = useState(false);
   const [displays, setDisplays] = useState<Record<string, DiagramNodeDisplay>>({});
+  const [devices, setDevices] = useState<CatalogDevice[]>(loadDevices);
   const [liveById, setLiveById] = useState<Record<string, ProjectGatewaySample>>({});
   const [liveTick, setLiveTick] = useState(0);
   const [nodes, setNodes, onNodesChange] = useNodesState<DiagramNode>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<DiagramEdge>([]);
   const { fitView, setCenter, getNode, getViewport, setViewport } = useReactFlow();
-  const displaysRef = useRef(displays);
+  /** Hiển thị đã lưu + danh sách thông số riêng của đồng hồ không phải điện (chỉ lúc chạy, không lưu). */
+  const effectiveDisplays = useMemo(() => {
+    const next: Record<string, DiagramNodeDisplay> = { ...displays };
+    for (const meter of meters) {
+      const options = paramOptionsForMeter(meter, devices, liveById[meter.id]);
+      if (options) next[meter.id] = { ...displays[meter.id], paramOptions: options };
+    }
+    return next;
+  }, [displays, meters, devices, liveById]);
+  const displaysRef = useRef(effectiveDisplays);
   const liveByIdRef = useRef(liveById);
-  displaysRef.current = displays;
+  displaysRef.current = effectiveDisplays;
   liveByIdRef.current = liveById;
 
   const refreshLive = useCallback(() => {
@@ -435,6 +473,7 @@ function SystemDiagramInner() {
   }, []);
 
   const saveCurrentViewport = useCallback(() => {
+    if (isCompactScreen()) return;
     saveDiagramViewport(projectId, energy, getViewport());
   }, [projectId, energy, getViewport]);
 
@@ -458,6 +497,13 @@ function SystemDiagramInner() {
     });
     reloadMeters();
   }, [projectId, reloadMeters]);
+
+  useEffect(() => {
+    const reloadDevices = () => void hydrateDevices().then(setDevices);
+    reloadDevices();
+    window.addEventListener("ems-devices-changed", reloadDevices);
+    return () => window.removeEventListener("ems-devices-changed", reloadDevices);
+  }, []);
 
   useEffect(() => {
     const onCustom = () => reloadMeters();
@@ -553,7 +599,7 @@ function SystemDiagramInner() {
       setSelectedId(filtered[0].id);
     }
 
-    if (savedState?.viewport && hasSavedSource) {
+    if (savedState?.viewport && hasSavedSource && !isCompactScreen()) {
       const vp = savedState.viewport;
       const frame = requestAnimationFrame(() => {
         setViewport({ x: vp.x, y: vp.y, zoom: vp.zoom });
@@ -576,7 +622,7 @@ function SystemDiagramInner() {
           return {
             ...item,
             data: {
-              ...buildSourceNodeData(projectName, energy, filtered, displays, liveById),
+              ...buildSourceNodeData(projectName, energy, filtered, effectiveDisplays, liveById),
               busWidth: prev.busWidth,
               feeders: prev.feeders,
             },
@@ -585,7 +631,7 @@ function SystemDiagramInner() {
         if (item.type !== "meter") return item;
         const meter = meters.find((row) => row.id === item.id);
         if (!meter) return item;
-        const nextData = nodeDataForMeter(meter, displays[item.id], liveById[item.id]);
+        const nextData = nodeDataForMeter(meter, effectiveDisplays[item.id], liveById[item.id]);
         const prev = item.data as MeterNodeData;
         return {
           ...item,
@@ -609,7 +655,7 @@ function SystemDiagramInner() {
         };
       }),
     );
-  }, [liveById, displays, meters, energy, projectName, selectedId, diagramStateReady, setNodes, setEdges]);
+  }, [liveById, effectiveDisplays, meters, energy, projectName, selectedId, diagramStateReady, setNodes, setEdges]);
 
   useEffect(() => {
     setNodes((current) =>
@@ -690,9 +736,9 @@ function SystemDiagramInner() {
     return meters
       .filter((meter) => meter.utility === energy)
       .map((meter) => {
-        const display = displays[meter.id];
+        const display = effectiveDisplays[meter.id];
         const live = buildLiveMetrics(
-          normalizeMetricKeys(display?.metricKeys),
+          resolveMetricKeys(display),
           liveById[meter.id]?.values,
           {
             hasDevice: Boolean(meter.deviceId),
@@ -710,7 +756,7 @@ function SystemDiagramInner() {
           serialNumber: meter.serialNumber,
         };
       });
-  }, [meters, energy, displays, liveById]);
+  }, [meters, energy, effectiveDisplays, liveById]);
 
   const selectPoint = (id: string) => {
     setSelectedId(id);
@@ -734,7 +780,7 @@ function SystemDiagramInner() {
     clearDiagramState(projectId, energy);
     saveDiagramDisplays(projectId, energy, displays);
     const filtered = meters.filter((meter) => meter.utility === energy);
-    const built = buildFlowFromMeters(filtered, displays, liveById, projectName, energy);
+    const built = buildFlowFromMeters(filtered, effectiveDisplays, liveById, projectName, energy);
     setNodes(
       built.nodes.map((node) => ({
         ...node,
@@ -746,7 +792,7 @@ function SystemDiagramInner() {
     setSavedNotice(true);
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(() => setSavedNotice(false), 2000);
-  }, [projectId, projectName, energy, meters, displays, liveById, selectedId, setNodes, setEdges, fitView]);
+  }, [projectId, projectName, energy, meters, displays, effectiveDisplays, liveById, selectedId, setNodes, setEdges, fitView]);
 
   const configHref = `/du-an/${projectId}/cau-hinh`;
 
@@ -929,13 +975,13 @@ function SystemDiagramInner() {
                   saveTimerRef.current = setTimeout(() => setSavedNotice(false), 2000);
                 }}
                 onMoveEnd={(_, viewport) => {
-                  saveDiagramViewport(projectId, energy, viewport);
+                  if (!isCompactScreen()) saveDiagramViewport(projectId, energy, viewport);
                 }}
                 nodesConnectable={false}
                 edgesFocusable={false}
                 elementsSelectable
                 nodesDraggable
-                minZoom={0.25}
+                minZoom={0.1}
                 maxZoom={2.0}
                 proOptions={{ hideAttribution: true }}
               >
@@ -1031,15 +1077,20 @@ function NodeSettingsPanel({
   onChange: (patch: DiagramNodeDisplay & { iconImage?: string }) => void;
   onRefresh: () => void;
 }) {
-  const selectedKeys = new Set(normalizeMetricKeys(data.metricKeys));
-  const groups = parameterGroups();
+  const customParams = data.paramOptions?.length ? data.paramOptions : null;
+  const currentKeys = customParams ? data.metricKeys : normalizeMetricKeys(data.metricKeys);
+  const selectedKeys = new Set(currentKeys);
+  // Đồng hồ không phải điện: chỉ liệt kê thông số đã khai báo cho đồng hồ; đồng hồ điện: danh sách thông số điện chuẩn.
+  const groups = customParams
+    ? [["Thông số khai báo của đồng hồ", customParams.map((item) => ({ key: item.key, name: item.label, unit: item.unit ?? "" }))] as const]
+    : parameterGroups();
 
   const toggleKey = (key: string) => {
-    const current = normalizeMetricKeys(data.metricKeys);
-    const next = current.includes(key)
-      ? current.filter((item) => item !== key)
-      : [...current, key];
-    onChange({ metricKeys: next.length ? next : [...normalizeMetricKeys(null)] });
+    const next = currentKeys.includes(key)
+      ? currentKeys.filter((item) => item !== key)
+      : [...currentKeys, key];
+    const fallback = customParams ? resolveMetricKeys({ paramOptions: customParams }) : normalizeMetricKeys(null);
+    onChange({ metricKeys: next.length ? next : [...fallback] });
   };
 
   return (
@@ -1086,10 +1137,12 @@ function NodeSettingsPanel({
 
         <SettingsField label="GIÁ TRỊ HIỂN THỊ TRÊN THẺ">
           <p className="mb-2 text-[11px] leading-relaxed text-slate-400">
-            Tick các thông số (dòng điện, điện áp, công suất…). Thẻ sơ đồ sẽ hiện giá trị gateway thực.
+            {customParams
+              ? "Tick các thông số đã khai báo ở Hàm nhận dữ liệu của đồng hồ. Thẻ sơ đồ sẽ hiện giá trị gateway thực."
+              : "Tick các thông số (dòng điện, điện áp, công suất…). Thẻ sơ đồ sẽ hiện giá trị gateway thực."}
           </p>
           <div className="mb-2 flex flex-wrap gap-1.5">
-            {normalizeMetricKeys(data.metricKeys).map((key) => (
+            {currentKeys.map((key) => (
               <button
                 key={key}
                 type="button"
@@ -1239,7 +1292,7 @@ function CanvasControls({
   const { zoomIn, zoomOut } = useReactFlow();
 
   return (
-    <Panel position="bottom-right" className="m-4 flex flex-col gap-2 font-sans">
+    <Panel position="bottom-right" className="m-2 flex flex-row gap-1.5 font-sans sm:m-4 sm:flex-col sm:gap-2">
       <ControlButton
         label="Phóng to (+)"
         onClick={async () => {
@@ -1266,7 +1319,8 @@ function CanvasControls({
       <ControlButton label="Đặt lại vị trí mặc định" onClick={onResetLayout}>
         <ResetIcon className="h-4 w-4" />
       </ControlButton>
-      <ControlButton label="Toàn màn hình" onClick={onFullscreen}>
+      {/* iPhone không hỗ trợ toàn màn hình cho một phần trang: ẩn trên điện thoại */}
+      <ControlButton label="Toàn màn hình" onClick={onFullscreen} className="hidden sm:flex">
         <ExpandIcon className="h-4 w-4" />
       </ControlButton>
     </Panel>
@@ -1277,21 +1331,32 @@ function ControlButton({
   children,
   label,
   onClick,
+  className = "flex",
 }: {
   children: React.ReactNode;
   label: string;
   onClick: () => void;
+  className?: string;
 }) {
   return (
     <button
       type="button"
       title={label}
+      aria-label={label}
       onClick={onClick}
-      className="flex h-9 w-9 items-center justify-center rounded-xl border border-slate-200/80 bg-white text-base text-slate-600 shadow-md hover:bg-slate-50 hover:text-slate-900 transition-colors"
+      className={`${className} h-9 w-9 items-center justify-center rounded-xl border border-slate-200/80 bg-white text-base text-slate-600 shadow-md hover:bg-slate-50 hover:text-slate-900 transition-colors`}
     >
       {children}
     </button>
   );
+}
+
+/**
+ * Màn hình nhỏ (điện thoại, máy tính bảng dọc): góc nhìn đã lưu (zoom / vị trí) lấy từ màn hình rộng nên áp vào
+ * sẽ chỉ thấy một góc sơ đồ. Trên màn hình nhỏ luôn thu vừa khung và không ghi đè góc nhìn đã lưu.
+ */
+function isCompactScreen() {
+  return typeof window !== "undefined" && window.matchMedia("(max-width: 1023px)").matches;
 }
 
 // ---------------- SVG Icons ----------------

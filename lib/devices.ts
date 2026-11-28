@@ -10,6 +10,10 @@ export type DeviceRegister = {
   name: string;
   dataType: string;
   multiplier: string;
+  /** Đơn vị hiển thị trên biểu đồ / sơ đồ (VD: m³/s, bar, °C). */
+  unit?: string;
+  /** Chỉ số tích lũy (VD tổng m³ đã chảy qua): báo cáo dùng để tính sản lượng tiêu thụ theo kỳ. */
+  cumulative?: boolean;
 };
 
 export type DeviceExtraField = {
@@ -94,6 +98,31 @@ export async function upsertDevice(device: CatalogDevice) {
   const saved = await dbFetch<CatalogDevice[]>("devices", {
     method: "POST",
     body: JSON.stringify(device),
+  });
+  devicesCache = saved;
+  emitDbChange("devices");
+  return saved;
+}
+
+/** Thông số khai báo ở "Hàm nhận dữ liệu từ gateway" của mọi đồng hồ thuộc một loại (gộp, không trùng tên). */
+export function declaredParamsForType(devices: CatalogDevice[], meterType: string) {
+  const list: { key: string; label: string; unit: string; cumulative: boolean }[] = [];
+  for (const device of devices) {
+    if (device.type !== meterType) continue;
+    for (const row of device.registers ?? []) {
+      const key = row.address?.trim();
+      if (!key || list.some((item) => item.key === key)) continue;
+      list.push({ key, label: row.name?.trim() || key, unit: row.unit?.trim() || "", cumulative: Boolean(row.cumulative) });
+    }
+  }
+  return list;
+}
+
+/** Chỉ cập nhật "Hàm nhận dữ liệu" (tên, mô tả, đơn vị…): được phép cả khi đồng hồ đang gắn vào dự án. */
+export async function updateDeviceRegisters(id: string, registers: DeviceRegister[]) {
+  const saved = await dbFetch<CatalogDevice[]>("devices", {
+    method: "POST",
+    body: JSON.stringify({ id, registersOnly: true, registers }),
   });
   devicesCache = saved;
   emitDbChange("devices");

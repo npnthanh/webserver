@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { useAuth } from "@/components/auth/useAuth";
 import { logout } from "@/lib/auth";
@@ -29,19 +29,18 @@ export function ClientShell({
   const router = useRouter();
   const { session } = useAuth();
   const [resolved, setResolved] = useState(project);
-  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
-  const mobileNavRef = useRef<HTMLElement>(null);
+  // Lưới chuyển trang nhớ trang lúc mở: sang trang khác là tự đóng (không cần effect đặt lại state).
+  const [menuOpenedAt, setMenuOpenedAt] = useState<string | null>(null);
+  const mobileMenuOpen = menuOpenedAt === pathname;
+  const setMobileMenuOpen = (next: boolean | ((open: boolean) => boolean)) => {
+    const open = typeof next === "function" ? next(mobileMenuOpen) : next;
+    setMenuOpenedAt(open ? pathname : null);
+  };
   const base = `/du-an/${project.id}`;
-
-  useEffect(() => {
-    setMobileMenuOpen(false);
-    const navEl = mobileNavRef.current;
-    if (!navEl) return;
-    const activeEl = navEl.querySelector<HTMLElement>('[data-active="true"]');
-    if (activeEl) {
-      activeEl.scrollIntoView({ behavior: "smooth", inline: "center", block: "nearest" });
-    }
-  }, [pathname]);
+  const isActive = (href: string) =>
+    href === "" ? pathname === base : pathname === `${base}${href}` || pathname.startsWith(`${base}${href}/`);
+  const currentItem = navItems.find((item) => isActive(item.href)) ?? navItems[0];
+  const CurrentIcon = currentItem.icon;
 
   useEffect(() => {
     let active = true;
@@ -157,66 +156,32 @@ export function ClientShell({
         </div>
       </header>
 
-      {/* Mobile Navigation Strip + Quick Grid Menu */}
-      <div className="relative z-40 flex sm:hidden items-center border-b border-slate-200/80 bg-white shrink-0">
-        <div className="relative min-w-0 flex-1">
-          <nav
-            ref={mobileNavRef}
-            className="flex overflow-x-auto px-2 py-1.5 pr-6 gap-1 scrollbar-none"
-            aria-label="Điều hướng dự án mobile"
-          >
-            {navItems.map((item) => {
-              const href = `${base}${item.href}`;
-              const active =
-                item.href === ""
-                  ? pathname === base
-                  : pathname === href || pathname.startsWith(`${href}/`);
-              const Icon = item.icon;
-
-              return (
-                <Link
-                  key={item.href || "home"}
-                  href={href}
-                  data-active={active ? "true" : "false"}
-                  className={`flex shrink-0 items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium whitespace-nowrap transition-colors ${
-                    active
-                      ? "bg-emerald-600 text-white font-semibold shadow-xs"
-                      : "text-slate-600 hover:bg-slate-100 hover:text-slate-900"
-                  }`}
-                >
-                  <Icon className={`h-3.5 w-3.5 shrink-0 ${active ? "text-white" : "text-slate-400"}`} />
-                  <span>{item.label}</span>
-                </Link>
-              );
-            })}
-          </nav>
-          <div
-            aria-hidden
-            className="pointer-events-none absolute inset-y-0 right-0 w-6 bg-gradient-to-l from-white to-transparent"
-          />
-        </div>
-
-        <div className="relative z-10 flex shrink-0 items-center border-l border-slate-200/80 bg-white px-2 py-1.5">
-          <button
-            type="button"
-            onClick={() => setMobileMenuOpen((v) => !v)}
-            aria-expanded={mobileMenuOpen}
-            aria-label="Mở danh mục nhanh"
-            className={`inline-flex h-7 items-center gap-1 rounded-lg border px-2.5 text-[11px] font-semibold transition-colors ${
-              mobileMenuOpen
-                ? "border-emerald-600 bg-emerald-50 text-emerald-700"
-                : "border-slate-200 bg-slate-50 text-slate-700"
-            }`}
-          >
-            <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+      {/* Điện thoại: một nút ghi tên trang hiện tại, bấm mở lưới chọn đủ 8 trang
+          (thanh tab trượt ngang cũ chỉ hiện được ~3/8 mục nên đã bỏ). */}
+      <div className="relative z-40 shrink-0 border-b border-slate-200/80 bg-white px-3 py-1.5 sm:hidden">
+        <button
+          type="button"
+          onClick={() => setMobileMenuOpen((v) => !v)}
+          aria-expanded={mobileMenuOpen}
+          aria-label="Chọn trang"
+          className={`flex h-9 w-full items-center gap-2 rounded-lg border px-3 text-sm font-semibold transition-colors ${
+            mobileMenuOpen
+              ? "border-emerald-500 bg-emerald-50 text-emerald-800"
+              : "border-slate-200 bg-slate-50 text-slate-800"
+          }`}
+        >
+          <CurrentIcon className="h-4 w-4 shrink-0 text-emerald-600" />
+          <span className="min-w-0 flex-1 truncate text-left">{currentItem.label}</span>
+          <span className="flex shrink-0 items-center gap-1 text-xs font-medium text-slate-500">
+            <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
               <rect x="3" y="3" width="7" height="7" rx="1.5" />
               <rect x="14" y="3" width="7" height="7" rx="1.5" />
               <rect x="3" y="14" width="7" height="7" rx="1.5" />
               <rect x="14" y="14" width="7" height="7" rx="1.5" />
             </svg>
-            <span>Menu</span>
-          </button>
-        </div>
+            Chuyển trang
+          </span>
+        </button>
 
         {mobileMenuOpen ? (
           <>
@@ -227,9 +192,7 @@ export function ClientShell({
             />
             <div className="absolute inset-x-0 top-full z-50 border-b border-slate-200 bg-white p-3 shadow-xl">
               <div className="mb-2 flex items-center justify-between px-1">
-                <span className="text-[11px] font-bold tracking-wider text-slate-400 uppercase">
-                  Chọn nhanh chức năng ({resolved.customer})
-                </span>
+                <span className="text-[11px] font-bold tracking-wider text-slate-400 uppercase">Chuyển trang</span>
                 <button
                   type="button"
                   onClick={() => setMobileMenuOpen(false)}
@@ -241,10 +204,7 @@ export function ClientShell({
               <div className="grid grid-cols-2 gap-2">
                 {navItems.map((item) => {
                   const href = `${base}${item.href}`;
-                  const active =
-                    item.href === ""
-                      ? pathname === base
-                      : pathname === href || pathname.startsWith(`${href}/`);
+                  const active = isActive(item.href);
                   const Icon = item.icon;
                   return (
                     <Link

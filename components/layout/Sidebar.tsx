@@ -75,6 +75,12 @@ const navGroups: {
         permission: "manageDevices",
       },
       {
+        href: "/cau-hinh/thu-vien-chi-phi",
+        label: "Thư viện chi phí",
+        icon: CostLibraryIcon,
+        permission: "manageDevices",
+      },
+      {
         href: "/cau-hinh/thu-vien-bao-cao",
         label: "Thư viện báo cáo",
         icon: ReportConfigIcon,
@@ -212,10 +218,9 @@ function SidebarBody({
     <div className="flex h-full flex-col">
       {/* Brand Header */}
       <div
-        className={`flex items-center border-b border-slate-100 ${
-          collapsed
-            ? "justify-center px-2 py-4"
-            : "justify-between px-5 py-4 sm:px-6 sm:py-5"
+        // Cao đúng bằng thanh header (h-16) và cùng màu đường kẻ để hai đường ngang thẳng hàng.
+        className={`flex h-16 shrink-0 items-center border-b border-slate-200/80 ${
+          collapsed ? "justify-center px-2" : "justify-between px-5 sm:px-6"
         }`}
       >
         <div className={`flex items-center gap-3 ${collapsed ? "justify-center" : ""}`}>
@@ -476,6 +481,16 @@ function AlertLibraryIcon({ className }: { className?: string }) {
       <path d="M6 8a6 6 0 0 1 12 0c0 6 2.5 8 2.5 8h-17S6 14 6 8Z" />
       <path d="M10.3 20a1.94 1.94 0 0 0 3.4 0" />
       <path d="M12 7v4M12 13.5v.01" />
+    </svg>
+  );
+}
+
+function CostLibraryIcon({ className }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="6" width="18" height="12" rx="2" />
+      <circle cx="12" cy="12" r="2.5" />
+      <path d="M6.5 9.5v.01M17.5 14.5v.01" />
     </svg>
   );
 }

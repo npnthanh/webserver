@@ -1,0 +1,22 @@
+# Cầu nối TCP thô → https://webserver.kivon.tech/api/gateway (systemd, Linux)
+# Cài: xem deploy/gateway-bridge/HUONG-DAN.md
+[Unit]
+Description=Gateway TCP bridge (raw TCP -> webserver.kivon.tech)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Cổng gateway bắn vào (đổi theo cổng đã mở trên firewall)
+Environment=GATEWAY_TCP_PORT=5000
+Environment=GATEWAY_TCP_HOST=0.0.0.0
+Environment=GATEWAY_INGEST_URL=https://webserver.kivon.tech/api/gateway
+ExecStart=/usr/bin/node /opt/gateway-bridge/gateway-tcp.mjs
+Restart=always
+RestartSec=3
+# Chạy bằng user tạm, không cần quyền root
+DynamicUser=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

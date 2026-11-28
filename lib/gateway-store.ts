@@ -72,6 +72,18 @@ export type GatewayDeviceView = {
   meterTypeName?: string | null;
   meterModelName?: string | null;
   meterId: string | null;
+  /**
+   * Các đồng hồ gateway đang đọc (bản tin hợp lệ trong 7 ngày gần nhất). Một gateway có thể đọc nhiều
+   * đồng hồ xen kẽ (VD điện + nước); meterId/meterModel ở trên chỉ là đồng hồ của bản tin cuối.
+   */
+  meters?: Array<{
+    meterType: string;
+    meterModel: string;
+    meterId: string;
+    meterTypeName: string | null;
+    meterModelName: string | null;
+    lastAt: string;
+  }>;
   lastReadingTime: string | null;
   lastIsReplay: boolean | null;
   lastError: number | null;
@@ -424,6 +436,25 @@ async function createSchema() {
   await emsDb.query(
     "INSERT IGNORE INTO schema_migrations (version) VALUES ('2026-10-17-gateway-hmac')",
   ).catch(() => undefined);
+
+  // Một lần: dọn "giá trị mới nhất" bị ghép sai khi đồng bộ upstream (serial của bản tin bị từ chối + giá trị
+  // của bản tin hợp lệ trước đó, VD đồng hồ nước 26250444 mang số điện). Dòng hợp lệ luôn có mẫu cùng model + serial.
+  const latestFix = await queryRows<RowDataPacket>(
+    "SELECT version FROM schema_migrations WHERE version = '2026-11-27-meter-latest-mismatch' LIMIT 1",
+  ).catch(() => null);
+  if (latestFix && latestFix.length === 0) {
+    await emsDb.query(
+      `DELETE l FROM gateway_meter_latest l
+        WHERE NOT EXISTS (
+          SELECT 1 FROM gateway_samples s
+           WHERE s.meter_model = l.meter_model AND s.meter_id = l.meter_id
+           LIMIT 1
+        )`,
+    ).catch(() => undefined);
+    await emsDb.query(
+      "INSERT IGNORE INTO schema_migrations (version) VALUES ('2026-11-27-meter-latest-mismatch')",
+    ).catch(() => undefined);
+  }
 }
 
 export async function ingestGateway(rawText: string, headers?: Headers) {
@@ -922,7 +953,11 @@ async function syncFromUpstreamGateway() {
           : null;
         const receivedSql = lastSeen.slice(0, 23).replace("T", " ").replace("Z", "");
 
-        if (valuesJson && Number.isSafeInteger(meterIdNum)) {
+        // Chỉ ghi "giá trị mới nhất" khi bản tin cuối của gateway được chấp nhận: upstream cập nhật meterId theo
+        // MỌI bản tin nhưng lastValues chỉ theo bản tin hợp lệ, nên bản tin bị từ chối (VD đồng hồ chưa khai báo)
+        // sẽ ghép serial mới với giá trị của đồng hồ khác.
+        const lastAccepted = (gw.lastDisposition ?? "accepted") === "accepted";
+        if (valuesJson && lastAccepted && Number.isSafeInteger(meterIdNum)) {
           await emsDb
             .execute(
               `INSERT INTO gateway_meter_latest (
@@ -1120,7 +1155,8 @@ export async function getGatewayConsole(input: { from?: string; to?: string; gat
       return [] as T[];
     });
 
-  const [gateways, statsRows, packets, alarmCountRows, alarms, logCountRows, logs, thresholds] =
+  const meterSince = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString().slice(0, 19).replace("T", " ");
+  const [gateways, statsRows, packets, alarmCountRows, alarms, logCountRows, logs, thresholds, meterRows] =
     await Promise.all([
       safeQuery<RowDataPacket>("SELECT * FROM gateway_devices ORDER BY gateway_id"),
       safeQuery<RowDataPacket>(
@@ -1158,6 +1194,14 @@ export async function getGatewayConsole(input: { from?: string; to?: string; gat
             [input.gatewayId],
           )
         : safeQuery<RowDataPacket>("SELECT * FROM gateway_thresholds ORDER BY id"),
+      // Mỗi đồng hồ một dòng (bảng nhỏ): đồng hồ nào gateway nào đang đọc.
+      safeQuery<RowDataPacket>(
+        `SELECT gateway_id, meter_type, meter_model, meter_id, received_at
+           FROM gateway_meter_latest
+          WHERE received_at >= ?
+          ORDER BY received_at DESC`,
+        [meterSince],
+      ),
     ]);
 
   const baseGateways = gateways.length
@@ -1166,10 +1210,26 @@ export async function getGatewayConsole(input: { from?: string; to?: string; gat
       ? cachedUpstreamConsole.gateways
       : [];
   const mappedGateways = await Promise.all(
-    baseGateways.map(async (gateway) => ({
-      ...gateway,
-      ...(await resolveMeterNames(gateway.meterType, gateway.meterModel)),
-    })),
+    baseGateways.map(async (gateway) => {
+      const rows = meterRows.filter((row) => String(row.gateway_id) === gateway.gatewayId);
+      const meters = await Promise.all(
+        rows.map(async (row) => {
+          const names = await resolveMeterNames(String(row.meter_type), String(row.meter_model));
+          return {
+            meterType: String(row.meter_type),
+            meterModel: String(row.meter_model),
+            meterId: String(row.meter_id),
+            ...names,
+            lastAt: receivedAtText(row.received_at),
+          };
+        }),
+      );
+      return {
+        ...gateway,
+        ...(await resolveMeterNames(gateway.meterType, gateway.meterModel)),
+        ...(meters.length ? { meters } : {}),
+      };
+    }),
   );
   // Chỉ mượn gói tin upstream khi xem tổng quan (không lọc). Khi lọc theo thời gian/gateway mà không có
   // gói nào thì trả rỗng, tránh hiển thị gói của thời điểm khác như thể thuộc khoảng đang xem.

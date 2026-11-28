@@ -65,124 +65,53 @@ export function LoginForm({
   }
 
   return (
-    <div className="relative flex h-full w-full min-h-screen lg:min-h-0 lg:h-screen flex-col lg:flex-row bg-[#0b1120] text-slate-100 font-sans selection:bg-emerald-500 selection:text-white overflow-y-auto lg:overflow-hidden">
-      {/* LEFT COLUMN: Cinematic CleanTech & Energy Showcase */}
-      <div className="relative hidden lg:flex lg:w-7/12 xl:w-2/3 flex-col justify-between overflow-hidden p-8 xl:p-12 h-full">
-        {/* Background Image with Deep Overlay */}
+    // h-dvh: đúng chiều cao vùng nhìn thấy trên điện thoại (100vh tính cả thanh địa chỉ nên sinh cuộn thừa).
+    // Chỉ khung ngoài được cuộn, và chỉ khi nội dung thật sự cao hơn màn hình (VD điện thoại xoay ngang).
+    <div className="relative flex h-dvh w-full overflow-x-hidden overflow-y-auto bg-[#0b1120] font-sans text-slate-100 selection:bg-emerald-500 selection:text-white lg:overflow-hidden">
+      {/* Cột trái (laptop / desktop): ảnh nền tối + thương hiệu, tối giản */}
+      <div className="relative hidden h-full flex-col justify-between overflow-hidden p-10 lg:flex lg:w-7/12 xl:w-3/5 xl:p-14">
         <div className="absolute inset-0 z-0">
           <Image
             src="/images/login-hero.jpg"
-            alt="Nhà máy công nghiệp xanh thông minh"
+            alt="Nhà máy công nghiệp"
             fill
             priority
-            className="object-cover object-center scale-105 transform transition-transform duration-10000 ease-out"
+            sizes="60vw"
+            className="object-cover object-center"
           />
-          {/* Multi-layered futuristic gradient overlays */}
-          <div className="absolute inset-0 bg-gradient-to-r from-[#070b14]/90 via-[#070b14]/75 to-[#0b1120]" />
-          <div className="absolute inset-0 bg-radial-[at_top_left] from-emerald-500/20 via-transparent to-transparent" />
-          <div className="absolute inset-0 bg-radial-[at_bottom_center] from-cyan-500/15 via-transparent to-transparent" />
+          {/* Phủ tối đậm để ảnh chỉ còn là nền, không tranh chú ý với nội dung */}
+          <div className="absolute inset-0 bg-[#070b14]/85" />
+          <div className="absolute inset-0 bg-gradient-to-r from-transparent to-[#0b1120]" />
         </div>
 
-        {/* Ambient Top Bar */}
-        <div className="relative z-10 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-tr from-emerald-500 to-cyan-400 p-0.5 shadow-[0_0_20px_rgba(16,185,129,0.4)]">
-              <div className="flex h-full w-full items-center justify-center rounded-[10px] bg-[#090d16]">
-                <EnergyLogoIcon className="h-5 w-5 text-emerald-400" />
-              </div>
-            </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="text-base font-bold tracking-tight text-white">DTS</span>
-                <span className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-400 uppercase tracking-wider">
-                  Doanh nghiệp
-                </span>
-              </div>
-              <p className="text-[11px] text-slate-400">Quản lý năng lượng & phát thải carbon</p>
-            </div>
-          </div>
+        <BrandMark />
 
-          <div className="flex items-center gap-2 rounded-full border border-slate-700/60 bg-slate-900/60 px-3 py-1 backdrop-blur-md">
-            <span className="relative flex h-2 w-2">
-              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
-              <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-500" />
-            </span>
-            <span className="text-[11px] font-medium text-slate-300">Hạ tầng IoT: 100% Sẵn sàng</span>
-          </div>
-        </div>
-
-        {/* Hero Central Content */}
-        <div className="relative z-10 my-auto max-w-xl py-6 xl:py-8">
-          <div className="inline-flex items-center gap-2 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-3 py-1 text-xs font-medium text-emerald-300 backdrop-blur-md mb-4 xl:mb-6">
-            <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
-            <span>Nền tảng Quản trị Năng lượng & Phát thải GHG</span>
-          </div>
-
-          <h2 className="text-3xl xl:text-4xl 2xl:text-5xl font-bold tracking-tight text-white leading-[1.2]">
-            Kiểm soát năng lượng &{" "}
-            <span className="bg-gradient-to-r from-emerald-400 to-teal-300 bg-clip-text text-transparent">
-              phát thải thông minh
-            </span>
+        <div className="relative z-10 max-w-lg">
+          <h2 className="text-3xl font-bold leading-tight tracking-tight text-white xl:text-4xl">
+            Quản lý năng lượng
+            <br />
+            <span className="text-emerald-400">và phát thải carbon</span>
           </h2>
-          <p className="mt-3 xl:mt-4 text-sm xl:text-base text-slate-300/80 leading-relaxed font-normal">
-            Giám sát thời gian thực toàn bộ mạng lưới phụ tải công nghiệp, tự động hóa kiểm kê carbon
-            theo tiêu chuẩn GHG Protocol và ISO 50001.
+          <p className="mt-4 text-sm leading-relaxed text-slate-400 xl:text-base">
+            Giám sát điện năng thời gian thực, chi phí và kiểm kê khí nhà kính cho doanh nghiệp.
           </p>
-
-          {/* Minimal Key Highlights */}
-          <div className="mt-6 xl:mt-8 flex items-center gap-6 xl:gap-8 border-t border-white/10 pt-4 xl:pt-6">
-            <div>
-              <p className="text-xl xl:text-2xl font-bold tracking-tight text-white">10,400+</p>
-              <p className="text-[11px] text-slate-400 mt-0.5">Điểm đo kết nối IoT</p>
-            </div>
-            <div className="h-8 w-px bg-white/10" />
-            <div>
-              <p className="text-xl xl:text-2xl font-bold tracking-tight text-emerald-400">-18.4%</p>
-              <p className="text-[11px] text-slate-400 mt-0.5">Phát thải CO₂e trung bình</p>
-            </div>
-            <div className="h-8 w-px bg-white/10" />
-            <div>
-              <p className="text-xl xl:text-2xl font-bold tracking-tight text-cyan-400">99.98%</p>
-              <p className="text-[11px] text-slate-400 mt-0.5">Độ ổn định dữ liệu</p>
-            </div>
-          </div>
         </div>
 
-        {/* Left Bottom Meta */}
-        <div className="relative z-10 flex items-center justify-between text-xs text-slate-400 pt-4 border-t border-slate-800/80">
-          <div className="flex items-center gap-4">
-            <span className="flex items-center gap-1.5">
-              <ShieldCheckIcon className="h-4 w-4 text-emerald-400" />
-              Chuẩn ISO 50001
-            </span>
-            <span className="h-3 w-px bg-slate-700" />
-            <span className="flex items-center gap-1.5">
-              <LeafIcon className="h-4 w-4 text-cyan-400" />
-              Theo chuẩn GHG Protocol
-            </span>
-          </div>
-          <span className="text-[11px]">© 2026 DTS.</span>
-        </div>
+        <p className="relative z-10 text-xs text-slate-500">© 2026 DTS</p>
       </div>
 
-      {/* RIGHT COLUMN: Modern High-Precision Auth Card */}
-      <div className="relative flex flex-1 flex-col justify-center px-6 py-8 sm:px-10 lg:px-12 xl:px-16 bg-[#0b1120] h-full overflow-y-auto lg:overflow-visible">
-        {/* Background Ambient Glows */}
-        <div className="pointer-events-none absolute -top-40 right-0 h-96 w-96 rounded-full bg-emerald-500/10 blur-[120px]" />
-        <div className="pointer-events-none absolute -bottom-40 left-0 h-96 w-96 rounded-full bg-cyan-500/10 blur-[120px]" />
+      {/* Cột phải: form đăng nhập */}
+      <div className="relative flex min-h-full flex-1 flex-col justify-center px-6 py-10 sm:px-10 lg:px-12 xl:px-16">
+        {/* Đốm sáng nền: bọc trong lớp overflow-hidden để không bao giờ làm tràn màn hình */}
+        <div className="pointer-events-none absolute inset-0 overflow-hidden" aria-hidden>
+          <div className="absolute -top-32 right-0 h-72 w-72 rounded-full bg-emerald-500/10 blur-[110px]" />
+          <div className="absolute -bottom-32 left-0 h-72 w-72 rounded-full bg-cyan-500/10 blur-[110px]" />
+        </div>
 
-        <div className="mx-auto w-full max-w-md my-auto">
-          {/* Mobile Logo Brand */}
-          <div className="mb-6 flex items-center gap-3 lg:hidden">
-            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-tr from-emerald-500 to-cyan-400 p-0.5 shadow-md">
-              <div className="flex h-full w-full items-center justify-center rounded-[10px] bg-[#090d16]">
-                <EnergyLogoIcon className="h-5 w-5 text-emerald-400" />
-              </div>
-            </div>
-            <div>
-              <span className="text-lg font-bold tracking-tight text-white">DTS</span>
-              <p className="text-xs text-slate-400">Quản lý năng lượng & phát thải carbon</p>
-            </div>
+        <div className="relative mx-auto w-full max-w-sm">
+          {/* Logo trên điện thoại / máy tính bảng (cột trái bị ẩn) */}
+          <div className="mb-8 lg:hidden">
+            <BrandMark />
           </div>
 
           {/* Heading */}
@@ -193,7 +122,7 @@ export function LoginForm({
             <p className="mt-2 text-sm text-slate-400">
               {project
                 ? `Giám sát dữ liệu vận hành dự án: ${project.name}`
-                : "Truy cập trung tâm điều hành và nền tảng giám sát năng lượng EMS."}
+                : "Đăng nhập để tiếp tục vào hệ thống."}
             </p>
           </div>
 
@@ -229,7 +158,7 @@ export function LoginForm({
                     setError("");
                   }}
                   placeholder="Nhập tên đăng nhập hoặc email..."
-                  className="w-full rounded-xl border border-slate-700/80 bg-slate-900/90 py-3 pl-10 pr-4 text-sm text-white placeholder:text-slate-500 focus:border-emerald-400 focus:bg-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-400/20 transition-all"
+                  className="w-full rounded-xl border border-slate-700/80 bg-slate-900/90 py-3 pl-10 pr-4 text-base sm:text-sm text-white placeholder:text-slate-500 focus:border-emerald-400 focus:bg-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-400/20 transition-all"
                   autoComplete="username"
                   required
                 />
@@ -265,7 +194,7 @@ export function LoginForm({
                     setError("");
                   }}
                   placeholder="Nhập mật khẩu truy cập"
-                  className="w-full rounded-xl border border-slate-700/80 bg-slate-900/90 py-3 pl-10 pr-11 text-sm text-white placeholder:text-slate-500 focus:border-emerald-400 focus:bg-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-400/20 transition-all"
+                  className="w-full rounded-xl border border-slate-700/80 bg-slate-900/90 py-3 pl-10 pr-11 text-base sm:text-sm text-white placeholder:text-slate-500 focus:border-emerald-400 focus:bg-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-400/20 transition-all"
                   autoComplete="current-password"
                   required
                 />
@@ -327,12 +256,24 @@ export function LoginForm({
             </button>
           </form>
 
-          {/* Bottom Security Footer */}
-          <div className="mt-6 flex items-center justify-center gap-2 text-[11px] text-slate-500">
-            <LockClosedSmallIcon className="h-3.5 w-3.5 text-slate-400" />
-            <span>Kết nối bảo mật 256-bit TLS mã hóa đầu cuối</span>
-          </div>
         </div>
+      </div>
+    </div>
+  );
+}
+
+/** Logo + tên sản phẩm (cột trái trên desktop, đầu form trên điện thoại). */
+function BrandMark() {
+  return (
+    <div className="relative z-10 flex items-center gap-3">
+      <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-tr from-emerald-500 to-cyan-400 p-0.5">
+        <div className="flex h-full w-full items-center justify-center rounded-[10px] bg-[#090d16]">
+          <EnergyLogoIcon className="h-5 w-5 text-emerald-400" />
+        </div>
+      </div>
+      <div>
+        <p className="text-lg font-bold leading-tight tracking-tight text-white">DTS</p>
+        <p className="text-xs text-slate-400">Energy &amp; Carbon Platform</p>
       </div>
     </div>
   );
@@ -410,33 +351,6 @@ function ArrowRightIcon({ className }: { className?: string }) {
     <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="M5 12h14" />
       <path d="m12 5 7 7-7 7" />
-    </svg>
-  );
-}
-
-function ShieldCheckIcon({ className }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10" />
-      <path d="m9 12 2 2 4-4" />
-    </svg>
-  );
-}
-
-function LeafIcon({ className }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M11 20A7 7 0 0 1 9.8 6.1C15.5 5 17 4.48 19 2c1 2 2 4.18 2 8 0 5.5-4.78 10-10 10Z" />
-      <path d="M2 21c0-3 1.85-5.36 5.08-6C9.5 14.52 12 13 13 12" />
-    </svg>
-  );
-}
-
-function LockClosedSmallIcon({ className }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-      <rect width="14" height="10" x="5" y="11" rx="2" />
-      <path d="M8 11V7a4 4 0 0 1 8 0v4" />
     </svg>
   );
 }

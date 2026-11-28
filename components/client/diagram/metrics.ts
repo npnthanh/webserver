@@ -4,7 +4,7 @@ import {
   type MeterParameter,
 } from "@/lib/meter-parameters";
 import { formatAppNumber } from "@/lib/number-format";
-import type { MeterMetric, MeterStatus } from "./types";
+import type { DiagramNodeDisplay, DiagramParamOption, MeterMetric, MeterStatus } from "./types";
 
 /** Thông số mặc định trên thẻ sơ đồ (điện áp / dòng / công suất). */
 export const DEFAULT_DIAGRAM_METRIC_KEYS = ["Van", "Ia", "Papt"] as const;
@@ -53,17 +53,36 @@ export function normalizeMetricKeys(keys: string[] | null | undefined): string[]
   return cleaned.length ? [...new Set(cleaned)] : [...DEFAULT_DIAGRAM_METRIC_KEYS];
 }
 
+/**
+ * Thông số hiện trên thẻ. Đồng hồ có danh sách thông số riêng (Nước, Khí nén, Nhiệt, Hơi…): chỉ giữ các thông số
+ * đã chọn nằm trong danh sách đó, chưa chọn thì hiện tối đa 4 thông số đầu. Đồng hồ điện: như cũ (mặc định Ua / Ia / P).
+ */
+export function resolveMetricKeys(display?: DiagramNodeDisplay): string[] {
+  const options = display?.paramOptions;
+  if (options?.length) {
+    const allowed = new Set(options.map((option) => option.key));
+    const kept = (display?.metricKeys ?? []).filter((key) => allowed.has(key));
+    return kept.length ? [...new Set(kept)] : options.slice(0, 4).map((option) => option.key);
+  }
+  return normalizeMetricKeys(display?.metricKeys);
+}
+
 export function metricLabel(key: string) {
   return SHORT_LABELS[key] ?? key;
 }
 
-export function formatMetricReading(key: string, values: Record<string, number> | undefined) {
+export function formatMetricReading(
+  key: string,
+  values: Record<string, number> | undefined,
+  /** Đơn vị khai báo ở Hàm nhận dữ liệu của đồng hồ (ưu tiên hơn đơn vị chuẩn). */
+  unitOverride?: string,
+) {
   const raw = values?.[key];
   if (typeof raw !== "number" || !Number.isFinite(raw)) return "—";
 
   const param = METER_PARAMETERS.find((item) => item.key === key);
   let num = raw;
-  let unit = param?.unit ?? "";
+  let unit = unitOverride || param?.unit || "";
 
   if (ENERGY_KEYS.has(key)) {
     num = registerToKwh(raw);
@@ -86,6 +105,7 @@ export function buildLiveMetrics(
     hasDevice: boolean;
     online: boolean;
     code: string;
+    paramOptions?: DiagramParamOption[];
   },
 ): { metrics: MeterMetric[]; status: MeterStatus; statusLabel?: string } {
   if (!options.hasDevice) {
@@ -122,7 +142,7 @@ export function buildLiveMetrics(
     metrics: resolved.map((key) => ({
       key,
       label: metricLabel(key),
-      value: formatMetricReading(key, values),
+      value: formatMetricReading(key, values, options.paramOptions?.find((item) => item.key === key)?.unit),
     })),
   };
 }

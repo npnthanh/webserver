@@ -273,6 +273,22 @@ export function readChartParameterConfig(settings: Record<string, unknown> | und
   return config;
 }
 
+/**
+ * Loại điểm đo không phải điện (Nước, Khí nén …): tham số BỊ ẨN trên biểu đồ, theo loại.
+ * Tham số lấy từ Hàm nhận dữ liệu của đồng hồ; mặc định hiện hết nên thông số mới khai báo tự hiện.
+ */
+export type UtilityChartHidden = Record<string, string[]>;
+
+export function readUtilityChartHidden(settings: Record<string, unknown> | undefined | null): UtilityChartHidden {
+  const raw = settings?.chartUtilityHidden;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const result: UtilityChartHidden = {};
+  for (const [utility, list] of Object.entries(raw as Record<string, unknown>)) {
+    if (Array.isArray(list)) result[utility] = list.filter((key): key is string => typeof key === "string");
+  }
+  return result;
+}
+
 /** Dữ liệu lưu vào project settings (kèm phiên bản danh sách tham số). */
 export function chartParametersForSave(config: ChartParameterConfig) {
   return { ...config, _v: CHART_PARAMETERS_VERSION };

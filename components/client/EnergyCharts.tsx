@@ -22,6 +22,7 @@ import { UiWaveform } from "@/components/client/UiWaveform";
 import { UnbalanceChart } from "@/components/client/UnbalanceChart";
 import { CustomSelect } from "@/components/ui/CustomSelect";
 import { hydrateClientMeters, loadClientMeters, orderMetersByTree } from "@/lib/client-meters";
+import { hydrateDevices, loadDevices, type CatalogDevice } from "@/lib/devices";
 import { formatAppNumber } from "@/lib/number-format";
 import { hydrateProjects, loadProjects, resolveMeterTypes } from "@/lib/projects";
 import {
@@ -42,7 +43,13 @@ import {
   inferSlotMs,
 } from "@/lib/industrial-electricity";
 import { METER_PARAMETERS, registerToKwh } from "@/lib/meter-parameters";
-import { isParamAllowed, readChartParameterConfig, type ChartParameterConfig } from "@/lib/chart-parameters";
+import {
+  isParamAllowed,
+  readChartParameterConfig,
+  readUtilityChartHidden,
+  type ChartParameterConfig,
+  type UtilityChartHidden,
+} from "@/lib/chart-parameters";
 import { readChartShowMarkers, setChartDisplay } from "@/lib/chart-display";
 import { hydrateProjectSettings } from "@/lib/project-settings";
 
@@ -56,7 +63,22 @@ type MeterPoint = {
   name: string;
   energy: EnergyKind;
   color: string;
+  deviceId?: string;
 };
+
+/** Thông số khai báo ở "Hàm nhận dữ liệu từ gateway" của đồng hồ: tên (key), mô tả, đơn vị. */
+type DeclaredParam = { key: string; label: string; unit: string };
+
+function declaredParamsFor(point: MeterPoint | null | undefined, devices: CatalogDevice[]): DeclaredParam[] {
+  const device = point?.deviceId ? devices.find((item) => item.id === point.deviceId) : undefined;
+  const list: DeclaredParam[] = [];
+  for (const row of device?.registers ?? []) {
+    const key = row.address?.trim();
+    if (!key || list.some((item) => item.key === key)) continue;
+    list.push({ key, label: row.name?.trim() || "", unit: row.unit?.trim() || "" });
+  }
+  return list;
+}
 
 const POINT_COLORS = ["#059669", "#22c55e", "#a16207", "#ef4444", "#8b5cf6", "#06b6d4", "#f59e0b"];
 
@@ -424,12 +446,14 @@ export function EnergyCharts() {
   const projectId = params?.id ?? "default";
   // Tham số vẽ trên từng biểu đồ (Cấu hình → Tham số biểu đồ).
   const [chartParams, setChartParams] = useState<ChartParameterConfig>({});
+  const [utilityHidden, setUtilityHidden] = useState<UtilityChartHidden>({});
   useEffect(() => {
     let active = true;
     void hydrateProjectSettings(projectId, { force: true })
       .then((settings) => {
         if (!active) return;
         setChartParams(readChartParameterConfig(settings));
+        setUtilityHidden(readUtilityChartHidden(settings as Record<string, unknown>));
         setChartDisplay({ showMarkers: readChartShowMarkers(settings) });
       })
       .catch(() => undefined);
@@ -447,6 +471,14 @@ export function EnergyCharts() {
   const [range, setRange] = useState({ start: 0, end: 30 });
   const [slotInterval, setSlotIntervalState] = useState<SlotInterval>(30);
   const [allPoints, setAllPoints] = useState<MeterPoint[]>([]);
+  const [devices, setDevices] = useState<CatalogDevice[]>(loadDevices);
+
+  useEffect(() => {
+    const reloadDevices = () => void hydrateDevices().then(setDevices);
+    reloadDevices();
+    window.addEventListener("ems-devices-changed", reloadDevices);
+    return () => window.removeEventListener("ems-devices-changed", reloadDevices);
+  }, []);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [pointQuery, setPointQuery] = useState("");
   const [timeFilter, setTimeFilter] = useState<TimeFilterValue>(() => ({
@@ -538,6 +570,7 @@ export function EnergyCharts() {
             name: meter.name,
             energy: meter.utility,
             color: POINT_COLORS[index % POINT_COLORS.length],
+            deviceId: meter.deviceId ?? undefined,
           })),
         );
       });
@@ -1296,7 +1329,8 @@ export function EnergyCharts() {
               ) : (
                 <DynamicUtilityTrend
                   energy={energy}
-                  unit={consumptionUnit}
+                  params={declaredParamsFor(livePoint ?? selectedPoints[0], devices)}
+                  hidden={utilityHidden[energy] ?? []}
                   samples={liveSamples}
                   onRefresh={handleRefresh}
                 />
@@ -2181,42 +2215,50 @@ function BidirectionalEnergyTrend({
 
 function DynamicUtilityTrend({
   energy,
-  unit,
+  params,
+  hidden,
   samples,
   onRefresh,
 }: {
   energy: string;
-  unit: string;
+  /** Thông số khai báo của đồng hồ (tên, mô tả, đơn vị); rỗng thì lấy theo bản tin gateway. */
+  params: DeclaredParam[];
+  /** Tham số ẩn theo Cấu hình → Tham số biểu đồ. */
+  hidden: string[];
   samples?: ProjectGatewaySample[];
   onRefresh?: () => void;
 }) {
   const series = useMemo<TrendSeriesConfig[]>(() => {
-    const keys = new Set<string>();
-    for (const s of samples ?? []) {
-      for (const [k, v] of Object.entries(s.values)) {
-        if (typeof v === "number" && Number.isFinite(v)) keys.add(k);
+    const keys: string[] = params.map((item) => item.key);
+    if (!keys.length) {
+      for (const s of samples ?? []) {
+        for (const [k, v] of Object.entries(s.values)) {
+          if (typeof v === "number" && Number.isFinite(v) && !keys.includes(k)) keys.push(k);
+        }
       }
     }
-    const list = Array.from(keys);
-    if (!list.length) {
-      return [{ key: "EPaed", label: `Chỉ số ${energy}`, color: "#5470c6", unit, digits: 2 }];
-    }
-    return list.slice(0, 8).map((k, idx) => {
+    return keys.filter((k) => !hidden.includes(k)).slice(0, 8).map((k, idx) => {
+      const declared = params.find((item) => item.key === k);
       const known = METER_PARAMETERS.find((p) => p.key === k);
+      const name = declared?.label || known?.name || "";
       return {
         key: k,
-        label: known ? `${k} (${known.name})` : k,
+        label: name && name !== k ? `${k} (${name})` : k,
         color: SERIES_PALETTE[idx % SERIES_PALETTE.length],
-        unit: known?.unit || unit,
+        unit: declared?.unit || known?.unit || "",
         digits: 2,
       };
     });
-  }, [energy, samples, unit]);
+  }, [params, samples, hidden]);
+
+  // Trục tung: ghi đơn vị khi mọi thông số cùng đơn vị; khác đơn vị thì xem đơn vị từng thông số trong chú giải.
+  const units = [...new Set(series.map((item) => item.unit).filter((unit): unit is string => Boolean(unit)))];
+  const axisUnit = units.length === 1 ? units[0] : "";
 
   return (
     <SampleTrendChart
       title={`Biểu đồ thông số đo ${energy} theo mẫu thời gian thực`}
-      unitLabel={unit}
+      unitLabel={axisUnit}
       series={series}
       samples={samples}
       onRefresh={onRefresh}

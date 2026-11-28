@@ -141,6 +141,7 @@ export function ClientAlerts({ project }: { project: Project }) {
   const [selectedPoint, setSelectedPoint] = useState<string>("all");
   const [selectedDelivery, setSelectedDelivery] = useState<string>("all");
   const [liveMode, setLiveMode] = useState(true);
+  const [filtersOpen, setFiltersOpen] = useState(false);
   const [reloadTick, setReloadTick] = useState(0);
 
   useEffect(() => {
@@ -325,6 +326,10 @@ export function ClientAlerts({ project }: { project: Project }) {
     });
   }, [monthlyAlerts, selectedSeverity, selectedCategory, selectedPoint, selectedDelivery, search]);
 
+  const activeFilterCount = [selectedSeverity, selectedCategory, selectedPoint, selectedDelivery].filter(
+    (v) => v !== "all",
+  ).length;
+
   const monthLabel =
     selectedMonth === "all"
       ? "Tất cả các tháng"
@@ -373,30 +378,34 @@ export function ClientAlerts({ project }: { project: Project }) {
   };
 
   return (
-    <div className="flex h-full min-h-0 flex-1 flex-col overflow-y-auto md:overflow-hidden bg-[#f8fafc]">
+    <div className="flex min-h-full flex-col bg-[#f8fafc] md:h-full md:min-h-0 md:overflow-hidden">
       {/* Top Banner Header */}
       <div className="shrink-0 border-b border-slate-200/80 bg-white px-3.5 py-3.5 sm:px-5 sm:py-4 lg:px-8">
         <div className="flex flex-wrap items-center justify-between gap-3 sm:gap-4">
-          <div className="flex items-center gap-2.5">
+          <div className="flex min-w-0 items-center gap-2.5">
             <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-amber-500/10 text-amber-600">
               <AlertBellIcon className="h-5 w-5" />
             </span>
-            <div>
-              <h1 className="text-base sm:text-xl font-bold tracking-tight text-slate-900">
-                Nhật Ký Cảnh Báo Hệ Thống · {monthLabel}
+            <div className="min-w-0">
+              <h1 className="text-base font-bold tracking-tight text-slate-900 sm:text-xl">
+                Nhật Ký Cảnh Báo<span className="hidden sm:inline"> Hệ Thống · {monthLabel}</span>
               </h1>
               <p className="mt-0.5 text-xs text-slate-500">
-                Thống kê thời điểm phát sinh cảnh báo trong tháng, phân loại mức độ theo cấu hình và trạng thái gửi thông báo qua Zalo / Telegram
+                <span className="sm:hidden">{monthLabel}</span>
+                <span className="hidden sm:inline">
+                  Thống kê thời điểm phát sinh cảnh báo trong tháng, phân loại mức độ theo cấu hình và trạng thái gửi thông báo qua Zalo / Telegram
+                </span>
               </p>
             </div>
           </div>
 
-          <div className="flex flex-wrap items-center gap-2">
+          {/* Điện thoại: 3 nút chia đều một hàng, chữ ngắn */}
+          <div className="grid w-full grid-cols-3 gap-2 sm:flex sm:w-auto sm:flex-wrap sm:items-center [&>*]:min-w-0 [&>*]:justify-center">
             {/* Live Mode Toggle */}
             <button
               type="button"
               onClick={() => setLiveMode(!liveMode)}
-              className={`inline-flex h-8 sm:h-9 items-center gap-2 rounded-xl border px-2.5 sm:px-3 text-xs font-semibold transition-all ${
+              className={`inline-flex h-9 items-center gap-2 rounded-xl border px-2.5 sm:px-3 text-xs font-semibold transition-all ${
                 liveMode
                   ? "border-emerald-200 bg-emerald-50/80 text-emerald-800 shadow-xs"
                   : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
@@ -407,81 +416,84 @@ export function ClientAlerts({ project }: { project: Project }) {
                   liveMode ? "bg-emerald-500 animate-pulse" : "bg-slate-400"
                 }`}
               />
-              {liveMode ? "Tự động cập nhật" : "Tạm dừng cập nhật"}
+              <span className="truncate sm:hidden">{liveMode ? "Tự cập nhật" : "Tạm dừng"}</span>
+              <span className="hidden sm:inline">{liveMode ? "Tự động cập nhật" : "Tạm dừng cập nhật"}</span>
             </button>
 
             {/* Nút Cấu hình mức độ & ngưỡng */}
             <Link
               href={`/du-an/${project.id}/cau-hinh?tab=alerts`}
-              className="inline-flex h-8 sm:h-9 items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-2.5 sm:px-3.5 text-xs font-semibold text-slate-700 shadow-xs transition-colors hover:bg-slate-50"
+              className="inline-flex h-9 items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-2.5 sm:px-3.5 text-xs font-semibold text-slate-700 shadow-xs transition-colors hover:bg-slate-50"
             >
-              <GearIcon className="h-3.5 w-3.5 text-slate-500" />
-              Cấu hình mức độ & kênh gửi
+              <GearIcon className="h-3.5 w-3.5 shrink-0 text-slate-500" />
+              <span className="truncate sm:hidden">Cấu hình</span>
+              <span className="hidden sm:inline">Cấu hình mức độ & kênh gửi</span>
             </Link>
 
             {/* Nút Xuất Excel */}
             <button
               type="button"
               onClick={handleExportExcel}
-              className="inline-flex h-8 sm:h-9 items-center gap-1.5 rounded-xl bg-emerald-600 px-3 sm:px-4 text-xs font-semibold text-white shadow-xs transition-colors hover:bg-emerald-700"
+              className="inline-flex h-9 items-center gap-1.5 rounded-xl bg-emerald-600 px-2.5 sm:px-4 text-xs font-semibold text-white shadow-xs transition-colors hover:bg-emerald-700"
             >
-              <DownloadIcon className="h-3.5 w-3.5" />
-              Xuất Excel (.xlsx)
+              <DownloadIcon className="h-3.5 w-3.5 shrink-0" />
+              <span className="truncate sm:hidden">Xuất Excel</span>
+              <span className="hidden sm:inline">Xuất Excel (.xlsx)</span>
             </button>
           </div>
         </div>
 
         {/* Thống kê số lượng cảnh báo trong tháng theo mức độ cấu hình & trạng thái gửi Zalo/Tele */}
         <div className="mt-3 sm:mt-4 grid grid-cols-2 gap-2.5 sm:gap-3 sm:grid-cols-5">
-          <div className="rounded-xl border border-slate-200/80 bg-slate-50/60 p-3">
+          <div className="rounded-xl border border-slate-200/80 bg-slate-50/60 p-2.5 sm:p-3">
             <span className="text-[11px] font-semibold tracking-wider text-slate-500 uppercase">
-              Tổng cảnh báo ({monthLabel})
+              Tổng cảnh báo<span className="hidden sm:inline"> ({monthLabel})</span>
             </span>
             <div className="mt-1 flex items-baseline gap-2">
-              <span className="text-2xl font-bold text-slate-900">{stats.total}</span>
+              <span className="text-xl font-bold sm:text-2xl text-slate-900">{stats.total}</span>
               <span className="text-[11px] text-slate-400">lần phát sinh</span>
             </div>
           </div>
 
-          <div className="rounded-xl border border-rose-200/80 bg-rose-50/50 p-3">
+          <div className="rounded-xl border border-rose-200/80 bg-rose-50/50 p-2.5 sm:p-3">
             <span className="flex items-center gap-1.5 text-[11px] font-semibold tracking-wider text-rose-700 uppercase">
               <span className="h-2 w-2 rounded-full bg-rose-500" />
-              Mức độ Nghiêm trọng
+              <span><span className="hidden sm:inline">Mức độ </span>Nghiêm trọng</span>
             </span>
             <div className="mt-1 flex items-baseline gap-2">
-              <span className="text-2xl font-bold text-rose-600">{stats.critical}</span>
-              <span className="text-[11px] text-rose-500">theo cấu hình</span>
+              <span className="text-xl font-bold sm:text-2xl text-rose-600">{stats.critical}</span>
+              <span className="hidden text-[11px] text-rose-500 sm:inline">theo cấu hình</span>
             </div>
           </div>
 
-          <div className="rounded-xl border border-amber-200/80 bg-amber-50/50 p-3">
+          <div className="rounded-xl border border-amber-200/80 bg-amber-50/50 p-2.5 sm:p-3">
             <span className="flex items-center gap-1.5 text-[11px] font-semibold tracking-wider text-amber-700 uppercase">
               <span className="h-2 w-2 rounded-full bg-amber-500" />
-              Mức độ Cảnh báo
+              <span><span className="hidden sm:inline">Mức độ </span>Cảnh báo</span>
             </span>
             <div className="mt-1 flex items-baseline gap-2">
-              <span className="text-2xl font-bold text-amber-600">{stats.warning}</span>
-              <span className="text-[11px] text-amber-600">theo cấu hình</span>
+              <span className="text-xl font-bold sm:text-2xl text-amber-600">{stats.warning}</span>
+              <span className="hidden text-[11px] text-amber-600 sm:inline">theo cấu hình</span>
             </div>
           </div>
 
-          <div className="rounded-xl border border-slate-200/80 bg-slate-50/80 p-3">
+          <div className="rounded-xl border border-slate-200/80 bg-slate-50/80 p-2.5 sm:p-3">
             <span className="flex items-center gap-1.5 text-[11px] font-semibold tracking-wider text-slate-600 uppercase">
               <span className="h-2 w-2 rounded-full bg-slate-400" />
-              Mức độ Thông tin
+              <span><span className="hidden sm:inline">Mức độ </span>Thông tin</span>
             </span>
             <div className="mt-1 flex items-baseline gap-2">
-              <span className="text-2xl font-bold text-slate-800">{stats.info}</span>
-              <span className="text-[11px] text-slate-500">theo cấu hình</span>
+              <span className="text-xl font-bold sm:text-2xl text-slate-800">{stats.info}</span>
+              <span className="hidden text-[11px] text-slate-500 sm:inline">theo cấu hình</span>
             </div>
           </div>
 
-          <div className="col-span-2 rounded-xl border border-emerald-200/80 bg-emerald-50/50 p-3 sm:col-span-1">
+          <div className="col-span-2 rounded-xl border border-emerald-200/80 bg-emerald-50/50 p-2.5 sm:col-span-1 sm:p-3">
             <span className="text-[11px] font-semibold tracking-wider text-emerald-700 uppercase">
               Đã gửi Zalo / Telegram
             </span>
             <div className="mt-1 flex items-baseline gap-2">
-              <span className="text-2xl font-bold text-emerald-600">
+              <span className="text-xl font-bold sm:text-2xl text-emerald-600">
                 {stats.sentSuccess}/{stats.total}
               </span>
               <span className="text-[11px] font-medium text-emerald-700">thành công</span>
@@ -493,12 +505,13 @@ export function ClientAlerts({ project }: { project: Project }) {
       {/* Filter Toolbar */}
       <div className="shrink-0 border-b border-slate-200 bg-white px-3.5 py-2.5 sm:px-5 sm:py-3 lg:px-8">
         <div className="flex flex-wrap items-center justify-between gap-2.5 sm:gap-3">
-          <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+          <div className="grid w-full grid-cols-[minmax(0,1fr)_auto] gap-2 sm:flex sm:w-auto sm:min-w-0 sm:flex-1 sm:flex-wrap sm:items-center">
             {/* Chọn Tháng */}
             <CustomSelect
               value={selectedMonth}
               onChange={(e) => setSelectedMonth(e.target.value)}
-              className="h-9 rounded-xl border border-slate-200 bg-white px-2.5 text-xs font-semibold text-slate-800 outline-none focus:border-emerald-500"
+              aria-label="Chọn tháng"
+              className="h-9 w-full rounded-xl border border-slate-200 bg-white px-2.5 text-xs font-semibold text-slate-800 outline-none focus:border-emerald-500 sm:w-auto"
             >
               <option value="all">Tất cả các tháng</option>
               {availableMonths.map((m) => (
@@ -508,13 +521,29 @@ export function ClientAlerts({ project }: { project: Project }) {
               ))}
             </CustomSelect>
 
-            {/* Ô tìm kiếm */}
-            <div className="relative min-w-[180px] max-w-[300px] flex-1">
+            {/* Điện thoại: nút mở / đóng các bộ lọc chi tiết */}
+            <button
+              type="button"
+              onClick={() => setFiltersOpen((v) => !v)}
+              aria-expanded={filtersOpen}
+              className={`inline-flex h-9 items-center gap-1.5 rounded-xl border px-3 text-xs font-semibold transition-colors sm:hidden ${
+                filtersOpen || activeFilterCount > 0
+                  ? "border-emerald-500 bg-emerald-50 text-emerald-800"
+                  : "border-slate-200 bg-white text-slate-700"
+              }`}
+            >
+              <FilterIcon className="h-3.5 w-3.5" />
+              Bộ lọc{activeFilterCount > 0 ? ` (${activeFilterCount})` : ""}
+            </button>
+
+            {/* Ô tìm kiếm (chữ 16px trên điện thoại để Safari iOS không tự phóng to) */}
+            <div className="relative col-span-2 sm:max-w-[300px] sm:min-w-[180px] sm:flex-1">
               <input
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
                 placeholder="Tìm điểm đo, thông số, nội dung..."
-                className="h-9 w-full rounded-xl border border-slate-200 bg-slate-50/70 pr-3 pl-8 text-xs text-slate-800 transition-all outline-none placeholder:text-slate-400 focus:border-emerald-500 focus:bg-white focus:ring-1 focus:ring-emerald-500"
+                aria-label="Tìm cảnh báo"
+                className="h-9 w-full rounded-xl border border-slate-200 bg-slate-50/70 pr-3 pl-8 text-base sm:text-xs text-slate-800 transition-all outline-none placeholder:text-slate-400 focus:border-emerald-500 focus:bg-white focus:ring-1 focus:ring-emerald-500"
               />
               <SearchIcon className="pointer-events-none absolute top-1/2 left-2.5 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
               {search ? (
@@ -528,11 +557,14 @@ export function ClientAlerts({ project }: { project: Project }) {
               ) : null}
             </div>
 
+            <div
+              className={`${filtersOpen ? "grid" : "hidden"} col-span-2 grid-cols-2 gap-2 sm:contents [&>*]:min-w-0`}
+            >
             {/* Lọc theo Mức độ */}
             <CustomSelect
               value={selectedSeverity}
               onChange={(e) => setSelectedSeverity(e.target.value)}
-              className="h-9 rounded-xl border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 outline-none focus:border-emerald-500"
+              className="h-9 w-full rounded-xl border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 outline-none focus:border-emerald-500 sm:w-auto"
             >
               <option value="all">Tất cả mức độ</option>
               <option value="critical">Nghiêm trọng</option>
@@ -544,7 +576,7 @@ export function ClientAlerts({ project }: { project: Project }) {
             <CustomSelect
               value={selectedCategory}
               onChange={(e) => setSelectedCategory(e.target.value)}
-              className="h-9 rounded-xl border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 outline-none focus:border-emerald-500"
+              className="h-9 w-full rounded-xl border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 outline-none focus:border-emerald-500 sm:w-auto"
             >
               <option value="all">Tất cả nhóm thông số</option>
               <option value="frequency">Tần số</option>
@@ -560,7 +592,7 @@ export function ClientAlerts({ project }: { project: Project }) {
             <CustomSelect
               value={selectedPoint}
               onChange={(e) => setSelectedPoint(e.target.value)}
-              className="h-9 rounded-xl border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 outline-none focus:border-emerald-500"
+              className="h-9 w-full rounded-xl border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 outline-none focus:border-emerald-500 sm:w-auto"
             >
               <option value="all">Tất cả điểm đo</option>
               {points.map((p) => (
@@ -574,13 +606,14 @@ export function ClientAlerts({ project }: { project: Project }) {
             <CustomSelect
               value={selectedDelivery}
               onChange={(e) => setSelectedDelivery(e.target.value)}
-              className="h-9 rounded-xl border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 outline-none focus:border-emerald-500"
+              className="h-9 w-full rounded-xl border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 outline-none focus:border-emerald-500 sm:w-auto"
             >
               <option value="all">Tất cả trạng thái gửi</option>
               <option value="sent">Đã gửi Zalo / Telegram thành công</option>
               <option value="failed">Gửi thông báo thất bại</option>
               <option value="unconfigured">Chưa bật kênh gửi</option>
             </CustomSelect>
+            </div>
           </div>
 
           {/* Tóm tắt kênh nhận đang bật */}
@@ -904,6 +937,14 @@ function SearchIcon({ className }: { className?: string }) {
     >
       <circle cx="11" cy="11" r="8" />
       <line x1="21" y1="21" x2="16.65" y2="16.65" />
+    </svg>
+  );
+}
+
+function FilterIcon({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M3 5h18M6 12h12M10 19h4" />
     </svg>
   );
 }

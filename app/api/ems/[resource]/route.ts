@@ -90,6 +90,7 @@ const RESOURCE_NAMES = new Set([
   "notifications",
   "project-deletions",
   "alert-library",
+  "cost-library",
   "meter-replacements",
   "report-templates",
 ]);
@@ -216,6 +217,13 @@ function ensureAlertLibrarySchema() {
       });
   }
   return alertLibraryReady;
+}
+
+/** Thư viện chi phí: lưu chung bảng alert_library (dòng id = 'cost'), payload { templates: [...] }. */
+async function getCostLibrary() {
+  await ensureAlertLibrarySchema();
+  const [row] = await queryRows<Row>("SELECT payload FROM alert_library WHERE id = 'cost' LIMIT 1");
+  return jsonField<Record<string, unknown>>(row?.payload, {});
 }
 
 async function getAlertLibrary() {
@@ -602,6 +610,7 @@ async function getResource(resource: string, request: NextRequest) {
   }
   if (resource === "project-telemetry") return getProjectsListTelemetry();
   if (resource === "alert-library") return getAlertLibrary();
+  if (resource === "cost-library") return getCostLibrary();
   if (resource === "project-managers") {
     if (!projectId) throw new UserFacingError("Thiếu mã dự án.");
     await ensureAccountProjectsSchema();
@@ -1182,6 +1191,16 @@ async function saveResource(resource: string, body: Row) {
     const [previousDevice] = await queryRows<Row>("SELECT serial_number AS sn FROM devices WHERE id = ?", [
       asString(body.id),
     ]);
+    // Chỉ sửa "Hàm nhận dữ liệu" (tên, mô tả, đơn vị…): không đụng serial / model nên cho phép cả khi đang gắn dự án.
+    if (body.registersOnly === true) {
+      if (!previousDevice) throw new UserFacingError("Không tìm thấy đồng hồ.");
+      const registers = Array.isArray(body.registers) ? body.registers : [];
+      await emsDb.execute("UPDATE devices SET registers = ? WHERE id = ?", [
+        registers.length ? JSON.stringify(registers) : null,
+        asString(body.id),
+      ]);
+      return getResource(resource, new NextRequest("http://localhost/api/ems/devices"));
+    }
     if (previousDevice) {
       // Đồng hồ đang gắn vào điểm đo của dự án: khoá chỉnh sửa (đổi serial / model sẽ làm lệch dữ liệu đã đo).
       const linked = (await deviceProjectLinks()).get(asString(body.id)) ?? [];
@@ -1629,7 +1648,7 @@ export async function GET(request: NextRequest, context: Params) {
       if (!gate.ok || !gate.session) return forbidden();
       return Response.json(await listNotifications(gate.session));
     }
-    if (resource === "alert-library") {
+    if (resource === "alert-library" || resource === "cost-library") {
       const gate = await requirePermission("viewProjects");
       if (!gate.ok) return forbidden();
     }
@@ -1680,6 +1699,28 @@ export async function POST(request: NextRequest, context: Params) {
       const gate = await requirePermission("manageDevices");
       if (!gate.ok) return forbidden("Không có quyền chỉnh sửa thư viện cảnh báo.");
     }
+    if (resource === "cost-library") {
+      const gate = await requirePermission("manageDevices");
+      if (!gate.ok) return forbidden("Không có quyền chỉnh sửa thư viện chi phí.");
+      const body = (await request.json()) as Row;
+      await ensureAlertLibrarySchema();
+      const templates = (Array.isArray(body.templates) ? (body.templates as unknown[]) : [])
+        .filter((item): item is Row => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+        .map((item) => ({
+          id: asString(item.id).trim().slice(0, 64),
+          name: asString(item.name).trim().slice(0, 150),
+          meterType: asString(item.meterType).trim().slice(0, 100),
+          ...(item.electricity && typeof item.electricity === "object" ? { electricity: item.electricity } : {}),
+          ...(Array.isArray(item.bands) ? { bands: item.bands } : {}),
+        }))
+        .filter((item) => item.id && item.name && item.meterType);
+      await emsDb.execute(
+        `INSERT INTO alert_library (id, payload) VALUES ('cost', ?)
+         ON DUPLICATE KEY UPDATE payload = VALUES(payload)`,
+        [JSON.stringify({ templates })],
+      );
+      return Response.json(await getCostLibrary());
+    }
     if (resource === "report-templates") {
       const gate = await requirePermission("manageDevices");
       if (!gate.ok) return forbidden("Không có quyền chỉnh sửa thư viện báo cáo.");
@@ -1688,11 +1729,27 @@ export async function POST(request: NextRequest, context: Params) {
     const body = (await request.json()) as Row;
     if (resource === "alert-library") {
       await ensureAlertLibrarySchema();
-      const payload = {
-        categoriesByUtility:
-          body.categoriesByUtility && typeof body.categoriesByUtility === "object" ? body.categoriesByUtility : {},
-        alarmsByCategory: body.alarmsByCategory && typeof body.alarmsByCategory === "object" ? body.alarmsByCategory : {},
-      };
+      // Nhiều mẫu có tên theo loại điểm đo; dữ liệu cũ (một bộ ngưỡng) vẫn nhận để tương thích.
+      const payload = Array.isArray(body.templates)
+        ? {
+            templates: (body.templates as unknown[])
+              .filter((item): item is Row => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+              .map((item) => ({
+                id: asString(item.id).trim().slice(0, 64),
+                name: asString(item.name).trim().slice(0, 150),
+                meterType: asString(item.meterType).trim().slice(0, 100),
+                alarmsByCategory:
+                  item.alarmsByCategory && typeof item.alarmsByCategory === "object" && !Array.isArray(item.alarmsByCategory)
+                    ? item.alarmsByCategory
+                    : {},
+              }))
+              .filter((item) => item.id && item.name && item.meterType),
+          }
+        : {
+            categoriesByUtility:
+              body.categoriesByUtility && typeof body.categoriesByUtility === "object" ? body.categoriesByUtility : {},
+            alarmsByCategory: body.alarmsByCategory && typeof body.alarmsByCategory === "object" ? body.alarmsByCategory : {},
+          };
       await emsDb.execute(
         `INSERT INTO alert_library (id, payload) VALUES ('default', ?)
          ON DUPLICATE KEY UPDATE payload = VALUES(payload)`,

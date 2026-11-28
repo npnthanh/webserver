@@ -17,7 +17,15 @@ import {
   type TimeFilterValue,
 } from "@/components/client/TimeFilterBar";
 import { hydrateClientMeters, loadClientMeters, orderMetersByTree } from "@/lib/client-meters";
-import { loadProjectGatewayEnergySlots, type GatewayEnergySlot } from "@/lib/gateway-series";
+import {
+  loadProjectGatewayEnergySlots,
+  loadProjectGatewaySamples,
+  type GatewayEnergySlot,
+  type ProjectGatewaySample,
+} from "@/lib/gateway-series";
+import { declaredParamsForType, hydrateDevices, loadDevices, type CatalogDevice } from "@/lib/devices";
+import { consumptionUnitWith } from "@/lib/report-config";
+import { priceAt, readUtilityBands, type UtilityBand } from "@/lib/utility-tariff";
 import {
   formatTariffPrice,
   parseTariffPrice,
@@ -43,6 +51,7 @@ type CostPoint = {
   name: string;
   energy: string;
   color: string;
+  deviceId?: string;
 };
 
 const POINT_COLORS = ["#059669", "#10b981", "#e67e22", "#8b5cf6", "#06b6d4", "#ef4444", "#a16207"];
@@ -219,6 +228,68 @@ function costBarsFromSlots(filter: TimeFilterValue, slots: GatewayEnergySlot[], 
   };
 }
 
+type BandCost = { id: string; label: string; range: string; price: number; amount: number; cost: number };
+
+/**
+ * Loại không phải điện: mỗi lần chỉ số cộng dồn tăng, phần tăng tính theo đơn giá của khung giờ tại thời điểm
+ * đọc (giờ Việt Nam). Chỉ số giảm (thay / reset đồng hồ) thì bắt đầu lại, không trừ ra âm.
+ */
+function utilityCostFromSamples(
+  filter: TimeFilterValue,
+  samples: { at: string; values: Record<string, number> }[],
+  indexKey: string | undefined,
+  bands: UtilityBand[],
+) {
+  const bars: CostBar[] = getTimeFilterPeriods(filter).map((period) => ({
+    key: period.key,
+    label: period.label,
+    light: 0,
+    dark: 0,
+  }));
+  const byBand = new Map<string, BandCost>();
+  for (const band of bands) {
+    byBand.set(band.id, {
+      id: band.id,
+      label: band.label || "Khung giờ",
+      range: `${band.from}–${band.to}`,
+      price: priceAt([band], Number(band.from.slice(0, 2)) || 0, Number(band.from.slice(3, 5)) || 0)?.price ?? 0,
+      amount: 0,
+      cost: 0,
+    });
+  }
+  let previous: number | null = null;
+  let amount = 0;
+  let last: number | null = null;
+  let count = 0;
+  const days = new Set<string>();
+  for (const sample of samples) {
+    const value = indexKey ? sample.values[indexKey] : undefined;
+    if (typeof value !== "number" || !Number.isFinite(value)) continue;
+    count += 1;
+    const bucket = periodIndexForInstant(filter, sample.at, bars.length);
+    if (bucket >= 0) bars[bucket].light += 1;
+    const parts = vietnamFromStored(sample.at);
+    if (parts) days.add(parts.date);
+    if (previous !== null && value > previous) {
+      const delta = value - previous;
+      const hit = parts ? priceAt(bands, parts.hour, parts.minute) : null;
+      const cost = delta * (hit?.price ?? 0);
+      if (bucket >= 0) bars[bucket].dark += cost;
+      const key = hit?.band.id ?? "none";
+      const entry =
+        byBand.get(key) ??
+        { id: "none", label: "Ngoài khung giờ", range: "—", price: 0, amount: 0, cost: 0 };
+      entry.amount += delta;
+      entry.cost += cost;
+      byBand.set(key, entry);
+      amount += delta;
+    }
+    previous = value;
+    last = value;
+  }
+  return { bars, bands: [...byBand.values()], amount, last, count, days: days.size };
+}
+
 function costLabel(energy: string) {
   if (energy === "Nhiệt") return "Chi phí nhiệt năng";
   if (energy === "Khí nén") return "Chi phí khí nén";
@@ -256,6 +327,9 @@ export function CostCharts() {
   const [touPrices, setTouPrices] = useState<TouPrices>(() => resolveTouPrices("kv-under-6").prices);
   const [savedCostConfig, setSavedCostConfig] = useState<SavedElectricityCostConfig | undefined>(undefined);
   const [flatPrices, setFlatPrices] = useState<Record<string, number>>({});
+  // Loại không phải điện: sản lượng lấy từ chỉ số "Cộng dồn" của đồng hồ (mẫu gateway trong kỳ).
+  const [devices, setDevices] = useState<CatalogDevice[]>(loadDevices);
+  const [utilitySamples, setUtilitySamples] = useState<ProjectGatewaySample[]>([]);
   const [reloadKey, setReloadKey] = useState(0);
   const [pointsOpen, setPointsOpen] = useState(false);
   const [range, setRange] = useState({ start: 0, end: 30 });
@@ -321,6 +395,7 @@ export function CostCharts() {
             name: meter.name,
             energy: meter.utility,
             color: POINT_COLORS[index % POINT_COLORS.length],
+            deviceId: meter.deviceId ?? undefined,
           })),
         );
       });
@@ -370,6 +445,39 @@ export function CostCharts() {
     };
   }, [projectId, timeFilter, reloadKey]);
 
+  const isElectric = energy === "Điện";
+
+  useEffect(() => {
+    const reloadDevices = () => void hydrateDevices().then(setDevices);
+    reloadDevices();
+    window.addEventListener("ems-devices-changed", reloadDevices);
+    return () => window.removeEventListener("ems-devices-changed", reloadDevices);
+  }, []);
+
+  useEffect(() => {
+    if (isElectric) return;
+    let active = true;
+    const span = timeFilterSpan(timeFilter);
+    void loadProjectGatewaySamples(projectId, { from: span.from, to: span.to }).then((rows) => {
+      if (active) setUtilitySamples(rows);
+    });
+    return () => {
+      active = false;
+    };
+  }, [projectId, timeFilter, reloadKey, isElectric]);
+
+  const declaredParams = useMemo(
+    () => (isElectric ? [] : declaredParamsForType(devices, energy)),
+    [devices, energy, isElectric],
+  );
+  /** Khung giờ tính chi phí của loại đang xem (Cấu hình → Chi phí). */
+  const utilityBands = useMemo(
+    () => (isElectric ? [] : readUtilityBands(savedCostConfig, energy)),
+    [isElectric, savedCostConfig, energy],
+  );
+  /** Đơn vị sản lượng (Điện: kWh; loại khác: theo chỉ số cộng dồn đã khai báo). */
+  const amountUnit = isElectric ? "kWh" : consumptionUnitWith(energy, declaredParams) || "đơn vị";
+
   const pointsForEnergy = useMemo(
     () => allPoints.filter((p) => p.energy === energy),
     [allPoints, energy],
@@ -410,8 +518,35 @@ export function CostCharts() {
   }, [energy, flatPrices, savedCostConfig, touPrices]);
 
   const series = useMemo(
-    () =>
-      selectedPoints.map((point) => {
+    () => {
+      if (!isElectric) {
+        // Chi phí = phần chỉ số cộng dồn tăng thêm × đơn giá của khung giờ tại thời điểm tăng.
+        return selectedPoints.map((point) => {
+          const device = point.deviceId ? devices.find((item) => item.id === point.deviceId) : undefined;
+          const indexKey = device?.registers?.find((row) => row.cumulative && row.address?.trim())?.address.trim();
+          const result = utilityCostFromSamples(
+            timeFilter,
+            utilitySamples
+              .filter((sample) => sample.meterPointId === point.id)
+              .sort((a, b) => a.at.localeCompare(b.at)),
+            indexKey,
+            utilityBands,
+          );
+          const cost = result.bands.reduce((sum, band) => sum + band.cost, 0);
+          return {
+            point,
+            bars: result.bars,
+            tou: { ...emptyKwh(), normal: cost },
+            kwh: { ...emptyKwh(), normal: result.amount },
+            sampleDays: result.days,
+            slotCount: result.count,
+            lastIndexKwh: result.last ?? 0,
+            hasIndex: Boolean(indexKey),
+            bandCosts: result.bands,
+          };
+        });
+      }
+      return selectedPoints.map((point) => {
         const result = costBarsFromSlots(
           timeFilter,
           slots.filter((slot) => slot.meterPointId === point.id),
@@ -425,10 +560,28 @@ export function CostCharts() {
           sampleDays: result.sampleDays,
           slotCount: result.slotCount,
           lastIndexKwh: result.lastIndexKwh,
+          hasIndex: true,
+          bandCosts: [] as BandCost[],
         };
-      }),
-    [rateSource, slots, selectedPoints, timeFilter],
+      });
+    },
+    [rateSource, slots, selectedPoints, timeFilter, isElectric, devices, utilitySamples, utilityBands],
   );
+  /** Chi phí theo khung giờ, gộp các điểm đo đang chọn (loại không phải điện). */
+  const bandTotals = useMemo(() => {
+    const map = new Map<string, BandCost>();
+    for (const item of series) {
+      for (const band of item.bandCosts) {
+        const current = map.get(band.id) ?? { ...band, amount: 0, cost: 0 };
+        current.amount += band.amount;
+        current.cost += band.cost;
+        map.set(band.id, current);
+      }
+    }
+    return [...map.values()].filter((band) => band.id !== "none" || band.amount > 0);
+  }, [series]);
+  /** Điểm đo không phải điện chưa chọn chỉ số tính sản lượng (chi phí sẽ bằng 0). */
+  const pointsWithoutIndex = isElectric ? [] : series.filter((item) => !item.hasIndex).map((item) => item.point);
 
   const primaryBars = series[0]?.bars ?? costSeriesForFilter(timeFilter);
   const barCount = primaryBars.length;
@@ -710,6 +863,15 @@ export function CostCharts() {
             <div className="flex items-start justify-between gap-3">
               <div>
                 <h2 className="text-[15px] font-semibold text-slate-800">Chi tiết chi phí</h2>
+                {!isElectric && (pointsWithoutIndex.length > 0 || utilityBands.every((band) => !band.price.trim())) ? (
+                  <p className="mt-1 rounded-md bg-amber-50 px-2.5 py-1.5 text-[11.5px] text-amber-800">
+                    {utilityBands.every((band) => !band.price.trim()) ? `Chưa đặt đơn giá ${energy.toLowerCase()}. ` : ""}
+                    {pointsWithoutIndex.length > 0
+                      ? `Chưa chọn chỉ số tính sản lượng cho: ${pointsWithoutIndex.map((point) => point.name).join(", ")}. `
+                      : ""}
+                    Cài ở Cấu hình → Chi phí → {energy}.
+                  </p>
+                ) : null}
                 <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[12px] text-slate-600">
                   {selectedPoints.length === 0 ? (
                     <span className="text-slate-400">Chọn điểm đo bên trái</span>
@@ -879,7 +1041,49 @@ export function CostCharts() {
                   Tiền điện năng trước thuế. Chưa gồm VAT và công suất phản kháng.
                 </p>
               </article>
-            ) : null}
+            ) : (
+              <article className="min-w-0 rounded-lg border border-slate-200 bg-white p-4 shadow-[0_1px_2px_rgba(16,24,40,0.04)]">
+                <h2 className="text-center text-[13px] font-bold tracking-wide text-slate-700">
+                  TIỀN {energy.toUpperCase()} THEO KHUNG GIỜ
+                </h2>
+                <table className="mt-3 w-full text-left text-[11px]">
+                  <thead className="text-slate-400">
+                    <tr>
+                      <th className="py-1 font-semibold">Khung giờ</th>
+                      <th className="py-1 text-right font-semibold">Sản lượng ({amountUnit})</th>
+                      <th className="py-1 text-right font-semibold">Đơn giá</th>
+                      <th className="py-1 text-right font-semibold">Thành tiền</th>
+                    </tr>
+                  </thead>
+                  <tbody className="text-slate-700">
+                    {bandTotals.map((band) => (
+                      <tr key={band.id} className="border-t border-slate-100">
+                        <td className="py-1.5">
+                          {band.label}
+                          <span className="block text-[10px] text-slate-400">{band.range}</span>
+                        </td>
+                        <td className="py-1.5 text-right font-mono">{formatKwh(band.amount)}</td>
+                        <td className="py-1.5 text-right font-mono">{formatVnd(band.price)}</td>
+                        <td className="py-1.5 text-right font-mono">{formatVnd(band.cost)}</td>
+                      </tr>
+                    ))}
+                    <tr className="border-t border-slate-200 font-semibold text-slate-800">
+                      <td className="py-1.5">Tổng</td>
+                      <td className="py-1.5 text-right font-mono">
+                        {formatKwh(bandTotals.reduce((sum, band) => sum + band.amount, 0))}
+                      </td>
+                      <td />
+                      <td className="py-1.5 text-right font-mono">
+                        {formatVnd(bandTotals.reduce((sum, band) => sum + band.cost, 0))}
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+                <p className="mt-2 text-[11px] leading-relaxed text-slate-400">
+                  Khung giờ và đơn giá cài ở Cấu hình → Chi phí → {energy}.
+                </p>
+              </article>
+            )}
           </div>
         </div>
 
@@ -888,7 +1092,7 @@ export function CostCharts() {
             <span className={`h-2.5 w-2.5 rounded-full ${grandTotal > 0 ? "bg-emerald-500" : "bg-slate-300"}`} />
             {`Tổng chi phí kỳ lọc: ${formatVnd(grandTotal)} VNĐ · Tổng sản lượng: ${formatKwh(
               kwh.normal + kwh.off + kwh.peak + kwh.none,
-            )} kWh`}
+            )} ${amountUnit}`}
           </p>
         </div>
       </div>

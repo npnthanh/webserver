@@ -125,6 +125,11 @@ export function GhgConfig({ projectId }: { projectId: string }) {
   const metersLoading = metersProjectId !== projectId;
   const [formOpen, setFormOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const editFormRef = useRef<HTMLElement>(null);
+  // Khung sửa nằm phía trên bảng: bấm "Sửa" ở một dòng thì cuộn lên khung sửa (sau khi khung đã hiện ra).
+  useEffect(() => {
+    if (editingId) editFormRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, [editingId]);
   const [dropHover, setDropHover] = useState(false);
   const formulaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -495,6 +500,7 @@ export function GhgConfig({ projectId }: { projectId: string }) {
 
       <div className="grid items-start gap-5">
         <section
+          ref={editFormRef}
           id="them-nguon-phat-thai"
           onDragOver={(e) => {
             e.preventDefault();
@@ -509,7 +515,7 @@ export function GhgConfig({ projectId }: { projectId: string }) {
             const group = groups.find((item) => item.id === id);
             if (group) applyGroup(group);
           }}
-          className={`rounded-xl border bg-white p-6 shadow-[0_1px_2px_rgba(16,24,40,0.04)] transition-colors ${
+          className={`scroll-mt-20 rounded-xl border bg-white p-6 shadow-[0_1px_2px_rgba(16,24,40,0.04)] transition-colors ${
             dropHover ? "border-emerald-500 ring-2 ring-emerald-500/15" : "border-slate-200"
           }`}
         >

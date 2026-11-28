@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { CustomSelect } from "@/components/ui/CustomSelect";
-import { useEffect, useMemo, useState, type DragEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type DragEvent, type ReactNode } from "react";
 import {
   buildMeterDepthMap,
   hydrateClientMeters,
@@ -27,8 +27,16 @@ import {
   type CustomerAccount,
   type CustomerBranchRole,
 } from "@/lib/customer-accounts";
-import { loadDevices, type CatalogDevice } from "@/lib/devices";
+import {
+  declaredParamsForType,
+  hydrateDevices,
+  loadDevices,
+  updateDeviceRegisters,
+  type CatalogDevice,
+} from "@/lib/devices";
 import { vietnamNow } from "@/lib/vietnam-time";
+import { bandIssues, defaultUtilityBands, readUtilityBands, type UtilityBand } from "@/lib/utility-tariff";
+import { loadCostTemplates, type CostTemplate } from "@/lib/cost-library";
 import { hasPermission, isAdminRole } from "@/lib/permissions";
 import { hydrateProjects, loadProjects, resolveMeterTypes, type Project } from "@/lib/projects";
 import {
@@ -62,6 +70,12 @@ import {
   type UserAlertRule,
 } from "@/lib/alert-config";
 import { hydrateAlertEvents } from "@/lib/alert-events";
+import {
+  alertGroupIdsForUtility,
+  loadAlertTemplates,
+  utilityForAlertGroup,
+  type AlertTemplate,
+} from "@/lib/alert-library";
 import { loadProjectGatewayLatest } from "@/lib/gateway-series";
 import { METER_PARAMETERS, readMeterValue } from "@/lib/meter-parameters";
 import { hydrateProjectSettings, saveProjectSettings, type ProjectSettingsPayload } from "@/lib/project-settings";
@@ -71,6 +85,8 @@ import {
   allTabKeys,
   chartParametersForSave,
   readChartParameterConfig,
+  readUtilityChartHidden,
+  type UtilityChartHidden,
   type ChartParameterConfig,
   type ChartParamTabId,
 } from "@/lib/chart-parameters";
@@ -91,9 +107,9 @@ const NAV: { id: TabId; n: number; label: string; icon: NavIconType }[] = [
 
 const FALLBACK_UTILITIES = ["Điện", "Nước", "Nhiệt", "Hơi"];
 
-type Slot = { id: string; name: string; color: string; from: string; to: string; price: string };
+export type Slot = { id: string; name: string; color: string; from: string; to: string; price: string };
 /** `none`: đơn giá phần điện năng "Không xác định" khung giờ; bỏ trống = theo giá giờ bình thường. */
-type TouPriceInputs = Record<TouBand, string> & { none: string };
+export type TouPriceInputs = Record<TouBand, string> & { none: string };
 type SavedProjectConfig = {
   classify?: string;
   startTime?: string;
@@ -128,13 +144,16 @@ type SavedCostConfig = {
   slots?: Slot[];
   tariffHistory?: TariffHistoryEntry[];
   flatPrices?: Record<string, string>;
+  utilityBands?: Record<string, UtilityBand[]>;
+  /** Mẫu Thư viện chi phí đã chọn cho từng loại điểm đo. */
+  templateByUtility?: Record<string, string>;
   electricity?: {
     voltageLevel?: VoltageLevelId;
     prices?: Partial<TouPriceInputs>;
   };
 };
 
-function tariffInputs(levelId: string | undefined): TouPriceInputs {
+export function tariffInputs(levelId: string | undefined): TouPriceInputs {
   const prices = pricesForLevel(levelId);
   return {
     normal: formatTariffPrice(prices.normal),
@@ -150,6 +169,7 @@ export function ClientConfig() {
   const [tab, setTab] = useState<TabId>("meters");
   const [chartConfig, setChartConfig] = useState<ChartParameterConfig>({});
   const [chartShowMarkers, setChartShowMarkers] = useState(false);
+  const [chartUtilityHidden, setChartUtilityHidden] = useState<UtilityChartHidden>({});
   const [openParams, setOpenParams] = useState(true);
   const [saved, setSaved] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -164,6 +184,11 @@ export function ClientConfig() {
   const [savedTariffBaseline, setSavedTariffBaseline] = useState<TariffHistoryEntry | null>(null);
   const [applyDate, setApplyDate] = useState("");
   const [flatPrices, setFlatPrices] = useState<Record<string, string>>({});
+  /** Khung giờ tính chi phí theo loại không phải điện (chưa cấu hình = 1 khung cả ngày theo đơn giá cũ). */
+  const [utilityBands, setUtilityBands] = useState<Record<string, UtilityBand[]>>({});
+  const [costTemplates, setCostTemplates] = useState<CostTemplate[]>([]);
+  const [costTemplateByUtility, setCostTemplateByUtility] = useState<Record<string, string>>({});
+  const [costTemplateNotice, setCostTemplateNotice] = useState("");
   const [voltageLevel, setVoltageLevel] = useState<VoltageLevelId>(DEFAULT_VOLTAGE_LEVEL);
   const [touPrices, setTouPrices] = useState<TouPriceInputs>(() => tariffInputs(DEFAULT_VOLTAGE_LEVEL));
   const [accounts, setAccounts] = useState<CustomerAccount[]>(() =>
@@ -209,6 +234,10 @@ export function ClientConfig() {
     DEFAULT_USER_ALERT_CATEGORIES.map((item) => ({ ...item })),
   );
   const [activeAlertGroupId, setActiveAlertGroupId] = useState<UserAlertGroupId>("energy");
+  /** Thư viện cảnh báo của dự án (alertConfig do quản trị viên / mẫu thư viện) — để chọn mẫu theo loại điểm đo. */
+  const [adminAlertConfig, setAdminAlertConfig] = useState<Record<string, unknown>>({});
+  const [alertTemplates, setAlertTemplates] = useState<AlertTemplate[]>([]);
+  const [alertUtility, setAlertUtility] = useState("Điện");
   const [alertRulesByGroup, setAlertRulesByGroup] = useState<Record<string, UserAlertRule[]>>(() =>
     cloneDefaultRulesByGroup(),
   );
@@ -261,6 +290,7 @@ export function ClientConfig() {
 
   function applyCostSettings(settings: ProjectSettingsPayload, types: string[] = utilities) {
     setChartConfig(readChartParameterConfig(settings));
+    setChartUtilityHidden(readUtilityChartHidden(settings as Record<string, unknown>));
     setChartShowMarkers(readChartShowMarkers(settings));
     const savedProject = settings.projectConfig as SavedProjectConfig | undefined;
     if (savedProject) {
@@ -276,10 +306,13 @@ export function ClientConfig() {
     }
 
     const savedAlerts = settings.alertsConfig as SavedAlertsConfig | undefined;
-    const normalized = normalizeAlertConfig(
-      savedAlerts,
-      (settings as Record<string, unknown>).alertConfig,
+    const rawAdminAlert = (settings as Record<string, unknown>).alertConfig;
+    setAdminAlertConfig(
+      rawAdminAlert && typeof rawAdminAlert === "object" && !Array.isArray(rawAdminAlert)
+        ? (rawAdminAlert as Record<string, unknown>)
+        : {},
     );
+    const normalized = normalizeAlertConfig(savedAlerts, rawAdminAlert);
     setAlertClassify(normalized.classify ?? "Cấu hình ngưỡng theo thông số đo");
     setAlertCategories(normalized.categories);
     setActiveAlertGroupId((current) =>
@@ -299,6 +332,8 @@ export function ClientConfig() {
       setTariffHistory([]);
       setSavedTariffBaseline(null);
       setFlatPrices({});
+      setUtilityBands({});
+      setCostTemplateByUtility({});
       setVoltageLevel(DEFAULT_VOLTAGE_LEVEL);
       setTouPrices(tariffInputs(DEFAULT_VOLTAGE_LEVEL));
       return;
@@ -322,6 +357,12 @@ export function ClientConfig() {
     setSlots(savedCost.slots?.length ? savedCost.slots.map((slot) => ({ ...slot })) : []);
     setTariffHistory(savedCost.tariffHistory?.length ? savedCost.tariffHistory.map((h) => ({ ...h })) : []);
     setFlatPrices(savedCost.flatPrices ? { ...savedCost.flatPrices } : {});
+    setUtilityBands(
+      Object.fromEntries(
+        Object.keys(savedCost.utilityBands ?? {}).map((name) => [name, readUtilityBands(savedCost, name)]),
+      ),
+    );
+    setCostTemplateByUtility(savedCost.templateByUtility ? { ...savedCost.templateByUtility } : {});
     const tariff = resolveTouPrices(savedCost.electricity?.voltageLevel, savedCost.electricity?.prices);
     setVoltageLevel(tariff.levelId);
     const savedUnknown = parseTariffPrice(savedCost.electricity?.prices?.none);
@@ -367,7 +408,85 @@ export function ClientConfig() {
       .then((settings) => applyCostSettings(settings))
       .catch(() => undefined);
     setDevices(loadDevices());
+    void hydrateDevices().then(setDevices);
+    void loadAlertTemplates()
+      .then(setAlertTemplates)
+      .catch(() => undefined);
+    void loadCostTemplates()
+      .then(setCostTemplates)
+      .catch(() => undefined);
   }, [projectId]);
+
+  useEffect(() => {
+    const reloadDevices = () => setDevices(loadDevices());
+    window.addEventListener("ems-devices-changed", reloadDevices);
+    return () => window.removeEventListener("ems-devices-changed", reloadDevices);
+  }, []);
+
+  /**
+   * Áp mẫu thư viện cảnh báo cho một loại điểm đo: thay nhóm ngưỡng của loại đó trong thư viện cảnh báo của dự án
+   * (alertConfig), giữ nguyên các loại khác và phần khách đã chỉnh (bật/tắt, mức độ, ngưỡng riêng điểm đo).
+   */
+  const applyAlertTemplate = async (utilityName: string, template: AlertTemplate) => {
+    const groupIds = alertGroupIdsForUtility(utilityName);
+    const rawAlarms = adminAlertConfig.alarmsByCategory;
+    // Dự án chưa từng lưu thư viện riêng = đang dùng bộ ngưỡng điện mặc định: giữ bộ đó cho các loại khác.
+    const baseAlarms: Record<string, unknown[]> =
+      rawAlarms && typeof rawAlarms === "object" && !Array.isArray(rawAlarms)
+        ? { ...(rawAlarms as Record<string, unknown[]>) }
+        : (cloneDefaultRulesByGroup() as Record<string, unknown[]>);
+    for (const id of groupIds) delete baseAlarms[id];
+    for (const id of groupIds) baseAlarms[id] = [];
+    for (const [id, list] of Object.entries(template.alarmsByCategory)) baseAlarms[id] = list;
+
+    const rawCategories = adminAlertConfig.categoriesByUtility;
+    const categoriesByUtility: Record<string, Array<{ id: string; label: string }>> =
+      rawCategories && typeof rawCategories === "object" && !Array.isArray(rawCategories)
+        ? { ...(rawCategories as Record<string, Array<{ id: string; label: string }>>) }
+        : {};
+    if (!categoriesByUtility[utilityName]?.length && utilityName !== "Điện") {
+      categoriesByUtility[utilityName] = Object.keys(template.alarmsByCategory)
+        .concat(groupIds)
+        .filter((id, index, list) => list.indexOf(id) === index)
+        .map((id) => ({ id, label: utilityName }));
+    }
+    const rawTemplateByUtility = adminAlertConfig.templateByUtility;
+    const nextAdmin: Record<string, unknown> = {
+      ...adminAlertConfig,
+      alarmsByCategory: baseAlarms,
+      categoriesByUtility,
+      templateByUtility: {
+        ...(rawTemplateByUtility && typeof rawTemplateByUtility === "object" ? (rawTemplateByUtility as Record<string, string>) : {}),
+        [utilityName]: template.id,
+      },
+    };
+    await saveProjectSettings(projectId, { alertConfig: nextAdmin });
+    setAdminAlertConfig(nextAdmin);
+    const normalized = normalizeAlertConfig(
+      { activeGroupId: activeAlertGroupId, ruleOverrides: buildRuleOverrides(alertRulesByGroup) },
+      nextAdmin,
+    );
+    setAlertCategories(normalized.categories);
+    setAlertRulesByGroup(normalized.rulesByGroup);
+  };
+
+  /** Điền biểu giá của mẫu Thư viện chi phí vào form của loại đang chọn (bấm Lưu cấu hình để áp dụng). */
+  const applyCostTemplate = (template: CostTemplate) => {
+    if (template.meterType === "Điện" && template.electricity) {
+      const levelId = template.electricity.voltageLevel as VoltageLevelId;
+      setVoltageLevel(levelId);
+      setTouPrices({ ...tariffInputs(levelId), ...template.electricity.prices });
+      setSlots(template.electricity.slots.map((slot) => ({ ...slot })));
+    } else {
+      setUtilityBands((current) => ({
+        ...current,
+        [template.meterType]: (template.bands?.length ? template.bands : defaultUtilityBands()).map((band) => ({ ...band })),
+      }));
+    }
+    setCostTemplateByUtility((current) => ({ ...current, [template.meterType]: template.id }));
+    setCostTemplateNotice(`Đã điền biểu giá theo mẫu "${template.name}". Bấm Lưu cấu hình để áp dụng cho dự án.`);
+    window.setTimeout(() => setCostTemplateNotice(""), 5000);
+  };
 
   const markSaved = async () => {
     setSaveError("");
@@ -448,6 +567,7 @@ export function ClientConfig() {
         const stored = await saveProjectSettings(projectId, {
           chartParameters: chartParametersForSave(chartConfig),
           chartShowMarkers,
+          chartUtilityHidden,
         });
         applyCostSettings(stored);
       } else if (tab === "cost") {
@@ -486,7 +606,13 @@ export function ClientConfig() {
             applyDate: effectiveDate,
             slots,
             tariffHistory: nextHistory,
-            flatPrices,
+            // Đơn giá cố định cũ = giá khung đầu tiên (các trang chưa tính theo khung giờ vẫn dùng được).
+            flatPrices: {
+              ...flatPrices,
+              ...Object.fromEntries(Object.entries(utilityBands).map(([name, bands]) => [name, bands[0]?.price ?? ""])),
+            },
+            utilityBands,
+            templateByUtility: costTemplateByUtility,
             electricity: {
               voltageLevel,
               prices: touPrices,
@@ -592,22 +718,10 @@ export function ClientConfig() {
 
       <div className="min-w-0 flex-1 overflow-y-auto p-3 sm:p-4 lg:p-5">
         <section className="rounded-lg border border-slate-200 bg-white p-3.5 shadow-[0_1px_2px_rgba(16,24,40,0.04)] sm:p-5 lg:p-6">
-          <div className="mb-4 sm:mb-5 flex items-start justify-between gap-3">
-            <div>
-              <h2 className="text-lg sm:text-[22px] font-bold text-slate-800">{meta.title}</h2>
-              <p className="mt-1 text-xs sm:text-sm text-slate-500">{meta.hint}</p>
-            </div>
-            {tab === "accounts" || canEditConfig ? (
-              <button
-                type="button"
-                title="Lưu"
-                onClick={() => void markSaved()}
-                disabled={saving || (tab !== "accounts" && !canEditConfig)}
-                className="flex h-9 w-9 items-center justify-center rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 shadow-xs transition-colors disabled:opacity-60"
-              >
-                {tab === "accounts" ? <FileIcon /> : <SaveIcon />}
-              </button>
-            ) : null}
+          {/* Chỉ còn nút "Lưu cấu hình" ở cuối khung (nút lưu nhỏ ở góc trên trùng chức năng nên đã bỏ). */}
+          <div className="mb-4 sm:mb-5">
+            <h2 className="text-lg sm:text-[22px] font-bold text-slate-800">{meta.title}</h2>
+            <p className="mt-1 text-xs sm:text-sm text-slate-500">{meta.hint}</p>
           </div>
 
           {tab !== "accounts" && !canEditConfig ? (
@@ -679,8 +793,60 @@ export function ClientConfig() {
                   setTouPrices((current) => ({ ...tariffInputs(levelId), none: current.none }));
                 }}
                 onTouPrice={(band, value) => setTouPrices((current) => ({ ...current, [band]: value }))}
-                flatPrice={flatPrices[utility]}
-                onFlatPrice={(value) => setFlatPrices((current) => ({ ...current, [utility]: value }))}
+                bands={utilityBands[utility] ?? defaultUtilityBands(flatPrices[utility] ?? "")}
+                onBands={(next) => setUtilityBands((current) => ({ ...current, [utility]: next }))}
+                templatePicker={
+                  <div className="mt-4 rounded-lg border border-emerald-100 bg-emerald-50/50 px-4 py-3">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="text-[13px] font-semibold text-slate-800">Mẫu chi phí áp dụng ({utility})</p>
+                        <p className="text-[11px] text-slate-500">
+                          Chọn mẫu trong Thư viện chi phí để điền sẵn biểu giá; vẫn chỉnh tay được trước khi lưu.
+                        </p>
+                      </div>
+                      <div className="w-full sm:w-72">
+                        <CustomSelect
+                          value={costTemplateByUtility[utility] ?? ""}
+                          onChange={(e) => {
+                            const picked = costTemplates.find((item) => item.id === e.target.value);
+                            if (picked) applyCostTemplate(picked);
+                          }}
+                          className="h-10 w-full rounded-md border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none focus:border-emerald-500"
+                        >
+                          <option value="">
+                            {costTemplates.some((item) => item.meterType === utility)
+                              ? "-- Chọn mẫu từ Thư viện chi phí --"
+                              : "Thư viện chưa có mẫu cho loại này"}
+                          </option>
+                          {costTemplates
+                            .filter((item) => item.meterType === utility)
+                            .map((item) => (
+                              <option key={item.id} value={item.id}>
+                                {item.name}
+                              </option>
+                            ))}
+                        </CustomSelect>
+                      </div>
+                    </div>
+                    {costTemplateNotice ? (
+                      <p className="mt-2 text-[12px] font-medium text-emerald-700">{costTemplateNotice}</p>
+                    ) : null}
+                  </div>
+                }
+                indexSources={meters
+                  .filter((meter) => meter.utility === utility)
+                  .map((meter) => ({
+                    meter,
+                    device: meter.deviceId ? devices.find((item) => item.id === meter.deviceId) : undefined,
+                  }))}
+                onPickIndex={async (device, key) => {
+                  // Đánh dấu "Cộng dồn" cho đúng một thông số của đồng hồ (lưu ngay vào Hàm nhận dữ liệu).
+                  const registers = (device.registers ?? []).map((row) => ({
+                    ...row,
+                    cumulative: key !== "" && row.address.trim() === key,
+                  }));
+                  setDevices(await updateDeviceRegisters(device.id, registers));
+                }}
               />
             ) : null}
 
@@ -688,6 +854,10 @@ export function ClientConfig() {
               <ChartParamsPanel
                 config={chartConfig}
                 onChange={setChartConfig}
+                utilities={utilities}
+                devices={devices}
+                utilityHidden={chartUtilityHidden}
+                onUtilityHidden={setChartUtilityHidden}
                 showMarkers={chartShowMarkers}
                 onShowMarkers={setChartShowMarkers}
               />
@@ -702,6 +872,12 @@ export function ClientConfig() {
                 onActiveGroup={setActiveAlertGroupId}
                 rulesByGroup={alertRulesByGroup}
                 onRulesByGroupChange={setAlertRulesByGroup}
+                utilities={utilities}
+                alertUtility={utilities.includes(alertUtility) ? alertUtility : utilities[0] ?? "Điện"}
+                onAlertUtility={setAlertUtility}
+                templates={alertTemplates}
+                adminAlertConfig={adminAlertConfig}
+                onApplyTemplate={applyAlertTemplate}
                 meters={meters}
                 liveMeterValues={liveMeterValues}
                 severityByCategory={severityByCategory}
@@ -1326,7 +1502,7 @@ function applyMeterDrop(
   return next;
 }
 
-function CostPanel({
+export function CostPanel({
   utility,
   utilities,
   onUtility,
@@ -1340,8 +1516,12 @@ function CostPanel({
   onTariffHistoryChange,
   onVoltageLevel,
   onTouPrice,
-  flatPrice,
-  onFlatPrice,
+  bands,
+  onBands,
+  indexSources,
+  onPickIndex,
+  libraryMode = false,
+  templatePicker,
 }: {
   utility: Utility;
   utilities: string[];
@@ -1356,10 +1536,19 @@ function CostPanel({
   onTariffHistoryChange: (next: TariffHistoryEntry[]) => void;
   onVoltageLevel: (levelId: VoltageLevelId) => void;
   onTouPrice: (band: TouBand | "none", value: string) => void;
-  flatPrice?: string;
-  onFlatPrice: (value: string) => void;
+  /** Khung giờ tính chi phí (loại không phải điện). */
+  bands: UtilityBand[];
+  onBands: (next: UtilityBand[]) => void;
+  /** Điểm đo của loại đang cấu hình + đồng hồ gắn vào (để chọn chỉ số tính sản lượng). */
+  indexSources: { meter: ClientMeter; device?: CatalogDevice }[];
+  onPickIndex: (device: CatalogDevice, key: string) => Promise<void>;
+  /** Trang Thư viện chi phí: chỉ sửa biểu giá (ẩn tab loại, ngày áp dụng, lịch sử mốc, chỉ số tính sản lượng). */
+  libraryMode?: boolean;
+  /** Ô chọn mẫu thư viện (trang Chi phí của dự án). */
+  templatePicker?: ReactNode;
 }) {
   const isElectric = utility === "Điện";
+  const [indexError, setIndexError] = useState("");
   const unitMeta: Record<string, { title: string; hint: string; unit: string; defaultPrice: string }> = {
     Điện: {
       title: "Giá điện sản xuất theo khung giờ",
@@ -1392,11 +1581,16 @@ function CostPanel({
     unit: "VNĐ",
     defaultPrice: "0",
   };
-  const flatPriceValue = flatPrice ?? meta.defaultPrice;
+  const issues = bandIssues(bands);
+  const missingPrice = bands.some((band) => !band.price.trim());
+  const patchBand = (id: string, patch: Partial<UtilityBand>) =>
+    onBands(bands.map((band) => (band.id === id ? { ...band, ...patch } : band)));
 
   return (
     <div>
-      <UtilityTabs value={utility} options={utilities} onChange={onUtility} />
+      {libraryMode ? null : <UtilityTabs value={utility} options={utilities} onChange={onUtility} />}
+      {templatePicker}
+      {libraryMode ? null : (
       <div className="mt-5 flex flex-wrap items-start justify-between gap-3 border-b border-slate-100 pb-5">
         <div>
           <p className="text-[15px] font-semibold text-slate-800">Ngày bắt đầu áp dụng</p>
@@ -1406,6 +1600,7 @@ function CostPanel({
         </div>
         <DateInput value={applyDate} onChange={onApplyDate} />
       </div>
+      )}
 
       {isElectric ? (
         <div className="mt-5 space-y-5">
@@ -1634,7 +1829,7 @@ function CostPanel({
           </div>
 
           {/* Lịch sử các mốc thay đổi biểu giá theo ngày áp dụng */}
-          {tariffHistory.length > 0 ? (
+          {tariffHistory.length > 0 && !libraryMode ? (
             <div className="rounded-lg border border-slate-200 bg-white p-4">
               <p className="text-[12px] font-bold tracking-wide text-slate-700 uppercase">
                 Lịch sử các mốc áp dụng biểu giá điện ({tariffHistory.length} mốc)
@@ -1678,25 +1873,175 @@ function CostPanel({
           <p className="text-[15px] font-semibold text-slate-800">{meta.title}</p>
           <p className="mt-1 text-[12px] text-slate-500">{meta.hint}</p>
           <p className="mt-2 rounded-md bg-slate-50 px-3 py-2 text-[12px] text-slate-500">
-            {utility} không dùng khung giờ cao điểm / thấp điểm — chỉ cấu hình đơn giá cố định.
+            Chia ngày thành các khung giờ, mỗi khung một đơn giá ({meta.unit}). Chỉ có một giá thì để một khung 00:00 – 24:00.
+            Khung qua đêm đặt giờ kết thúc nhỏ hơn giờ bắt đầu (VD 22:00 – 04:00).
           </p>
-          <div className="mt-4 max-w-md rounded-md border border-slate-200 p-4">
-            <label className="block">
-              <span className="mb-1.5 block text-[11px] font-semibold tracking-wide text-slate-400">
-                ĐƠN GIÁ ({meta.unit})
-              </span>
-              <span className="relative block">
-                <input
-                  value={flatPriceValue}
-                  onChange={(e) => onFlatPrice(e.target.value)}
-                  className="h-10 w-full rounded-md border border-slate-200 pr-14 pl-3 text-sm font-semibold text-slate-800 outline-none focus:border-emerald-500"
-                />
-                <span className="pointer-events-none absolute top-1/2 right-3 -translate-y-1/2 text-[11px] text-slate-400">
-                  VNĐ
-                </span>
-              </span>
-            </label>
+          <div className="mt-4 overflow-x-auto rounded-md border border-slate-200">
+            <table className="w-full min-w-[560px] text-left text-sm">
+              <thead className="bg-slate-50 text-[11px] font-semibold tracking-wide text-slate-400">
+                <tr>
+                  <th className="px-3 py-2">TÊN KHUNG GIỜ</th>
+                  <th className="w-32 px-3 py-2">TỪ</th>
+                  <th className="w-32 px-3 py-2">ĐẾN</th>
+                  <th className="w-48 px-3 py-2">ĐƠN GIÁ ({meta.unit})</th>
+                  <th className="w-12 px-3 py-2" />
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {bands.map((band) => (
+                  <tr key={band.id}>
+                    <td className="px-3 py-2">
+                      <input
+                        value={band.label}
+                        onChange={(e) => patchBand(band.id, { label: e.target.value })}
+                        placeholder="VD: Giờ cao điểm"
+                        className="h-9 w-full rounded-md border border-slate-200 px-2.5 text-sm text-slate-800 outline-none focus:border-emerald-500"
+                      />
+                    </td>
+                    <td className="px-3 py-2">
+                      <input
+                        type="time"
+                        value={band.from}
+                        onChange={(e) => patchBand(band.id, { from: e.target.value })}
+                        className="h-9 w-full rounded-md border border-slate-200 px-2 text-sm text-slate-800 outline-none focus:border-emerald-500"
+                      />
+                    </td>
+                    <td className="px-3 py-2">
+                      {/* "24:00" (hết ngày) không chọn được bằng ô giờ nên dùng ô chữ HH:MM */}
+                      <input
+                        value={band.to}
+                        onChange={(e) => patchBand(band.id, { to: e.target.value })}
+                        placeholder="24:00"
+                        inputMode="numeric"
+                        className="h-9 w-full rounded-md border border-slate-200 px-2.5 font-mono text-sm text-slate-800 outline-none focus:border-emerald-500"
+                      />
+                    </td>
+                    <td className="px-3 py-2">
+                      <input
+                        value={band.price}
+                        onChange={(e) => patchBand(band.id, { price: e.target.value })}
+                        placeholder={`VD: ${meta.defaultPrice}`}
+                        className="h-9 w-full rounded-md border border-slate-200 px-2.5 text-right text-sm font-semibold text-slate-800 outline-none placeholder:font-normal placeholder:text-slate-400 focus:border-emerald-500"
+                      />
+                    </td>
+                    <td className="px-3 py-2 text-right">
+                      {bands.length > 1 ? (
+                        <button
+                          type="button"
+                          onClick={() => onBands(bands.filter((item) => item.id !== band.id))}
+                          aria-label="Xóa khung giờ"
+                          className="inline-flex h-8 w-8 items-center justify-center rounded-md text-slate-400 hover:bg-rose-50 hover:text-rose-600"
+                        >
+                          ×
+                        </button>
+                      ) : null}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
+          <div className="mt-2 flex flex-wrap items-center justify-between gap-2">
+            <div className="space-y-0.5 text-[11.5px]">
+              {issues.invalid.length ? (
+                <p className="text-rose-600">Giờ không hợp lệ ở: {issues.invalid.join(", ")} (định dạng HH:MM, VD 06:30).</p>
+              ) : null}
+              {issues.gaps.length ? (
+                <p className="text-amber-700">
+                  Chưa có khung giờ cho: {issues.gaps.join(", ")} — lượng {utility.toLowerCase()} trong khoảng này tính đơn giá 0.
+                </p>
+              ) : null}
+              {issues.overlaps.length ? (
+                <p className="text-amber-700">Các khung trùng nhau ở: {issues.overlaps.join(", ")} — tính theo khung đứng trước.</p>
+              ) : null}
+              {missingPrice ? <p className="text-amber-700">Có khung chưa đặt đơn giá (tính 0).</p> : null}
+            </div>
+            <button
+              type="button"
+              onClick={() =>
+                onBands([
+                  ...bands,
+                  { id: `band-${Date.now()}`, label: `Khung ${bands.length + 1}`, from: "", to: "", price: "" },
+                ])
+              }
+              className="text-xs font-bold tracking-wide text-emerald-600 hover:text-emerald-700 hover:underline"
+            >
+              + THÊM KHUNG GIỜ
+            </button>
+          </div>
+
+          {/* Gateway gửi thông số nào là chỉ số tích lũy (VD tổng m³) → server tính sản lượng × đơn giá */}
+          {libraryMode ? null : (
+          <div className="mt-6 border-t border-slate-100 pt-5">
+            <p className="text-[15px] font-semibold text-slate-800">Chỉ số tính sản lượng</p>
+            <p className="mt-1 text-[12px] text-slate-500">
+              Chọn thông số gateway gửi lên là <strong>chỉ số cộng dồn</strong> (VD tổng m³ đã qua đồng hồ) của từng điểm đo.
+              Chi phí = phần chỉ số tăng thêm trong kỳ × đơn giá. Thông số lưu lượng tức thời (VD m³/s) không dùng để tính
+              tiền.
+            </p>
+            {indexError ? <p className="mt-2 text-[12px] font-medium text-rose-600">{indexError}</p> : null}
+            {indexSources.length === 0 ? (
+              <p className="mt-3 rounded-md bg-slate-50 px-3 py-2 text-[12px] text-slate-500">
+                Dự án chưa có điểm đo loại {utility}.
+              </p>
+            ) : (
+              <div className="mt-3 divide-y divide-slate-100 rounded-md border border-slate-200">
+                {indexSources.map(({ meter, device }) => {
+                  const registers = (device?.registers ?? []).filter((row) => row.address?.trim());
+                  const current = registers.find((row) => row.cumulative)?.address.trim() ?? "";
+                  return (
+                    <div
+                      key={meter.id}
+                      className="grid gap-2 px-4 py-3 sm:grid-cols-[minmax(0,1fr)_minmax(240px,320px)] sm:items-center"
+                    >
+                      <div className="min-w-0">
+                        <p className="truncate text-sm font-semibold text-slate-800">
+                          {meter.name} <span className="font-mono text-[11px] font-normal text-slate-400">({meter.code})</span>
+                        </p>
+                        <p className="truncate text-[11px] text-slate-500">
+                          {device ? `${device.brandModel || device.name} · SN ${device.sn}` : "Chưa gán đồng hồ"}
+                        </p>
+                      </div>
+                      {!device ? (
+                        <p className="text-[12px] text-slate-400">Gán đồng hồ cho điểm đo ở mục Cụm điểm đo.</p>
+                      ) : registers.length === 0 ? (
+                        <p className="text-[12px] text-amber-700">
+                          Đồng hồ chưa khai báo Hàm nhận dữ liệu.{" "}
+                          <Link
+                            href={`/thiet-bi/them-moi?id=${encodeURIComponent(device.id)}`}
+                            className="font-semibold underline-offset-2 hover:underline"
+                          >
+                            Khai báo
+                          </Link>
+                        </p>
+                      ) : (
+                        <CustomSelect
+                          value={current}
+                          onChange={(e) => {
+                            setIndexError("");
+                            void onPickIndex(device, e.target.value).catch(() =>
+                              setIndexError("Không lưu được chỉ số tính sản lượng. Hãy thử lại."),
+                            );
+                          }}
+                          className="h-10 w-full rounded-md border border-slate-200 bg-white px-3 text-sm text-slate-800 outline-none focus:border-emerald-500"
+                        >
+                          <option value="">-- Chưa chọn (không tính được tiền) --</option>
+                          {registers.map((row) => (
+                            <option key={row.id} value={row.address.trim()}>
+                              {row.address.trim()}
+                              {row.name ? ` — ${row.name}` : ""}
+                              {row.unit ? ` (${row.unit})` : ""}
+                            </option>
+                          ))}
+                        </CustomSelect>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+          )}
         </div>
       )}
     </div>
@@ -1706,12 +2051,18 @@ function CostPanel({
 function AlertsPanel({
   classify,
   onClassify,
-  categories,
+  categories: allCategories,
   activeGroupId,
   onActiveGroup,
   rulesByGroup,
   onRulesByGroupChange,
-  meters,
+  utilities,
+  alertUtility,
+  onAlertUtility,
+  templates,
+  adminAlertConfig,
+  onApplyTemplate,
+  meters: allMeters,
   liveMeterValues,
   severityByCategory,
   onSeverity,
@@ -1729,6 +2080,12 @@ function AlertsPanel({
   onActiveGroup: (id: UserAlertGroupId) => void;
   rulesByGroup: Record<string, UserAlertRule[]>;
   onRulesByGroupChange: (next: Record<string, UserAlertRule[]>) => void;
+  utilities: string[];
+  alertUtility: string;
+  onAlertUtility: (utility: string) => void;
+  templates: AlertTemplate[];
+  adminAlertConfig: Record<string, unknown>;
+  onApplyTemplate: (utility: string, template: AlertTemplate) => Promise<void>;
   meters: ClientMeter[];
   liveMeterValues: Record<string, { at: string; values: Record<string, number> }>;
   severityByCategory: Record<AlertCategoryId, AlertSeverityLevel>;
@@ -1743,6 +2100,22 @@ function AlertsPanel({
   const [showSeverityDefaults, setShowSeverityDefaults] = useState(false);
   /** Ngưỡng đang mở danh sách điểm đo. */
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
+  const [pendingTemplate, setPendingTemplate] = useState<AlertTemplate | null>(null);
+  const [templateNotice, setTemplateNotice] = useState("");
+
+  // Nhóm ngưỡng & điểm đo theo loại điểm đo đang xem (Điện / Nước / …).
+  const isElectricUtility = alertUtility === "Điện";
+  const categoriesByUtility = adminAlertConfig.categoriesByUtility as Record<string, Array<{ id: string }>> | undefined;
+  const categories = allCategories.filter((cat) => {
+    const owner = utilityForAlertGroup(cat.id, utilities, categoriesByUtility);
+    return owner ? owner === alertUtility : isElectricUtility;
+  });
+  const meters = isElectricUtility
+    ? allMeters.filter((meter) => (meter.utility || "Điện") === "Điện")
+    : allMeters.filter((meter) => meter.utility === alertUtility);
+  const utilityTemplates = templates.filter((item) => item.meterType === alertUtility);
+  const appliedTemplateId =
+    (adminAlertConfig.templateByUtility as Record<string, string> | undefined)?.[alertUtility] ?? "";
 
   const activeCategory = categories.find((c) => c.id === activeGroupId) ?? categories[0];
   const currentGroupId = activeCategory?.id ?? "energy";
@@ -1801,8 +2174,8 @@ function AlertsPanel({
 
   /** Điểm đo áp dụng được cho ngưỡng: tham số điện chỉ áp cho điểm đo điện. */
   function metersForRule(rule: UserAlertRule) {
-    const electric = METER_PARAMETERS.some((param) => param.key === rule.parameterKey);
-    return electric ? meters.filter((meter) => (meter.utility || "Điện") === "Điện") : meters;
+    void rule;
+    return meters;
   }
 
   return (
@@ -1826,6 +2199,85 @@ function AlertsPanel({
           Danh sách ngưỡng lấy từ thư viện cảnh báo của dự án (do quản trị viên cấu hình). Bật một ngưỡng để chọn
           điểm đo áp dụng và đặt ngưỡng riêng cho từng điểm đo; để trống thì dùng ngưỡng mặc định.
         </div>
+      </div>
+
+      {/* Loại điểm đo + mẫu thư viện áp dụng cho loại đó */}
+      <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3 sm:p-4">
+        <div className="flex flex-wrap items-end justify-between gap-3">
+          <div className="min-w-0">
+            <p className="mb-1.5 text-[11px] font-semibold tracking-[0.08em] text-slate-400">LOẠI ĐIỂM ĐO</p>
+            <div className="flex flex-wrap gap-2">
+              {utilities.map((item) => (
+                <button
+                  key={item}
+                  type="button"
+                  onClick={() => onAlertUtility(item)}
+                  className={`h-9 rounded-lg border px-3.5 text-xs font-semibold transition-colors ${
+                    item === alertUtility
+                      ? "border-emerald-500 bg-emerald-600 text-white shadow-xs"
+                      : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+                  }`}
+                >
+                  {item}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="w-full sm:w-80">
+            <p className="mb-1.5 text-[11px] font-semibold tracking-[0.08em] text-slate-400">
+              MẪU CẢNH BÁO ÁP DỤNG ({alertUtility.toUpperCase()})
+            </p>
+            <CustomSelect
+              value={appliedTemplateId}
+              onChange={(e) => {
+                const picked = utilityTemplates.find((item) => item.id === e.target.value);
+                if (picked) setPendingTemplate(picked);
+              }}
+              className="h-10 w-full rounded-md border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none focus:border-emerald-500"
+            >
+              <option value="">
+                {utilityTemplates.length ? "-- Chọn mẫu từ Thư viện cảnh báo --" : "Thư viện chưa có mẫu cho loại này"}
+              </option>
+              {utilityTemplates.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.name}
+                </option>
+              ))}
+            </CustomSelect>
+          </div>
+        </div>
+        {pendingTemplate ? (
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[12px] text-amber-900">
+            <span>
+              Thay toàn bộ ngưỡng cảnh báo loại {alertUtility} bằng mẫu <strong>{pendingTemplate.name}</strong>? Bật / tắt,
+              mức độ và ngưỡng riêng của điểm đo cho ngưỡng cùng mã vẫn giữ.
+            </span>
+            <span className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => setPendingTemplate(null)}
+                className="h-8 rounded-md border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-600 hover:bg-slate-50"
+              >
+                Hủy
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const template = pendingTemplate;
+                  setPendingTemplate(null);
+                  void onApplyTemplate(alertUtility, template)
+                    .then(() => setTemplateNotice(`Đã áp dụng mẫu "${template.name}" cho loại ${alertUtility}.`))
+                    .catch(() => setTemplateNotice("Không áp dụng được mẫu cảnh báo. Hãy thử lại."))
+                    .finally(() => window.setTimeout(() => setTemplateNotice(""), 3500));
+                }}
+                className="h-8 rounded-md bg-emerald-600 px-3 text-xs font-semibold text-white hover:bg-emerald-700"
+              >
+                Áp dụng
+              </button>
+            </span>
+          </div>
+        ) : null}
+        {templateNotice ? <p className="mt-2 text-[12px] font-medium text-emerald-700">{templateNotice}</p> : null}
       </div>
 
       {/* Nhóm cảnh báo của thư viện */}
@@ -1937,8 +2389,10 @@ function AlertsPanel({
 
         {rulesInGroup.length === 0 ? (
           <p className="px-4 py-10 text-center text-sm font-medium text-slate-500">
-            Thư viện cảnh báo của dự án chưa có ngưỡng nào trong nhóm {activeCategory?.label}. Liên hệ quản trị viên để
-            thêm ngưỡng.
+            {activeCategory
+              ? `Thư viện cảnh báo của dự án chưa có ngưỡng nào trong nhóm ${activeCategory.label}.`
+              : `Chưa có ngưỡng cảnh báo nào cho loại ${alertUtility}.`}{" "}
+            Chọn một mẫu ở ô &quot;Mẫu cảnh báo áp dụng&quot; phía trên.
           </p>
         ) : (
           <div className="divide-y divide-slate-100">
@@ -2103,7 +2557,7 @@ function AlertsPanel({
       </div>
 
       {/* Ngưỡng vận hành điện năng tiêu thụ (hiển thị trong nhóm Energy hoặc chế độ Thông tin chung) */}
-      {currentGroupId === "energy" || classify === "Thông tin chung (Info)" ? (
+      {isElectricUtility && (currentGroupId === "energy" || classify === "Thông tin chung (Info)") ? (
         <div className="rounded-xl border border-slate-200 bg-white p-4">
           <p className="mb-1 text-xs font-bold tracking-wide text-slate-700 uppercase">
             Ngưỡng vận hành tiêu thụ điện năng (Tổng hợp nhà máy)
@@ -2172,6 +2626,11 @@ function AccountsPanel({
   onRemove: (id: string) => Promise<void> | void;
 }) {
   const [editingId, setEditingId] = useState<string | null>(null);
+  const editFormRef = useRef<HTMLDivElement>(null);
+  // Khung sửa nằm phía trên bảng: bấm "Sửa" ở một dòng thì cuộn lên khung sửa (sau khi khung đã hiện ra).
+  useEffect(() => {
+    if (editingId) editFormRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, [editingId]);
   const [draft, setDraft] = useState<{
     username: string;
     displayName: string;
@@ -2303,7 +2762,7 @@ function AccountsPanel({
       ) : null}
 
       {adding && canManage ? (
-        <div className="mb-4 rounded-lg border border-slate-200 bg-slate-50 p-4">
+        <div ref={editFormRef} className="mb-4 scroll-mt-20 rounded-lg border border-slate-200 bg-slate-50 p-4">
           <div className="mb-2.5 flex items-center justify-between">
             <p className="text-[13px] font-semibold text-slate-800">
               {editingId
@@ -2626,14 +3085,29 @@ type NavIconType = "doc" | "nodes" | "cash" | "warn" | "user" | "chart";
 function ChartParamsPanel({
   config,
   onChange,
+  utilities,
+  devices,
+  utilityHidden,
+  onUtilityHidden,
   showMarkers,
   onShowMarkers,
 }: {
   config: ChartParameterConfig;
   onChange: (next: ChartParameterConfig) => void;
+  utilities: string[];
+  devices: CatalogDevice[];
+  utilityHidden: UtilityChartHidden;
+  onUtilityHidden: (next: UtilityChartHidden) => void;
   showMarkers: boolean;
   onShowMarkers: (next: boolean) => void;
 }) {
+  const [chartUtility, setChartUtility] = useState("Điện");
+  const activeUtility = utilities.includes(chartUtility) ? chartUtility : utilities[0] ?? "Điện";
+  const electric = activeUtility === "Điện";
+  const declared = electric ? [] : declaredParamsForType(devices, activeUtility);
+  const hidden = new Set(utilityHidden[activeUtility] ?? []);
+  const setHidden = (keys: Set<string>) =>
+    onUtilityHidden({ ...utilityHidden, [activeUtility]: [...keys] });
   const selectedFor = (tabId: ChartParamTabId) => new Set(config[tabId] ?? allTabKeys(tabId));
   const setTabKeys = (tabId: ChartParamTabId, keys: Set<string>) => {
     // Giữ thứ tự gốc của tham số.
@@ -2671,7 +3145,82 @@ function ChartParamsPanel({
           {showMarkers ? "Đang hiện" : "Đang ẩn"}
         </button>
       </section>
-      {CHART_PARAMETER_TABS.map((chart) => {
+      {utilities.length > 1 ? <UtilityTabs value={activeUtility} options={utilities} onChange={setChartUtility} /> : null}
+      {!electric ? (
+        <section className="rounded-lg border border-slate-200 bg-white p-4">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <h3 className="text-sm font-bold text-slate-800">
+              Thông số đo {activeUtility}
+              <span className="ml-2 text-xs font-medium text-slate-400">
+                {declared.filter((item) => !hidden.has(item.key)).length}/{declared.length} tham số
+              </span>
+            </h3>
+            {declared.length ? (
+              <div className="flex gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setHidden(new Set())}
+                  className="h-7 rounded-md border border-slate-200 bg-white px-2.5 text-xs font-semibold text-slate-600 hover:bg-slate-50"
+                >
+                  Chọn tất cả
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setHidden(new Set(declared.map((item) => item.key)))}
+                  className="h-7 rounded-md border border-slate-200 bg-white px-2.5 text-xs font-semibold text-slate-600 hover:bg-slate-50"
+                >
+                  Bỏ chọn
+                </button>
+              </div>
+            ) : null}
+          </div>
+          {declared.length === 0 ? (
+            <p className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800">
+              Đồng hồ loại {activeUtility} chưa khai báo thông số đo. Khai báo ở Thư viện loại đồng hồ → đồng hồ loại{" "}
+              {activeUtility} → Hàm nhận dữ liệu từ gateway (tên, mô tả, đơn vị).
+            </p>
+          ) : (
+            <div className="flex flex-wrap gap-1.5">
+              {declared.map((item) => {
+                const checked = !hidden.has(item.key);
+                return (
+                  <button
+                    key={item.key}
+                    type="button"
+                    aria-pressed={checked}
+                    onClick={() => {
+                      const next = new Set(hidden);
+                      if (checked) next.add(item.key);
+                      else next.delete(item.key);
+                      setHidden(next);
+                    }}
+                    className={`inline-flex h-8 items-center gap-1.5 rounded-md border px-2.5 text-xs font-semibold transition-colors ${
+                      checked
+                        ? "border-emerald-500 bg-emerald-50 text-emerald-700"
+                        : "border-slate-200 bg-white text-slate-400 hover:border-slate-300 hover:text-slate-600"
+                    }`}
+                  >
+                    <span
+                      className={`flex h-3.5 w-3.5 items-center justify-center rounded-[3px] border text-[9px] leading-none ${
+                        checked ? "border-emerald-600 bg-emerald-600 text-white" : "border-slate-300 bg-white"
+                      }`}
+                    >
+                      {checked ? "✓" : ""}
+                    </span>
+                    <span className="font-mono">{item.key}</span>
+                    <span className="font-normal text-slate-400">
+                      {item.label !== item.key ? item.label : ""}
+                      {item.unit ? ` (${item.unit})` : ""}
+                      {item.cumulative ? " · cộng dồn" : ""}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </section>
+      ) : null}
+      {(electric ? CHART_PARAMETER_TABS : []).map((chart) => {
         const selected = selectedFor(chart.id);
         const total = allTabKeys(chart.id).length;
         return (
@@ -2795,23 +3344,6 @@ function NavIcon({ type, className }: { type: NavIconType; className?: string })
     <svg className={className} viewBox="0 0 24 24" fill="none" aria-hidden>
       <path d="M7 3.5h7l5 5V20a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4.5a1 1 0 0 1 1-1Z" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round" />
       <path d="M14 3.5V9h5.5" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round" />
-    </svg>
-  );
-}
-
-function SaveIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" aria-hidden>
-      <path d="M5 5h11l3 3v11a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1Z" stroke="currentColor" strokeWidth="1.7" />
-      <path d="M8 5v5h8M8 19v-6h8v6" stroke="currentColor" strokeWidth="1.7" />
-    </svg>
-  );
-}
-
-function FileIcon() {
-  return (
-    <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" aria-hidden>
-      <path d="M7 3.5h7l5 5V20a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4.5a1 1 0 0 1 1-1Z" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round" />
     </svg>
   );
 }

@@ -19,11 +19,16 @@ import { exportToExcel, type ExcelCellValue } from "@/lib/excel-export";
 import { formatAppNumber } from "@/lib/number-format";
 import {
   DEFAULT_HEADER_FOOTER,
+  PARAM_FIELD_PREFIX,
   REPORTS,
-  REPORT_FIELDS,
+  consumptionUnitWith,
   defaultSelectedFieldsByReport,
+  isElectricMeterType,
+  isReportFieldAllowed,
   readReportConfig,
+  reportFieldsFor,
   reportTitle,
+  reportsForMeterType,
   type ReportConfig,
   type ReportFieldDef,
   type ReportHeaderFooterConfig,
@@ -34,6 +39,7 @@ import { loadReportTemplates } from "@/lib/report-templates";
 import {
   loadProjectGatewayEnergySlots,
   loadProjectGatewayLatest,
+  loadProjectGatewaySamples,
   type GatewayEnergySlot,
   type GatewayMeterSwap,
   type ProjectGatewaySample,
@@ -60,6 +66,8 @@ import { METER_PARAMETERS, readMeterValue, registerToKwh } from "@/lib/meter-par
 import { hydrateProjectSettings, saveProjectSettings } from "@/lib/project-settings";
 import { hydrateProjects, loadProjects } from "@/lib/projects";
 import { formatStoredVietnam, vietnamFromStored, vietnamNow } from "@/lib/vietnam-time";
+import { declaredParamsForType, hydrateDevices, loadDevices, type CatalogDevice } from "@/lib/devices";
+import { buildUtilityReport, computeUtilityCalcs } from "@/components/client/utilityReport";
 
 type YesNo = "Có" | "Không";
 type Format = ".pdf" | ".xlsx";
@@ -82,7 +90,9 @@ function buildTemplateState(base: ReportConfig, tpl: ReportTemplate | null, curr
     const fields = { ...base.fieldsByReport };
     for (const rid of REPORTS.map((item) => item.id)) {
       const allowed = base.allowedFields[rid];
-      const picked = (tpl.fieldsByReport[rid] ?? []).filter((key) => allowed.includes(key));
+      const picked = (tpl.fieldsByReport[rid] ?? []).filter(
+        (key) => allowed.includes(key) || key.startsWith(PARAM_FIELD_PREFIX),
+      );
       fields[rid] = picked.length ? picked : allowed;
     }
     config = {
@@ -148,15 +158,29 @@ export function ClientReports({
   /** Cấu hình báo cáo của dự án như đã lưu (trước khi áp mẫu) — để quay lại và để lưu không ghi đè phần quản trị. */
   const [baseConfig, setBaseConfig] = useState<ReportConfig | null>(null);
   const [projectMeterTypes, setProjectMeterTypes] = useState<string[]>([]);
-  const [reportId, setReportId] = useState<ReportTypeId>(
+  const [reportIdState, setReportId] = useState<ReportTypeId>(
     REPORTS.some((r) => r.id === initialId) ? initialId : "overview",
   );
-  const report = REPORTS.find((item) => item.id === reportId) ?? REPORTS[0];
+  /** Loại điểm đo của báo cáo (Điện / Nước / …): quyết định điểm đo, loại báo cáo và trường dữ liệu. */
+  const [reportUtility, setReportUtility] = useState("Điện");
+  const electricReport = isElectricMeterType(reportUtility);
 
   // Cấu hình báo cáo của dự án (Quản lý dự án → Cấu hình báo cáo): loại báo cáo được dùng, tiêu đề, bố cục mặc định.
   const [reportConfig, setReportConfig] = useState<ReportConfig>(() => readReportConfig(null));
-  const visibleReports = REPORTS.filter((item) => reportConfig.enabledReports.includes(item.id));
-  const [title, setTitle] = useState<string>(report.title);
+  // Chi phí 3 giá / khí nhà kính chỉ có ở Điện: loại khác chỉ hiện các báo cáo dùng được.
+  const visibleReports = useMemo(
+    () =>
+      REPORTS.filter(
+        (item) => reportConfig.enabledReports.includes(item.id) && reportsForMeterType(reportUtility).includes(item.id),
+      ),
+    [reportConfig, reportUtility],
+  );
+  const reportId: ReportTypeId = visibleReports.some((item) => item.id === reportIdState)
+    ? reportIdState
+    : visibleReports[0]?.id ?? reportIdState;
+  const report = REPORTS.find((item) => item.id === reportId) ?? REPORTS[0];
+  const [titleState, setTitle] = useState<string>(report.title);
+  const title = reportId === reportIdState ? titleState : reportTitle(reportConfig, reportId);
   const [chart, setChart] = useState<YesNo>("Có");
   const [summary, setSummary] = useState<YesNo>("Có");
   const [detail, setDetail] = useState<YesNo>("Có");
@@ -187,6 +211,16 @@ export function ClientReports({
   /** Đơn giá phần điện năng "Không xác định" khung giờ (bỏ trống ở Cấu hình = giá giờ bình thường). */
   const [unknownPrice, setUnknownPrice] = useState<number | null>(null);
   const [userAlertSettings, setUserAlertSettings] = useState<unknown>(null);
+  const [devices, setDevices] = useState<CatalogDevice[]>(loadDevices);
+  /** Mẫu gateway trong kỳ (chỉ tải cho loại điểm đo không phải điện). */
+  const [utilitySamples, setUtilitySamples] = useState<ProjectGatewaySample[]>([]);
+
+  useEffect(() => {
+    const reloadDevices = () => void hydrateDevices().then(setDevices);
+    reloadDevices();
+    window.addEventListener("ems-devices-changed", reloadDevices);
+    return () => window.removeEventListener("ems-devices-changed", reloadDevices);
+  }, []);
 
   const monthAligned = useRef(false);
   const filterTouched = useRef(false);
@@ -216,11 +250,10 @@ export function ClientReports({
       if (proj) setProjectName(proj.name);
 
       setMeters(meterRows);
-      setProjectMeterTypes(
-        Array.from(
-          new Set([...(proj?.meterTypes ?? []), ...meterRows.map((m) => m.utility)].filter(Boolean) as string[]),
-        ),
+      const meterTypes = Array.from(
+        new Set([...(proj?.meterTypes ?? []), ...meterRows.map((m) => m.utility)].filter(Boolean) as string[]),
       );
+      setProjectMeterTypes(meterTypes);
       setSelectedMeterIds((current) => {
         const valid = current.filter((id) => meterRows.some((m) => m.id === id));
         if (valid.length > 0) return valid;
@@ -260,6 +293,11 @@ export function ClientReports({
       // Dự án đã lưu mẫu thư viện → mở lại trang tự áp mẫu đó. Loại báo cáo mở ban đầu không được bật
       // cho dự án thì chuyển sang loại đầu tiên được bật.
       const savedTemplate = templateList.find((item) => item.id === base.templateId) ?? null;
+      setReportUtility(
+        savedTemplate && meterTypes.includes(savedTemplate.meterType)
+          ? savedTemplate.meterType
+          : meterTypes.find((type) => isElectricMeterType(type)) ?? meterTypes[0] ?? "Điện",
+      );
       const startId = REPORTS.some((r) => r.id === initialId) ? initialId : "overview";
       const state = buildTemplateState(base, savedTemplate, startId);
       const config = state.config;
@@ -325,6 +363,18 @@ export function ClientReports({
     };
   }, [projectId, timeFilter]);
 
+  useEffect(() => {
+    if (electricReport) return;
+    let active = true;
+    const span = timeFilterSpan(timeFilter);
+    void loadProjectGatewaySamples(projectId, { from: span.from, to: span.to }).then((rows) => {
+      if (active) setUtilitySamples(rows);
+    });
+    return () => {
+      active = false;
+    };
+  }, [projectId, timeFilter, electricReport]);
+
   /** Mẫu thư viện dùng được cho dự án: đúng loại điểm đo của dự án (chưa biết loại thì hiện tất cả). */
   const availableTemplates = useMemo(
     () =>
@@ -343,6 +393,7 @@ export function ClientReports({
   const applyTemplate = (id: string) => {
     if (!baseConfig) return;
     const tpl = libraryTemplates.find((item) => item.id === id) ?? null;
+    if (tpl && projectMeterTypes.includes(tpl.meterType)) setReportUtility(tpl.meterType);
     const state = buildTemplateState(baseConfig, tpl, reportId);
     setTemplateId(tpl?.id ?? "");
     setReportConfig(state.config);
@@ -378,54 +429,101 @@ export function ClientReports({
     }));
   };
 
+  /** Điểm đo thuộc loại điểm đo đang báo cáo. */
+  const utilityMeters = useMemo(
+    () =>
+      meters.filter((meter) =>
+        electricReport ? isElectricMeterType(meter.utility || "") : meter.utility === reportUtility,
+      ),
+    [meters, electricReport, reportUtility],
+  );
+
   const toggleMeter = (id: string) => {
     setSelectedMeterIds((list) => {
       if (list.includes(id)) {
-        return list.length === 1 ? list : list.filter((item) => item !== id);
+        // Giữ ít nhất một điểm đo của loại đang báo cáo.
+        const selectedInType = utilityMeters.filter((meter) => list.includes(meter.id)).length;
+        return selectedInType <= 1 ? list : list.filter((item) => item !== id);
       }
       return [...list, id];
     });
   };
 
-  // Chỉ các trường quản trị viên cho phép xem (Quản lý dự án → Cấu hình báo cáo).
-  const allowedKeys = reportConfig.allowedFields[reportId];
-  const activeFields = useMemo(
-    () => REPORT_FIELDS[reportId].filter((field) => allowedKeys.includes(field.key)),
-    [reportId, allowedKeys],
+  const changeUtility = (utility: string) => {
+    setReportUtility(utility);
+    const nextReports = REPORTS.filter(
+      (item) => reportConfig.enabledReports.includes(item.id) && reportsForMeterType(utility).includes(item.id),
+    );
+    if (!nextReports.some((item) => item.id === reportIdState) && nextReports[0]) pickReport(nextReports[0].id);
+  };
+
+  /** Thông số khai báo của đồng hồ cùng loại (loại không phải điện). */
+  const declaredParams = useMemo(
+    () => (electricReport ? [] : declaredParamsForType(devices, reportUtility)),
+    [devices, electricReport, reportUtility],
   );
-  const selectedFieldKeys = fieldsByReport[reportId] ?? activeFields.map((f) => f.key);
+  const utilityUnit = consumptionUnitWith(reportUtility, declaredParams);
+
+  // Chỉ các trường quản trị viên cho phép xem (Quản lý dự án → Cấu hình báo cáo); trường theo loại điểm đo.
+  const activeFields = useMemo(
+    () =>
+      reportFieldsFor(reportId, reportUtility, declaredParams).filter((field) =>
+        isReportFieldAllowed(reportConfig, reportId, field.key),
+      ),
+    [reportId, reportUtility, declaredParams, reportConfig],
+  );
+  const savedFieldKeys = fieldsByReport[reportId];
+  const selectedFieldKeys = useMemo(() => {
+    const keys = activeFields.map((f) => f.key);
+    const saved = savedFieldKeys ?? keys;
+    let picked = saved.filter((key) => keys.includes(key));
+    // Chưa từng chọn trường thông số đo (VD thông số mới khai báo): tích sẵn các trường mặc định.
+    if (!saved.some((key) => key.startsWith(PARAM_FIELD_PREFIX))) {
+      picked = [
+        ...picked,
+        ...activeFields
+          .filter((f) => f.key.startsWith(PARAM_FIELD_PREFIX) && f.defaultChecked !== false)
+          .map((f) => f.key),
+      ];
+    }
+    if (picked.length === 0) picked = activeFields.filter((f) => f.defaultChecked !== false).map((f) => f.key);
+    return picked.length ? picked : keys;
+  }, [activeFields, savedFieldKeys]);
   const visibleColumns = useMemo(
     () => activeFields.filter((f) => selectedFieldKeys.includes(f.key)),
     [activeFields, selectedFieldKeys],
   );
 
-  const toggleField = (fieldKey: string) => {
+  /** Ghi lựa chọn trường của loại điểm đo đang xem, giữ nguyên trường của loại khác trong cùng báo cáo. */
+  const setCurrentFields = (next: string[], keepParamMarker = true) => {
     setFieldsByReport((prev) => {
-      const current = prev[reportId] ?? [];
-      if (current.includes(fieldKey)) {
-        if (current.length <= 1) return prev;
-        return { ...prev, [reportId]: current.filter((k) => k !== fieldKey) };
-      }
-      const ordered = activeFields
-        .map((f) => f.key)
-        .filter((k) => current.includes(k) || k === fieldKey);
-      return { ...prev, [reportId]: ordered };
+      const activeKeys = new Set(activeFields.map((f) => f.key));
+      const others = (prev[reportId] ?? []).filter(
+        (key) => !activeKeys.has(key) && key !== PARAM_FIELD_PREFIX,
+      );
+      // Dấu "param:" = đã tự chọn trường thông số đo (kể cả bỏ hết), không tích lại mặc định.
+      const marker = keepParamMarker && !electricReport ? [PARAM_FIELD_PREFIX] : [];
+      return { ...prev, [reportId]: [...others, ...next, ...marker] };
     });
   };
 
+  const toggleField = (fieldKey: string) => {
+    const current = selectedFieldKeys;
+    if (current.includes(fieldKey)) {
+      if (current.length <= 1) return;
+      setCurrentFields(current.filter((k) => k !== fieldKey));
+      return;
+    }
+    setCurrentFields(activeFields.map((f) => f.key).filter((k) => current.includes(k) || k === fieldKey));
+  };
+
   const selectAllFields = () => {
-    setFieldsByReport((prev) => ({
-      ...prev,
-      [reportId]: activeFields.map((f) => f.key),
-    }));
+    setCurrentFields(activeFields.map((f) => f.key));
   };
 
   const resetDefaultFields = () => {
     const defaults = activeFields.filter((f) => f.defaultChecked !== false).map((f) => f.key);
-    setFieldsByReport((prev) => ({
-      ...prev,
-      [reportId]: defaults.length ? defaults : activeFields.map((f) => f.key),
-    }));
+    setCurrentFields(defaults.length ? defaults : activeFields.map((f) => f.key), false);
   };
 
   const handleSaveTemplateConfig = async () => {
@@ -454,8 +552,8 @@ export function ClientReports({
   };
 
   const selectedMeters = useMemo(
-    () => meters.filter((m) => selectedMeterIds.includes(m.id)),
-    [meters, selectedMeterIds],
+    () => utilityMeters.filter((m) => selectedMeterIds.includes(m.id)),
+    [utilityMeters, selectedMeterIds],
   );
 
   const periodLabel = useMemo(() => getTimeFilterLabel(timeFilter), [timeFilter]);
@@ -628,8 +726,47 @@ export function ClientReports({
     });
   }, [selectedMeters, slots, meterSwaps, timeFilter, touPrices, unknownPrice, latestSamples]);
 
+  // Loại không phải điện: thống kê từ mẫu gateway theo thông số khai báo của đồng hồ.
+  const utilityCalcs = useMemo(() => {
+    if (electricReport) return [];
+    const periods = getTimeFilterPeriods(timeFilter);
+    return computeUtilityCalcs({
+      meters: selectedMeters,
+      devices,
+      samples: utilitySamples,
+      params: declaredParams,
+      periods,
+      periodIndex: (at) => periodIndexForInstant(timeFilter, at, periods.length),
+    });
+  }, [electricReport, timeFilter, selectedMeters, devices, utilitySamples, declaredParams]);
+
+  /** Cảnh báo của các điểm đo thuộc loại đang báo cáo (cảnh báo không gắn điểm đo: tính vào Điện). */
+  const utilityAlertEvents = useMemo(() => {
+    const ids = new Set(utilityMeters.map((m) => m.id));
+    const codes = new Set(utilityMeters.map((m) => m.code));
+    return alertEvents.filter((ev) =>
+      ev.meterPointId || ev.pointCode
+        ? ids.has(ev.meterPointId ?? "") || codes.has(ev.pointCode ?? "")
+        : electricReport,
+    );
+  }, [alertEvents, utilityMeters, electricReport]);
+
   // Xây dựng dữ liệu Bảng tổng hợp & Bảng chi tiết theo loại báo cáo đang chọn
   const builtReportData = useMemo(() => {
+    if (!electricReport && reportId !== "alerts") {
+      return buildUtilityReport({
+        reportId,
+        utility: reportUtility,
+        unit: utilityUnit,
+        params: declaredParams,
+        calcs: utilityCalcs,
+        periodLabel,
+        alertCountFor: (meter) =>
+          utilityAlertEvents.filter((a) => a.meterPointId === meter.id || a.pointCode === meter.code).length,
+        totalAlerts: utilityAlertEvents.length,
+        betweenMeters: comparisonBaseline === "between_meters",
+      });
+    }
     const grandTotalKwh = meterCalculations.reduce((s, m) => s + m.totalKwh, 0);
     const grandTotalVnd = meterCalculations.reduce((s, m) => s + m.totalVnd, 0);
     const voltageLabel = voltageLevelById(voltageLevel).label;
@@ -922,7 +1059,7 @@ export function ClientReports({
       const deliveryText =
         deliveryChannels.length > 0 ? deliveryChannels.join(" · ") : "Chưa bật kênh gửi";
 
-      const rows: Record<string, { display: string; raw: ExcelCellValue }>[] = alertEvents.map(
+      const rows: Record<string, { display: string; raw: ExcelCellValue }>[] = utilityAlertEvents.map(
         (ev) => {
           const cat = alertCategory(ev.parameter, ev.category);
           const storedSev =
@@ -930,7 +1067,10 @@ export function ClientReports({
           const sev = resolveConfiguredSeverity(cat, storedSev, alertCfg, ev.parameter);
           const sevLabel =
             sev === "critical" ? "Nghiêm trọng" : sev === "warning" ? "Cảnh báo" : "Thông tin";
-          const paramMeta = METER_PARAMETERS.find((p) => p.key === ev.parameter);
+          const declared = declaredParams.find((p) => p.key === ev.parameter);
+          const paramMeta = METER_PARAMETERS.find((p) => p.key === ev.parameter) ?? (declared
+            ? { name: declared.label, unit: declared.unit }
+            : undefined);
           const unit = ev.unit || paramMeta?.unit || "";
           const timeText = formatStoredVietnam(ev.occurredAt) ?? ev.occurredAt;
 
@@ -1100,6 +1240,12 @@ export function ClientReports({
     reportId,
     userAlertSettings,
     voltageLevel,
+    electricReport,
+    reportUtility,
+    utilityUnit,
+    declaredParams,
+    utilityCalcs,
+    utilityAlertEvents,
   ]);
 
   // Xuất file Excel (.xlsx) theo đúng mẫu và các trường dữ liệu đã chọn
@@ -1472,26 +1618,47 @@ export function ClientReports({
 
           {/* Chọn điểm đo: hiển thị sẵn để tích chọn (không cần mở ô chọn) */}
           <div className="mt-4 rounded-xl border border-slate-200 p-4">
+            {projectMeterTypes.length > 1 ? (
+              <div className="mb-3 flex flex-wrap items-center gap-2 border-b border-slate-100 pb-3">
+                <span className="text-xs font-bold tracking-wider text-slate-700 uppercase">Loại điểm đo</span>
+                {projectMeterTypes.map((type) => (
+                  <button
+                    key={type}
+                    type="button"
+                    onClick={() => changeUtility(type)}
+                    className={`h-8 rounded-lg border px-3 text-xs font-semibold transition-colors ${
+                      type === reportUtility
+                        ? "border-emerald-500 bg-emerald-600 text-white shadow-xs"
+                        : "border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+                    }`}
+                  >
+                    {type}
+                  </button>
+                ))}
+              </div>
+            ) : null}
             <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2">
               <div>
                 <p className="text-xs font-bold tracking-wider text-slate-700 uppercase">
-                  Điểm đo đưa vào báo cáo ({selectedMeterIds.length}/{meters.length} điểm đo)
+                  Điểm đo đưa vào báo cáo ({selectedMeters.length}/{utilityMeters.length} điểm đo)
                 </p>
                 <p className="text-[11px] text-slate-500">Tích chọn các điểm đo cần đưa vào bản xem trước và file xuất</p>
               </div>
               <button
                 type="button"
-                onClick={() => setSelectedMeterIds(meters.map((m) => m.id))}
+                onClick={() =>
+                  setSelectedMeterIds((list) => Array.from(new Set([...list, ...utilityMeters.map((m) => m.id)])))
+                }
                 className="text-xs font-semibold text-emerald-600 hover:underline"
               >
                 Chọn tất cả
               </button>
             </div>
-            {meters.length === 0 ? (
-              <p className="py-2 text-xs text-slate-400">Dự án chưa có điểm đo.</p>
+            {utilityMeters.length === 0 ? (
+              <p className="py-2 text-xs text-slate-400">Dự án chưa có điểm đo loại {reportUtility}.</p>
             ) : (
               <div className="grid gap-2 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4">
-                {meters.map((item) => {
+                {utilityMeters.map((item) => {
                   const checked = selectedMeterIds.includes(item.id);
                   return (
                     <label
@@ -1547,6 +1714,14 @@ export function ClientReports({
                 </button>
               </div>
             </div>
+            {!electricReport && (declaredParams.length === 0 || !declaredParams.some((p) => p.cumulative)) ? (
+              <p className="mb-2.5 rounded-lg border border-amber-200 bg-amber-50/70 px-3 py-2 text-[11px] leading-relaxed text-amber-900">
+                {declaredParams.length === 0
+                  ? `Đồng hồ loại ${reportUtility} chưa khai báo thông số đo nào. `
+                  : `Đồng hồ loại ${reportUtility} chưa có thông số đánh dấu "Cộng dồn" nên chưa tính được sản lượng tiêu thụ. `}
+                Khai báo ở Thư viện loại đồng hồ → đồng hồ loại {reportUtility} → Hàm nhận dữ liệu từ gateway.
+              </p>
+            ) : null}
             <div className="grid gap-2 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4">
               {activeFields.map((field) => {
                 const checked = selectedFieldKeys.includes(field.key);

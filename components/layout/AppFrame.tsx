@@ -16,7 +16,7 @@ export function AppFrame({ children }: { children: React.ReactNode }) {
   if (isAuthView) {
     return (
       <AuthGuard>
-        <div className="flex h-screen w-full flex-col overflow-hidden bg-[#0b1120]">{children}</div>
+        <div className="flex h-dvh w-full flex-col overflow-hidden bg-[#0b1120]">{children}</div>
       </AuthGuard>
     );
   }

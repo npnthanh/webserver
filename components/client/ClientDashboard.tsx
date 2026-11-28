@@ -5,9 +5,11 @@ import { CustomSelect } from "@/components/ui/CustomSelect";
 import type { Project } from "@/lib/projects";
 import { normalizeAlertConfig, ruleThresholdsForPoint } from "@/lib/alert-config";
 import { alertValueText, hydrateAlertEvents, type AlertEvent } from "@/lib/alert-events";
-import { hydrateClientMeters } from "@/lib/client-meters";
+import { hydrateClientMeters, type ClientMeter } from "@/lib/client-meters";
 import { computeSourceTons, hydrateGhgSources, type GhgEmissionSource } from "@/lib/ghg-sources";
-import { hydrateDevices } from "@/lib/devices";
+import { declaredParamsForType, hydrateDevices, type CatalogDevice } from "@/lib/devices";
+import { consumptionUnitWith, isElectricMeterType } from "@/lib/report-config";
+import { computeUtilityCalcs } from "@/components/client/utilityReport";
 import {
   resolveElectricityRateAt,
   resolveTouPrices,
@@ -25,6 +27,7 @@ import {
   loadProjectGatewayDaily,
   loadProjectGatewayEnergySlots,
   loadProjectGatewayLatest,
+  loadProjectGatewaySamples,
   type GatewayDailyPoint,
   type GatewayEnergySlot,
   type ProjectGatewaySample,
@@ -182,6 +185,18 @@ export function ClientDashboard({ project }: { project: Project }) {
   const [prevMonthKwh, setPrevMonthKwh] = useState<number | null>(null);
   const [pollTick, setPollTick] = useState(0);
   const alignedMonth = useRef(false);
+  // Loại điểm đo không phải điện (Nước, Khí nén …): điểm đo, đồng hồ, mẫu trong tháng, giá trị mới nhất.
+  const [projectMeters, setProjectMeters] = useState<ClientMeter[]>([]);
+  const [catalogDevices, setCatalogDevices] = useState<CatalogDevice[]>([]);
+  const [latestByPoint, setLatestByPoint] = useState<Record<string, ProjectGatewaySample>>({});
+  const [utilitySamples, setUtilitySamples] = useState<ProjectGatewaySample[]>([]);
+  const otherUtilities = useMemo(
+    () =>
+      Array.from(new Set(projectMeters.map((m) => m.utility).filter((u): u is string => Boolean(u)))).filter(
+        (u) => !isElectricMeterType(u),
+      ),
+    [projectMeters],
+  );
 
   useEffect(() => {
     alignedMonth.current = false;
@@ -213,6 +228,9 @@ export function ClientDashboard({ project }: { project: Project }) {
         loadProjectGatewayLatest(project.id).catch(() => [] as ProjectGatewaySample[]),
       ]).then(([alertEvents, devices, meters, sources, settings, latestList]) => {
         if (!active) return;
+        setProjectMeters(meters);
+        setCatalogDevices(devices);
+        setLatestByPoint(Object.fromEntries(latestList.map((sample) => [sample.meterPointId, sample])));
         const saved = settings.costConfig as SavedElectricityCostConfig | undefined;
         setSavedCostConfig(saved);
         setTouPrices(resolveTouPrices(saved?.electricity?.voltageLevel, saved?.electricity?.prices).prices);
@@ -338,6 +356,67 @@ export function ClientDashboard({ project }: { project: Project }) {
   }, [project.id, year, month, pollTick]);
 
   useEffect(() => {
+    if (otherUtilities.length === 0) return;
+    let active = true;
+    const { from, to } = monthRange(year, month);
+    void loadProjectGatewaySamples(project.id, { from, to }).then((rows) => {
+      if (active) setUtilitySamples(rows);
+    });
+    return () => {
+      active = false;
+    };
+  }, [project.id, year, month, pollTick, otherUtilities.length]);
+
+  /** Mỗi loại không phải điện: tiêu thụ theo ngày (từ chỉ số cộng dồn) và thông số khai báo. */
+  const utilityPanels = useMemo(() => {
+    const last = daysInMonth(year, month);
+    const periods = Array.from({ length: last }, (_, i) => ({ key: i, label: pad2(i + 1) }));
+    const periodIndex = (at: string) => {
+      const parts = vietnamFromStored(at);
+      return parts && parts.year === year && parts.month === month ? parts.day - 1 : -1;
+    };
+    return otherUtilities.map((utility) => {
+      const meters = projectMeters.filter((m) => m.utility === utility);
+      const params = declaredParamsForType(catalogDevices, utility);
+      const calcs = computeUtilityCalcs({ meters, devices: catalogDevices, samples: utilitySamples, params, periods, periodIndex });
+      const hasIndex = calcs.some((calc) => calc.hasIndex);
+      const firstParam = params.find((param) => !param.cumulative);
+      // Có chỉ số cộng dồn: sản lượng theo ngày; chưa có: trung bình thông số đầu tiên theo ngày.
+      const series = periods.map((period, index) => {
+        let value = 0;
+        let sum = 0;
+        let count = 0;
+        let sampled = false;
+        for (const calc of calcs) {
+          const bucket = calc.byPeriod[index];
+          if (!bucket || bucket.samples === 0) continue;
+          sampled = true;
+          if (hasIndex) value += bucket.index.delta;
+          else if (firstParam && bucket.stats[firstParam.key]) {
+            sum += bucket.stats[firstParam.key].sum;
+            count += bucket.stats[firstParam.key].count;
+          }
+        }
+        return { day: period.label, kwh: hasIndex ? value : count ? sum / count : 0, hasSample: sampled };
+      });
+      const sampled = series.filter((item) => item.hasSample).map((item) => item.kwh);
+      return {
+        utility,
+        meters,
+        params,
+        hasIndex,
+        firstParam,
+        unit: hasIndex ? consumptionUnitWith(utility, params) : firstParam?.unit ?? "",
+        series,
+        total: hasIndex ? series.reduce((sum, item) => sum + item.kwh, 0) : 0,
+        max: sampled.length ? Math.max(...sampled) : 0,
+        min: sampled.length ? Math.min(...sampled) : 0,
+        sampledDays: sampled.length,
+      };
+    });
+  }, [otherUtilities, projectMeters, catalogDevices, utilitySamples, year, month]);
+
+  useEffect(() => {
     if (alignedMonth.current || !latest) return;
     const stamp = vietnamFromStored(latest.at);
     if (!stamp) return;
@@ -420,7 +499,7 @@ export function ClientDashboard({ project }: { project: Project }) {
         : "0 nguồn phát thải · 0,00 tấn CO₂e";
 
   return (
-    <div className="mx-auto h-full max-w-[1480px] overflow-y-auto px-3 py-3.5 sm:px-5 sm:py-5 lg:px-6">
+    <div className="mx-auto max-w-[1480px] px-3 py-3.5 sm:px-5 sm:py-5 lg:px-6">
       <div className="mb-3.5 sm:mb-4 flex flex-wrap items-center justify-between gap-2.5 sm:gap-3">
         <div>
           <h1 className="text-xl sm:text-[28px] font-bold tracking-tight text-slate-800">
@@ -474,6 +553,57 @@ export function ClientDashboard({ project }: { project: Project }) {
           />
         </DashboardCard>
       </div>
+
+      {/* Nước, Khí nén, Hơi …: mỗi loại một hàng (tiêu thụ trong tháng + thông số hiện tại) */}
+      {utilityPanels.map((panel) => (
+        <div key={panel.utility} className="mt-3.5 grid grid-cols-1 gap-3.5 sm:mt-4 sm:gap-4 xl:grid-cols-3">
+          <DashboardCard
+            title={panel.hasIndex ? `${panel.utility.toUpperCase()} TIÊU THỤ` : `THÔNG SỐ ${panel.utility.toUpperCase()}`}
+            className="xl:col-span-2"
+          >
+            <div className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-xs sm:gap-x-6 sm:text-sm">
+              {panel.hasIndex ? (
+                <>
+                  <p>
+                    Lớn nhất: <span className="font-semibold text-sky-700">{formatUtility(panel.max)} {panel.unit}</span>
+                  </p>
+                  <p>
+                    Nhỏ nhất: <span className="font-semibold text-sky-600">{formatUtility(panel.min)} {panel.unit}</span>
+                  </p>
+                  <p>
+                    Tổng tiêu thụ:{" "}
+                    <span className="font-semibold text-slate-800">
+                      {formatUtility(panel.total)} {panel.unit}
+                    </span>
+                  </p>
+                </>
+              ) : panel.firstParam ? (
+                <p>
+                  Trung bình {panel.firstParam.key} theo ngày
+                  {panel.firstParam.label && panel.firstParam.label !== panel.firstParam.key
+                    ? ` (${panel.firstParam.label})`
+                    : ""}
+                </p>
+              ) : null}
+            </div>
+            <EnergyChart
+              data={panel.series}
+              unit={panel.unit}
+              barClassName="bg-sky-600 hover:bg-sky-500"
+              emptyText={panel.params.length === 0 ? `Đồng hồ loại ${panel.utility} chưa khai báo thông số đo` : undefined}
+            />
+            <p className="mt-2 text-center text-[11.5px] text-slate-500 sm:text-[12px]">
+              {panel.hasIndex
+                ? `Tháng ${pad2(month)}/${year}: ${panel.sampledDays} ngày có số liệu · Tổng ${formatUtility(panel.total)} ${panel.unit}`
+                : `Chưa có chỉ số "Cộng dồn" nên chưa tính được ${panel.utility.toLowerCase()} tiêu thụ — khai báo ở Thư viện loại đồng hồ → Hàm nhận dữ liệu.`}
+            </p>
+          </DashboardCard>
+
+          <DashboardCard title={`${panel.utility.toUpperCase()} · GIÁ TRỊ HIỆN TẠI`}>
+            <UtilityLatest meters={panel.meters} params={panel.params} latestByPoint={latestByPoint} />
+          </DashboardCard>
+        </div>
+      ))}
 
       <div className="mt-3.5 sm:mt-4 grid grid-cols-1 gap-3.5 sm:gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <DashboardCard title="CHI PHÍ">
@@ -595,6 +725,58 @@ function MonthPicker({
   );
 }
 
+function formatUtility(value: number) {
+  if (!Number.isFinite(value)) return "0";
+  return formatAppNumber(value, { maxDecimals: Math.abs(value) < 10 ? 3 : 1 });
+}
+
+/** Giá trị mới nhất các thông số khai báo của từng điểm đo (loại không phải điện). */
+function UtilityLatest({
+  meters,
+  params,
+  latestByPoint,
+}: {
+  meters: ClientMeter[];
+  params: { key: string; label: string; unit: string }[];
+  latestByPoint: Record<string, ProjectGatewaySample>;
+}) {
+  if (meters.length === 0) return <p className="py-8 text-center text-sm text-slate-400">Chưa có điểm đo</p>;
+  return (
+    <ul className="max-h-[300px] space-y-2.5 overflow-y-auto">
+      {meters.map((meter) => {
+        const sample = latestByPoint[meter.id];
+        const keys = params.length ? params : Object.keys(sample?.values ?? {}).map((key) => ({ key, label: key, unit: "" }));
+        return (
+          <li key={meter.id} className="rounded-lg border border-slate-100 px-3 py-2">
+            <div className="flex items-baseline justify-between gap-2">
+              <span className="truncate text-[13px] font-semibold text-slate-700">{meter.name}</span>
+              <span className="shrink-0 text-[11px] text-slate-400">
+                {sample ? formatStoredVietnam(sample.at)?.slice(0, 16) ?? "" : "Chưa có bản tin"}
+              </span>
+            </div>
+            <div className="mt-1.5 flex flex-wrap gap-1.5">
+              {keys.map((param) => {
+                const value = sample?.values[param.key];
+                return (
+                  <span
+                    key={param.key}
+                    title={param.label}
+                    className="rounded-md bg-sky-50 px-2 py-0.5 font-mono text-[12px] text-sky-800"
+                  >
+                    {param.key}:{" "}
+                    <strong>{typeof value === "number" && Number.isFinite(value) ? formatUtility(value) : "—"}</strong>
+                    {param.unit ? ` ${param.unit}` : ""}
+                  </span>
+                );
+              })}
+            </div>
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
 function DashboardCard({
   title,
   children,
@@ -608,18 +790,7 @@ function DashboardCard({
     <section
       className={`min-w-0 overflow-hidden rounded-lg border border-slate-200 bg-white p-3.5 sm:p-4 shadow-[0_1px_2px_rgba(16,24,40,0.04)] ${className}`}
     >
-      <div className="mb-2 flex items-start justify-between">
-        <h2 className="text-[12px] font-semibold tracking-[0.08em] text-slate-400">
-          {title}
-        </h2>
-        <button
-          type="button"
-          className="text-slate-300 hover:text-slate-500"
-          aria-label="Phóng to"
-        >
-          <ExpandIcon className="h-4 w-4" />
-        </button>
-      </div>
+      <h2 className="mb-2 text-[12px] font-semibold tracking-[0.08em] text-slate-400">{title}</h2>
       {children}
     </section>
   );
@@ -646,11 +817,21 @@ function LatestReading({ sample }: { sample: ProjectGatewaySample }) {
   );
 }
 
-function EnergyChart({ data }: { data: { day: string; kwh: number; hasSample?: boolean }[] }) {
-  if (!data.length) {
+function EnergyChart({
+  data,
+  unit = "kWh",
+  barClassName = "bg-emerald-600 hover:bg-emerald-500",
+  emptyText,
+}: {
+  data: { day: string; kwh: number; hasSample?: boolean }[];
+  unit?: string;
+  barClassName?: string;
+  emptyText?: string;
+}) {
+  if (!data.length || emptyText) {
     return (
       <div className="flex h-[220px] sm:h-[250px] items-center justify-center text-sm text-slate-400">
-        Chưa có dữ liệu
+        {emptyText ?? "Chưa có dữ liệu"}
       </div>
     );
   }
@@ -667,7 +848,7 @@ function EnergyChart({ data }: { data: { day: string; kwh: number; hasSample?: b
     <div className="flex w-full min-w-0 gap-1.5">
       {/* Trục tung */}
       <div className="flex shrink-0 flex-col">
-        <span className="mb-1 text-[10px] font-semibold leading-none text-slate-400">kWh</span>
+        <span className="mb-1 text-[10px] font-semibold leading-none text-slate-400">{unit}</span>
         <div className="relative h-[185px] sm:h-[210px] w-9">
           {ticks.map((value) => (
             <span
@@ -700,16 +881,16 @@ function EnergyChart({ data }: { data: { day: string; kwh: number; hasSample?: b
             <div className="flex h-[185px] sm:h-[210px] w-full items-end justify-center">
               {heightPct > 0 ? (
                 <div
-                  className="w-[5px] sm:w-[7px] rounded-t-sm bg-emerald-600 transition-all hover:bg-emerald-500"
+                  className={`w-[5px] sm:w-[7px] rounded-t-sm transition-all ${barClassName}`}
                   style={{ height: `${heightPct}%` }}
-                  title={`Ngày ${item.day}: ${formatKwh(item.kwh)} kWh`}
+                  title={`Ngày ${item.day}: ${formatKwh(item.kwh)} ${unit}`}
                 />
               ) : (
                 <div
                   className={`h-[2px] w-[5px] sm:w-[7px] rounded-sm ${item.hasSample ? "bg-emerald-300" : "bg-slate-200"}`}
                   title={
                     item.hasSample
-                      ? `Ngày ${item.day}: có bản tin, sản lượng 0 kWh`
+                      ? `Ngày ${item.day}: có bản tin, giá trị 0 ${unit}`
                       : `Ngày ${item.day}: không có bản tin`
                   }
                 />
@@ -843,125 +1024,107 @@ function DonutChart({
 }
 
 function AlertLogTable({ rows: sourceRows }: { rows: DashboardAlert[] }) {
-  const [time, setTime] = useState("");
+  const [query, setQuery] = useState("");
   const [point, setPoint] = useState("all");
-  const [param, setParam] = useState("");
-  const [value, setValue] = useState("");
 
+  const points = Array.from(new Set(sourceRows.map((row) => row.point))).sort((x, y) => x.localeCompare(y, "vi"));
+  const q = query.trim().toLowerCase();
   const rows = sourceRows.filter((row) => {
-    const matchTime = !time || row.time.includes(time);
     const matchPoint = point === "all" || row.point === point;
-    const matchParam =
-      !param || row.param.toLowerCase().includes(param.toLowerCase());
-    const matchValue = !value || row.value.includes(value);
-    return matchTime && matchPoint && matchParam && matchValue;
+    const matchQuery =
+      !q ||
+      row.param.toLowerCase().includes(q) ||
+      row.value.toLowerCase().includes(q) ||
+      row.time.includes(q) ||
+      row.point.toLowerCase().includes(q);
+    return matchPoint && matchQuery;
   });
+  const empty = sourceRows.length === 0 ? "Chưa có nhật ký cảnh báo trong dự án" : "Không có cảnh báo khớp bộ lọc";
 
   return (
-    <div className="overflow-x-auto">
-      <table className="w-full min-w-[560px] text-left text-[13px]">
-        <thead>
-          <tr className="text-[12px] font-medium text-slate-500">
-            <th className="pb-2 font-medium">
-              Thời gian <span className="text-slate-300">↕</span>
-            </th>
-            <th className="pb-2 font-medium">
-              Điểm đo <span className="text-slate-300">↕</span>
-            </th>
-            <th className="pb-2 font-medium">
-              Thông số <span className="text-slate-300">↕</span>
-            </th>
-            <th className="pb-2 font-medium">
-              Giá trị <span className="text-slate-300">↕</span>
-            </th>
-          </tr>
-          <tr className="text-slate-400">
-            <th className="pb-2 pr-2 font-normal">
-              <span className="relative block">
-                <input
-                  value={time}
-                  onChange={(e) => setTime(e.target.value)}
-                  className="h-8 w-full rounded border border-slate-200 pr-7 pl-2 text-xs outline-none focus:border-emerald-500"
-                />
-                <FilterMark />
-              </span>
-            </th>
-            <th className="pb-2 pr-2 font-normal">
-              <span className="relative block">
-                <CustomSelect
-                  value={point}
-                  onChange={(e) => setPoint(e.target.value)}
-                  className="h-8 w-full appearance-none rounded border border-slate-200 pr-7 pl-2 text-xs outline-none focus:border-emerald-500"
-                >
-                  <option value="all" />
-                  {Array.from(new Set(sourceRows.map((row) => row.point))).map((name) => (
-                    <option key={name} value={name}>{name}</option>
-                  ))}
-                </CustomSelect>
-                <FilterMark />
-              </span>
-            </th>
-            <th className="pb-2 pr-2 font-normal">
-              <span className="relative block">
-                <input
-                  value={param}
-                  onChange={(e) => setParam(e.target.value)}
-                  className="h-8 w-full rounded border border-slate-200 pr-7 pl-2 text-xs outline-none focus:border-emerald-500"
-                />
-                <FilterMark />
-              </span>
-            </th>
-            <th className="pb-2 font-normal">
-              <span className="relative block">
-                <input
-                  value={value}
-                  onChange={(e) => setValue(e.target.value)}
-                  className="h-8 w-full rounded border border-slate-200 pr-7 pl-2 text-xs outline-none focus:border-emerald-500"
-                />
-                <FilterMark />
-              </span>
-            </th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.length === 0 ? (
-            <tr>
-              <td colSpan={4} className="py-8 text-center text-sm text-slate-400">
-                {sourceRows.length === 0 ? "Chưa có nhật ký cảnh báo trong dự án" : "Không khớp bộ lọc"}
-              </td>
-            </tr>
-          ) : (
-            rows.map((row) => (
-              <tr key={row.id} className="border-t border-slate-100 text-slate-600">
-                <td className="py-2.5 whitespace-nowrap">{row.time}</td>
-                <td className="py-2.5">{row.point}</td>
-                <td className="py-2.5">
-                  <button type="button" className="text-emerald-600 hover:underline">
-                    {row.param}
-                  </button>
-                </td>
-                <td className="py-2.5">{row.value}</td>
-              </tr>
-            ))
-          )}
-        </tbody>
-      </table>
+    <div className="space-y-3">
+      {/* Thanh lọc: một ô tìm kiếm + chọn điểm đo */}
+      <div className="flex flex-col gap-2 sm:flex-row">
+        <label className="relative min-w-0 flex-1">
+          <SearchIcon className="pointer-events-none absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2 text-slate-400" />
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Tìm thông số, giá trị, thời gian…"
+            aria-label="Tìm trong nhật ký cảnh báo"
+            className="h-9 w-full rounded-lg border border-slate-200 bg-white pr-3 pl-9 text-base text-slate-700 outline-none placeholder:text-slate-400 focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/15 sm:text-[13px]"
+          />
+        </label>
+        <CustomSelect
+          value={point}
+          onChange={(e) => setPoint(e.target.value)}
+          aria-label="Lọc theo điểm đo"
+          className="h-9 w-full rounded-lg border border-slate-200 bg-white px-3 text-[13px] text-slate-700 outline-none focus:border-emerald-500 sm:w-48"
+        >
+          <option value="all">Tất cả điểm đo</option>
+          {points.map((name) => (
+            <option key={name} value={name}>
+              {name}
+            </option>
+          ))}
+        </CustomSelect>
+      </div>
+
+      {rows.length === 0 ? (
+        <p className="rounded-lg border border-dashed border-slate-200 py-8 text-center text-sm text-slate-400">{empty}</p>
+      ) : (
+        <>
+          {/* Máy tính bảng trở lên: bảng */}
+          <div className="hidden overflow-hidden rounded-lg border border-slate-100 sm:block">
+            <table className="w-full text-left text-[13px]">
+              <thead className="bg-slate-50 text-[11px] font-semibold tracking-wide text-slate-500 uppercase">
+                <tr>
+                  <th className="px-3 py-2">Thời gian</th>
+                  <th className="px-3 py-2">Điểm đo</th>
+                  <th className="px-3 py-2">Thông số</th>
+                  <th className="px-3 py-2 text-right">Giá trị</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {rows.map((row) => (
+                  <tr key={row.id} className="text-slate-600 hover:bg-slate-50/60">
+                    <td className="px-3 py-2.5 whitespace-nowrap tabular-nums">{row.time}</td>
+                    <td className="px-3 py-2.5">{row.point}</td>
+                    <td className="px-3 py-2.5 font-mono text-[12px] font-semibold text-emerald-700">{row.param}</td>
+                    <td className="px-3 py-2.5 text-right font-semibold whitespace-nowrap text-slate-800 tabular-nums">
+                      {row.value}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Điện thoại: danh sách thẻ, không phải kéo ngang */}
+          <ul className="divide-y divide-slate-100 rounded-lg border border-slate-100 sm:hidden">
+            {rows.map((row) => (
+              <li key={row.id} className="px-3 py-2.5">
+                <div className="flex items-baseline justify-between gap-3">
+                  <span className="font-mono text-[13px] font-semibold text-emerald-700">{row.param}</span>
+                  <span className="shrink-0 text-[13px] font-semibold text-slate-800 tabular-nums">{row.value}</span>
+                </div>
+                <p className="mt-0.5 truncate text-xs text-slate-500">
+                  {row.point} · <span className="tabular-nums">{row.time}</span>
+                </p>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
     </div>
   );
 }
 
-function FilterMark() {
+function SearchIcon({ className }: { className?: string }) {
   return (
-    <span className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 text-[10px] text-slate-300">
-      ▾
-    </span>
-  );
-}
-
-function ExpandIcon({ className }: { className?: string }) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" aria-hidden>
-      <path d="M9 4H4v5M15 4h5v5M9 20H4v-5M20 15v5h-5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <circle cx="11" cy="11" r="7" />
+      <path d="m20 20-3.5-3.5" />
     </svg>
   );
 }

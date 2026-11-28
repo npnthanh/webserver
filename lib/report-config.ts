@@ -162,6 +162,103 @@ export const REPORT_FIELDS: Record<ReportTypeId, ReportFieldDef[]> = {
   ],
 };
 
+/* ---------------- Báo cáo theo loại điểm đo (Điện / Nước / Nhiệt / Hơi …) ---------------- */
+
+/** Trường theo thông số khai báo ở Hàm nhận dữ liệu của đồng hồ: `param:<tên>:<avg|min|max>`. */
+export const PARAM_FIELD_PREFIX = "param:";
+
+export type DeclaredReportParam = { key: string; label: string; unit: string; cumulative?: boolean };
+
+/** Đơn vị sản lượng: theo chỉ số cộng dồn đã khai báo, không có thì theo loại điểm đo. */
+export function consumptionUnitWith(meterType: string, params: DeclaredReportParam[] = []) {
+  return params.find((param) => param.cumulative && param.unit)?.unit || consumptionUnitFor(meterType);
+}
+
+export function isElectricMeterType(meterType: string) {
+  const value = meterType.trim().toLowerCase();
+  return value === "" || value.includes("điện") || value.includes("dien");
+}
+
+/** Đơn vị sản lượng tiêu thụ theo loại điểm đo (rỗng = chưa có đơn vị chuẩn). */
+export function consumptionUnitFor(meterType: string) {
+  const value = meterType.trim().toLowerCase();
+  if (isElectricMeterType(meterType)) return "kWh";
+  if (value.includes("nước")) return "m³";
+  if (value.includes("khí nén")) return "Nm³";
+  if (value.includes("hơi")) return "t";
+  if (value.includes("nhiệt")) return "kWh";
+  return "";
+}
+
+/** Loại báo cáo dùng được: các báo cáo khung giờ giá điện / chi phí 3 giá / khí nhà kính chỉ dành cho Điện. */
+export function reportsForMeterType(meterType: string): ReportTypeId[] {
+  return isElectricMeterType(meterType) ? [...REPORT_TYPE_IDS] : ["overview", "energy", "alerts", "comparison"];
+}
+
+function withUnit(label: string, unit: string) {
+  return unit ? `${label} (${unit})` : label;
+}
+
+/** Trường dữ liệu của một loại báo cáo theo loại điểm đo (Điện: như cũ; loại khác: bỏ trường riêng của điện). */
+export function reportFieldsFor(
+  id: ReportTypeId,
+  meterType: string,
+  params: DeclaredReportParam[] = [],
+): ReportFieldDef[] {
+  if (isElectricMeterType(meterType)) return REPORT_FIELDS[id];
+  const unit = consumptionUnitWith(meterType, params);
+  const pick = (keys: string[]) => REPORT_FIELDS[id].filter((field) => keys.includes(field.key));
+  switch (id) {
+    case "overview":
+      return [
+        ...pick(["point", "utility"]),
+        { key: "kwhTotal", label: withUnit("Tổng tiêu thụ", unit), align: "right", defaultChecked: true },
+        ...pick(["alertCount"]),
+      ];
+    case "energy":
+      return [
+        ...pick(["period", "point"]),
+        { key: "firstKwh", label: withUnit("Chỉ số đầu kỳ", unit), align: "right", defaultChecked: true },
+        { key: "lastKwh", label: withUnit("Chỉ số cuối kỳ", unit), align: "right", defaultChecked: true },
+        { key: "deltaKwh", label: withUnit("Sản lượng tiêu hao", unit), align: "right", defaultChecked: true },
+        ...pick(["meterSwap"]),
+        // Chỉ số cộng dồn đã dùng cho sản lượng: không cần thống kê trung bình / nhỏ nhất / lớn nhất.
+        ...params.filter((param) => !param.cumulative).flatMap((param): ReportFieldDef[] => [
+          { key: `${PARAM_FIELD_PREFIX}${param.key}:avg`, label: withUnit(`${param.key} trung bình`, param.unit), align: "right", defaultChecked: true },
+          { key: `${PARAM_FIELD_PREFIX}${param.key}:min`, label: withUnit(`${param.key} nhỏ nhất`, param.unit), align: "right", defaultChecked: false },
+          { key: `${PARAM_FIELD_PREFIX}${param.key}:max`, label: withUnit(`${param.key} lớn nhất`, param.unit), align: "right", defaultChecked: false },
+        ]),
+      ];
+    case "comparison":
+      return [
+        ...pick(["target"]),
+        { key: "currentKwh", label: withUnit("Sản lượng kỳ báo cáo", unit), align: "right", defaultChecked: true },
+        { key: "baseKwh", label: withUnit("Sản lượng kỳ đối chiếu", unit), align: "right", defaultChecked: true },
+        { key: "diffKwh", label: withUnit("Chênh lệch tiêu hao", unit), align: "right", defaultChecked: true },
+        ...pick(["diffPct", "trend"]),
+      ];
+    case "alerts":
+      return REPORT_FIELDS.alerts;
+    default:
+      return [];
+  }
+}
+
+/** Trường tích sẵn của từng báo cáo theo loại điểm đo. */
+export function defaultFieldsForMeterType(
+  meterType: string,
+  params: DeclaredReportParam[] = [],
+): Record<ReportTypeId, string[]> {
+  return Object.fromEntries(
+    REPORT_TYPE_IDS.map((id) => [
+      id,
+      reportFieldsFor(id, meterType, params)
+        .filter((field) => field.defaultChecked !== false)
+        .map((field) => field.key),
+    ]),
+  ) as Record<ReportTypeId, string[]>;
+}
+
 export function defaultSelectedFieldsByReport(): Record<ReportTypeId, string[]> {
   return Object.fromEntries(
     (Object.keys(REPORT_FIELDS) as ReportTypeId[]).map((id) => [
@@ -196,7 +293,18 @@ export type ReportConfig = {
   layout: ReportLayoutDefaults;
   /** Mẫu trong Thư viện báo cáo mà dự án đang dùng (rỗng = theo cấu hình riêng của dự án). */
   templateId?: string;
+  /**
+   * Trường theo thông số đo (param:…) bị ẩn với khách. Mặc định được xem (thông số mới khai báo tự hiện),
+   * quản trị viên bỏ tích ở Cấu hình báo cáo thì ghi vào đây.
+   */
+  hiddenParamFields?: Partial<Record<ReportTypeId, string[]>>;
 };
+
+/** Khách có được xem trường này không (trường chuẩn: theo allowedFields; trường thông số đo: trừ khi bị ẩn). */
+export function isReportFieldAllowed(config: Pick<ReportConfig, "allowedFields" | "hiddenParamFields">, id: ReportTypeId, key: string) {
+  if (key.startsWith(PARAM_FIELD_PREFIX)) return !(config.hiddenParamFields?.[id] ?? []).includes(key);
+  return (config.allowedFields[id] ?? []).includes(key);
+}
 
 /**
  * Mẫu báo cáo trong Thư viện báo cáo (Cấu hình → Thư viện báo cáo), chia theo loại điểm đo.
@@ -275,7 +383,11 @@ export function readReportConfig(settings: Record<string, unknown> | undefined |
     const list = raw.fieldsByReport && typeof raw.fieldsByReport === "object"
       ? (raw.fieldsByReport as Record<string, unknown>)[id]
       : null;
-    const saved = Array.isArray(list) ? allowed.filter((key) => list.includes(key)) : [];
+    // Trường theo thông số riêng của đồng hồ (param:…) không nằm trong danh sách chuẩn: giữ nguyên.
+    const paramKeys = Array.isArray(list)
+      ? list.filter((key): key is string => typeof key === "string" && key.startsWith(PARAM_FIELD_PREFIX))
+      : [];
+    const saved = Array.isArray(list) ? [...allowed.filter((key) => list.includes(key)), ...paramKeys] : [];
     const fallback = allowed.filter((key) => defaults[id].includes(key));
     fieldsByReport[id] = saved.length ? saved : fallback.length ? fallback : allowed;
   }
@@ -288,6 +400,17 @@ export function readReportConfig(settings: Record<string, unknown> | undefined |
     for (const id of REPORT_TYPE_IDS) {
       const value = (raw.titles as Record<string, unknown>)[id];
       if (typeof value === "string" && value.trim()) titles[id] = value;
+    }
+  }
+
+  const hiddenParamFields: Partial<Record<ReportTypeId, string[]>> = {};
+  if (raw.hiddenParamFields && typeof raw.hiddenParamFields === "object") {
+    for (const id of REPORT_TYPE_IDS) {
+      const list = (raw.hiddenParamFields as Record<string, unknown>)[id];
+      if (Array.isArray(list)) {
+        const keys = list.filter((key): key is string => typeof key === "string" && key.startsWith(PARAM_FIELD_PREFIX));
+        if (keys.length) hiddenParamFields[id] = keys;
+      }
     }
   }
 
@@ -307,6 +430,7 @@ export function readReportConfig(settings: Record<string, unknown> | undefined |
     enabledReports: enabled.length ? enabled : ["overview"],
     titles,
     layout,
+    hiddenParamFields,
     ...(typeof raw.templateId === "string" && raw.templateId ? { templateId: raw.templateId } : {}),
   };
 }

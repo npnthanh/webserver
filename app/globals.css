@@ -16,8 +16,9 @@ body {
   color: var(--foreground);
 }
 
+/* Chữ 16px trên điện thoại (sm trở lên 14px): ô nhập chữ < 16px làm Safari iOS tự phóng to trang khi chạm vào. */
 .input {
-  @apply h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-800 outline-none placeholder:text-slate-400 focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/15;
+  @apply h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-base text-slate-800 outline-none placeholder:text-slate-400 focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/15 sm:text-sm;
 }
 
 /* .input nằm ngoài layer nên các class `disabled:` của Tailwind không đè được: khai báo trạng thái khoá tại đây. */

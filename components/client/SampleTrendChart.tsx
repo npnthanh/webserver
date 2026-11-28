@@ -790,9 +790,11 @@ export function SampleTrendChart({
               >
                 {/* Đơn vị trục tung (V, A, Hz, kW, ...) */}
                 {/* Canh trái từ mép khung: đơn vị dài (VD "kW / kVAR / kVA" khi tích nhiều nhóm) không bị cắt. */}
-                <text x={4} y={15} textAnchor="start" className="fill-slate-500" fontSize="11">
-                  ({unitLabel})
-                </text>
+                {unitLabel ? (
+                  <text x={4} y={15} textAnchor="start" className="fill-slate-500" fontSize="11">
+                    ({unitLabel})
+                  </text>
+                ) : null}
 
                 {/* Lưới ngang & Nhãn trục tung */}
                 {yTicks.map((tv, idx) => {
