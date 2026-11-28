@@ -1211,7 +1211,16 @@ export async function getGatewayConsole(input: { from?: string; to?: string; gat
       : [];
   const mappedGateways = await Promise.all(
     baseGateways.map(async (gateway) => {
-      const rows = meterRows.filter((row) => String(row.gateway_id) === gateway.gatewayId);
+      // Mỗi serial một dòng (bản mới nhất): bảng khóa theo (meter_model, meter_id) nên có thể còn dòng cũ
+      // ghi sai mã model trước đây cho cùng serial.
+      const seenMeterIds = new Set<string>();
+      const rows = meterRows.filter((row) => {
+        if (String(row.gateway_id) !== gateway.gatewayId) return false;
+        const meterId = String(row.meter_id);
+        if (seenMeterIds.has(meterId)) return false;
+        seenMeterIds.add(meterId);
+        return true;
+      });
       const meters = await Promise.all(
         rows.map(async (row) => {
           const names = await resolveMeterNames(String(row.meter_type), String(row.meter_model));
@@ -2539,6 +2548,11 @@ async function meterIsRegistered(packet: NormalizedPacket) {
 function modelCodeForCategory(category: string) {
   const name = category.trim().toLowerCase();
   if (!name) return 0;
+  // Upstream cũ gửi meterModel là mã số thô ("1") hoặc "MODEL_1" khi chưa có tên: giữ đúng mã MM,
+  // không quy về 0 (= PM2230) để tên model hiển thị theo danh mục.
+  if (/^\d+$/.test(name)) return Number(name);
+  const prefixed = /^model_(\d+)$/.exec(name);
+  if (prefixed) return Number(prefixed[1]);
   for (const [code, label] of Object.entries(METER_MODEL_BY_CODE)) {
     if (label.toLowerCase() === name) return Number(code);
   }
